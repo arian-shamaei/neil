@@ -2,6 +2,7 @@ mod panel;
 mod state;
 mod panels;
 mod stream;
+mod awareness;
 
 use std::env;
 use std::fs;
@@ -63,6 +64,7 @@ fn main() -> anyhow::Result<()> {
     let mut view = View::Chat;
     let mut panel_selection: usize = 0;
     let mut show_sidebar = true;
+    let mut last_input_time = Instant::now();
     let mut tick: u64 = 0;
     let mut last_history_count: usize = 0;
 
@@ -122,6 +124,7 @@ fn main() -> anyhow::Result<()> {
                             match key.code {
                                 KeyCode::Enter => {
                                     if !input.is_empty() {
+                                        last_input_time = Instant::now();
                                         let msg = input.clone();
                                         stream.push(StreamEntry::new(EntryKind::Human, msg.clone()));
                                         input.clear();
@@ -144,6 +147,7 @@ fn main() -> anyhow::Result<()> {
                                         }
                                     } else {
                                         input.push(c);
+                                        last_input_time = Instant::now();
                                     }
                                 }
                                 KeyCode::Backspace => { input.pop(); }
@@ -233,8 +237,46 @@ fn main() -> anyhow::Result<()> {
         if last_tick.elapsed() >= tick_rate {
             tick += 1;
             last_tick = Instant::now();
+
+            // Write awareness state every 5 ticks (~2.5s)
+            if tick % 5 == 0 {
+                let term_size = terminal::size().unwrap_or((80, 24));
+                let view_str = match &view {
+                    View::Chat => "chat".to_string(),
+                    View::PanelSelector => "panel_selector".to_string(),
+                    View::Panel(i) => format!("panel:{}", PANEL_NAMES.get(*i).map(|p| p.0).unwrap_or("?")),
+                };
+                let bp_state = awareness::BlueprintState {
+                    timestamp: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    running: true,
+                    view: view_str,
+                    terminal_size: term_size,
+                    stream_length: stream.len(),
+                    scroll_offset,
+                    auto_scroll,
+                    input_buffer: if input.is_empty() { String::new() } else { format!("({} chars)", input.len()) },
+                    last_user_message: stream.iter().rev()
+                        .find(|e| matches!(e.kind, EntryKind::Human))
+                        .map(|e| e.blocks.first().map(|b| match b {
+                            stream::RichBlock::Text(t) => t.chars().take(80).collect(),
+                            _ => String::new(),
+                        }).unwrap_or_default())
+                        .unwrap_or_default(),
+                    sidebar_visible: show_sidebar,
+                    user_active: last_input_time.elapsed() < Duration::from_secs(60),
+                    last_input_time: if last_input_time.elapsed() < Duration::from_secs(3600) {
+                        format!("{}s ago", last_input_time.elapsed().as_secs())
+                    } else {
+                        "inactive".into()
+                    },
+                };
+                bp_state.write(&neil_home);
+            }
         }
     }
+
+    // Mark blueprint as stopped
+    awareness::BlueprintState::clear(&neil_home);
 
     terminal::disable_raw_mode()?;
     execute!(

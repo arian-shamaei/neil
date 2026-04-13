@@ -142,3 +142,33 @@ if [ -d "$HOME/.neil/mirror/remotes" ]; then
 else
     echo "(none configured)"
 fi
+
+echo ""
+echo "=== Blueprint TUI ==="
+BP_STATE="$HOME/.neil/.blueprint_state.json"
+if [ -f "$BP_STATE" ]; then
+    RUNNING=$(cat "$BP_STATE" | sed -n 's/.*"running":\([^,}]*\).*/\1/p')
+    if [ "$RUNNING" = "true" ]; then
+        VIEW=$(cat "$BP_STATE" | sed -n 's/.*"view":"\([^"]*\)".*/\1/p')
+        USER_ACTIVE=$(cat "$BP_STATE" | sed -n 's/.*"user_active":\([^,}]*\).*/\1/p')
+        LAST_INPUT=$(cat "$BP_STATE" | sed -n 's/.*"last_input_time":"\([^"]*\)".*/\1/p')
+        TERM_W=$(cat "$BP_STATE" | sed -n 's/.*"terminal_size":\[\([0-9]*\).*/\1/p')
+        TERM_H=$(cat "$BP_STATE" | sed -n 's/.*"terminal_size":\[[0-9]*,\([0-9]*\).*/\1/p')
+        SCROLL=$(cat "$BP_STATE" | sed -n 's/.*"scroll_offset":\([^,}]*\).*/\1/p')
+        INPUT_BUF=$(cat "$BP_STATE" | sed -n 's/.*"input_buffer":"\([^"]*\)".*/\1/p')
+        echo "status: running"
+        echo "view: $VIEW"
+        echo "terminal: ${TERM_W}x${TERM_H}"
+        echo "user: ${USER_ACTIVE} (last input: ${LAST_INPUT})"
+        if [ -n "$INPUT_BUF" ]; then
+            echo "typing: $INPUT_BUF"
+        fi
+        if [ "$SCROLL" != "0" ]; then
+            echo "scrolled: $SCROLL lines up"
+        fi
+    else
+        echo "status: stopped"
+    fi
+else
+    echo "status: not running"
+fi

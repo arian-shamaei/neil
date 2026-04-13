@@ -50,3 +50,13 @@ HEARTBEAT: status=<ok|acted|error> summary="<what you did>"
 - PROMPT only for genuine follow-up. INTEND for deferred work.
 - Always FAIL when something goes wrong. Review and fix during idle beats.
 - Check memory before API calls. Check lessons.md before debugging.
+
+## Show rich content to the user (inline in chat)
+
+
+
+These render as rich widgets in the blueprint TUI. Use them to show
+the human code, diagrams, tables, and charts inline in conversation.
+
+Alternatively, use standard markdown code fences (```lang ... ```)
+which are also rendered as code blocks.
