@@ -34,13 +34,18 @@
 #define HISTORY_DIR "history"
 
 #define MAX_PATH    4096
+#define MAX_LINE    4096
 #define MAX_PROMPT  (1024 * 1024)  /* 1 MB max prompt */
 #define READ_BUF    (1024 * 64)
 
-#define CLAUDE_BIN_DEFAULT "claude"
+#define AI_CMD_DEFAULT "claude"
 #define NEIL_HOME_DEFAULT ".neil"
 
-static const char *claude_bin = CLAUDE_BIN_DEFAULT;
+static char g_ai_command[MAX_PATH];
+static char g_ai_args[MAX_PATH];
+static char g_ai_system_flag[64];
+static char g_ai_prompt_flag[16];
+static int g_max_react_turns = 3;
 
 /* Resolved paths -- set once at startup from NEIL_HOME env var */
 static char g_neil_home[MAX_PATH];
@@ -95,6 +100,47 @@ static void resolve_neil_paths(void) {
         snprintf(zettel_home, sizeof(zettel_home),
             "%s/memory/palace", g_neil_home);
         setenv("ZETTEL_HOME", zettel_home, 0);
+    }
+
+    /* Load AI config from config.toml */
+    snprintf(g_ai_command, sizeof(g_ai_command), "%s", AI_CMD_DEFAULT);
+    snprintf(g_ai_args, sizeof(g_ai_args),
+        "--print --output-format text --dangerously-skip-permissions");
+    snprintf(g_ai_system_flag, sizeof(g_ai_system_flag), "--system-prompt");
+    snprintf(g_ai_prompt_flag, sizeof(g_ai_prompt_flag), "-p");
+
+    char config_path[MAX_PATH];
+    snprintf(config_path, sizeof(config_path), "%s/config.toml", g_neil_home);
+
+    FILE *cfg = fopen(config_path, "r");
+    if (cfg) {
+        char line[MAX_LINE];
+        while (fgets(line, sizeof(line), cfg)) {
+            char *eq = strchr(line, '=');
+            if (!eq) continue;
+            *eq = '\0';
+            char *key = line;
+            char *val = eq + 1;
+            /* trim whitespace and quotes */
+            while (*key == ' ' || *key == '\t') key++;
+            while (*val == ' ' || *val == '"' || *val == '\'') val++;
+            size_t vlen = strlen(val);
+            while (vlen > 0 && (val[vlen-1] == '\n' || val[vlen-1] == '"' ||
+                   val[vlen-1] == '\'' || val[vlen-1] == ' '))
+                val[--vlen] = '\0';
+
+            if (strcmp(key, "command") == 0)
+                snprintf(g_ai_command, sizeof(g_ai_command), "%s", val);
+            else if (strcmp(key, "system_prompt_flag") == 0)
+                snprintf(g_ai_system_flag, sizeof(g_ai_system_flag), "%s", val);
+            else if (strcmp(key, "prompt_flag") == 0)
+                snprintf(g_ai_prompt_flag, sizeof(g_ai_prompt_flag), "%s", val);
+            else if (strcmp(key, "max_react_turns") == 0)
+                g_max_react_turns = atoi(val);
+        }
+        fclose(cfg);
+        fprintf(stderr, "[autoprompt] config: ai=%s prompt=%s system=%s\n",
+                g_ai_command, g_ai_prompt_flag, g_ai_system_flag);
     }
 }
 
@@ -974,7 +1020,7 @@ static void timestamp_now(char *buf, size_t cap) {
     strftime(buf, cap, "%Y-%m-%dT%H-%M-%S", tm);
 }
 
-/* Execute claude --print -p <prompt> --system-prompt <identity>, capture output. */
+/* Execute AI command with prompt and optional system prompt. */
 static int run_claude(const char *prompt, const char *system_prompt,
                       char **out, size_t *out_len) {
     int pipefd[2];
@@ -993,7 +1039,7 @@ static int run_claude(const char *prompt, const char *system_prompt,
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
 
-        /* Ensure claude's dir is in PATH */
+        /* Ensure local bin dirs are in PATH */
         const char *oldpath = getenv("PATH");
         char newpath[MAX_PATH];
         snprintf(newpath, sizeof(newpath), "%s/.local/bin:%s",
@@ -1001,24 +1047,34 @@ static int run_claude(const char *prompt, const char *system_prompt,
                  oldpath ? oldpath : "/usr/bin");
         setenv("PATH", newpath, 1);
 
-        if (system_prompt && system_prompt[0]) {
-            execlp(claude_bin, claude_bin,
-                   "--print",
-                   "-p", prompt,
-                   "--system-prompt", system_prompt,
-                   "--output-format", "text",
-                   "--dangerously-skip-permissions",
-                   (char *)NULL);
-        } else {
-            execlp(claude_bin, claude_bin,
-                   "--print",
-                   "-p", prompt,
-                   "--output-format", "text",
-                   "--dangerously-skip-permissions",
-                   (char *)NULL);
+        /* Build argument array from config */
+        const char *argv[32];
+        int argc = 0;
+        argv[argc++] = g_ai_command;
+
+        /* Parse g_ai_args into individual arguments */
+        static char args_buf[MAX_PATH];
+        snprintf(args_buf, sizeof(args_buf), "%s", g_ai_args);
+        char *tok = strtok(args_buf, " ");
+        while (tok && argc < 24) {
+            argv[argc++] = tok;
+            tok = strtok(NULL, " ");
         }
-        /* If execl fails, write the error so we can see it */
-        dprintf(STDERR_FILENO, "execl failed: %s: %s\n", claude_bin, strerror(errno));
+
+        /* Add prompt */
+        argv[argc++] = g_ai_prompt_flag;
+        argv[argc++] = prompt;
+
+        /* Add system prompt if provided */
+        if (system_prompt && system_prompt[0] && g_ai_system_flag[0]) {
+            argv[argc++] = g_ai_system_flag;
+            argv[argc++] = system_prompt;
+        }
+
+        argv[argc] = NULL;
+
+        execvp(g_ai_command, (char *const *)argv);
+        dprintf(STDERR_FILENO, "exec failed: %s: %s\n", g_ai_command, strerror(errno));
         _exit(127);
     }
 
@@ -1088,7 +1144,7 @@ static void process_prompt(const char *filename) {
      * ReAct loop: reason -> act -> observe -> repeat
      * Max 3 iterations to prevent runaway.
      */
-    #define MAX_REACT_TURNS 3
+    /* max turns from config.toml, default 3 */
 
     /* Accumulate all outputs and call results across turns */
     size_t all_output_cap = 8192, all_output_len = 0;
@@ -1103,7 +1159,7 @@ static void process_prompt(const char *filename) {
     int exit_code = 0;
     int turn;
 
-    for (turn = 0; turn < MAX_REACT_TURNS; turn++) {
+    for (turn = 0; turn < g_max_react_turns; turn++) {
         /* Execute claude */
         char *output = NULL;
         size_t output_len = 0;
@@ -1293,11 +1349,12 @@ static void recover_active(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc > 1)
-        claude_bin = argv[1];
-
-    /* Resolve all paths from NEIL_HOME */
+    /* Resolve all paths and load config */
     resolve_neil_paths();
+
+    /* CLI override for AI command */
+    if (argc > 1)
+        snprintf(g_ai_command, sizeof(g_ai_command), "%s", argv[1]);
 
     /* Ensure directories exist */
     mkdir(QUEUE_DIR, 0755);
