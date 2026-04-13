@@ -1310,7 +1310,26 @@ int main(int argc, char **argv) {
     /* Crash recovery: move any active/ files back to queue/ */
     recover_active();
 
-    /* Process any files already in queue/ */
+    /* Queue wake-up prompt on startup */
+    {
+        char wakeup_src[MAX_PATH], wakeup_dst[MAX_PATH];
+        snprintf(wakeup_src, sizeof(wakeup_src), "%s/essence/wakeup.md", g_neil_home);
+        if (access(wakeup_src, F_OK) == 0) {
+            char ts[64];
+            timestamp_now(ts, sizeof(ts));
+            snprintf(wakeup_dst, sizeof(wakeup_dst), "%s/%s_wakeup.md", QUEUE_DIR, ts);
+
+            size_t wlen;
+            char *wdata = read_file(wakeup_src, &wlen);
+            if (wdata) {
+                write_file_atomic(wakeup_dst, wdata, wlen);
+                free(wdata);
+                printf("[autoprompt] wake-up prompt queued\n");
+            }
+        }
+    }
+
+    /* Process any files already in queue/ (including wake-up) */
     drain_existing();
 
     /* Set up inotify */
