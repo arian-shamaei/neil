@@ -1,0 +1,22 @@
+# Rebuildable artifacts (don't snapshot)
+memory/mempalace/.venv/
+memory/mempalace/.git/
+memory/palace/.mempalace/
+mirror/remotes/*/
+
+# Build artifacts
+tools/autoPrompter/autoprompt
+tools/autoPrompter/active/
+memory/zettel/zettel
+memory/zettel/index/
+memory/zettel/notes/
+
+# Runtime state (ephemeral)
+tools/autoPrompter/queue/
+tools/autoPrompter/history/
+
+# Temp files
+*.tmp
+*.bak
+*.swp
+memory/mempalace/

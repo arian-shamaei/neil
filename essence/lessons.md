@@ -1,0 +1,1 @@
+/home/seal/.neil/self/lessons.md

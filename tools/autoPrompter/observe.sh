@@ -1,0 +1,144 @@
+#!/bin/sh
+# observe.sh -- Gather system observations for heartbeat
+# Called by autoPrompter before Claude invocation.
+# Output is plain text injected into the [OBSERVATIONS] section.
+
+echo "=== System ==="
+echo "disk: $(df -h / | awk 'NR==2{print $5 " used, " $4 " free"}')"
+echo "ram: $(free -h | awk 'NR==2{print $3 " used, " $7 " available"}')"
+echo "load: $(uptime | sed 's/.*load average: //')"
+echo "uptime: $(uptime -p)"
+
+echo ""
+echo "=== Services ==="
+systemctl is-active autoprompt 2>/dev/null | xargs printf "autoprompt: %s\n"
+pgrep -c claude 2>/dev/null | xargs printf "claude processes: %s\n"
+
+echo ""
+echo "=== Input Watchers ==="
+for W in "$HOME/.neil/inputs/watchers/"*.sh; do
+    [ -f "$W" ] || continue
+    NAME=$(basename "$W" .sh)
+    PID=$(pgrep -f "$W" 2>/dev/null | head -1)
+    if [ -n "$PID" ]; then
+        echo "$NAME: running (pid $PID)"
+    else
+        echo "$NAME: stopped"
+    fi
+done
+
+echo ""
+echo "=== Memory Palace ==="
+export ZETTEL_HOME="$HOME/.neil/memory/palace"
+$HOME/.neil/memory/zettel/zettel context 2>/dev/null
+
+echo ""
+echo "=== Queue ==="
+QUEUE_COUNT=$(ls "$HOME/.neil/tools/autoPrompter/queue/" 2>/dev/null | wc -l)
+ACTIVE_COUNT=$(ls "$HOME/.neil/tools/autoPrompter/active/" 2>/dev/null | wc -l)
+echo "queue: $QUEUE_COUNT pending"
+echo "active: $ACTIVE_COUNT processing"
+
+echo ""
+echo "=== Recent History (last 3) ==="
+ls -t "$HOME/.neil/tools/autoPrompter/history/"*.result.md 2>/dev/null | head -3 | while read f; do
+    NAME=$(basename "$f" .result.md)
+    STATUS=$(grep 'exit_code' "$f" 2>/dev/null | head -1 | sed 's/.*: //' | tr -d '*')
+    TURNS=$(grep 'turns' "$f" 2>/dev/null | head -1 | sed 's/.*: //' | tr -d '*')
+    echo "  $NAME [exit:${STATUS:-?} turns:${TURNS:-1}]"
+done
+
+echo ""
+echo "=== Heartbeat Log (last 3) ==="
+tail -3 "$HOME/.neil/heartbeat_log.json" 2>/dev/null || echo "(empty)"
+
+echo ""
+echo "=== Intentions (pending) ==="
+if [ -f "$HOME/.neil/intentions.json" ]; then
+    grep '"status":"pending"' "$HOME/.neil/intentions.json" 2>/dev/null | while IFS= read -r line; do
+        PRIO=$(echo "$line" | sed 's/.*"priority":"\([^"]*\)".*/\1/')
+        DUE=$(echo "$line" | sed 's/.*"due":"\([^"]*\)".*/\1/')
+        DESC=$(echo "$line" | sed 's/.*"description":"\([^"]*\)".*/\1/')
+        TAG=$(echo "$line" | sed 's/.*"tag":"\([^"]*\)".*/\1/')
+        if [ -n "$DUE" ]; then
+            echo "  [$PRIO] $DESC (due: $DUE) ${TAG:+#$TAG}"
+        else
+            echo "  [$PRIO] $DESC ${TAG:+#$TAG}"
+        fi
+    done
+    PENDING=$(grep -c '"status":"pending"' "$HOME/.neil/intentions.json" 2>/dev/null || echo 0)
+    echo "total: $PENDING pending"
+else
+    echo "(none)"
+fi
+
+echo ""
+echo "=== Self Check ==="
+$HOME/.neil/self/self_check.sh 2>/dev/null | grep -E 'FAIL|FAILED|ALL CHECKS'
+
+echo ""
+echo "=== Unresolved Failures ==="
+if [ -f "$HOME/.neil/self/failures.json" ] && [ -s "$HOME/.neil/self/failures.json" ]; then
+    grep '"pending"' "$HOME/.neil/self/failures.json" 2>/dev/null | while IFS= read -r line; do
+        SEV=$(echo "$line" | sed 's/.*"severity":"\([^"]*\)".*/\1/')
+        SRC=$(echo "$line" | sed 's/.*"source":"\([^"]*\)".*/\1/')
+        ERR=$(echo "$line" | sed 's/.*"error":"\([^"]*\)".*/\1/')
+        echo "  [$SEV] $SRC: $ERR"
+    done
+    UNRESOLVED=$(grep -c '"pending"' "$HOME/.neil/self/failures.json" 2>/dev/null || echo 0)
+    echo "total: $UNRESOLVED unresolved"
+else
+    echo "(none)"
+fi
+
+echo ""
+echo "=== Guardrails ==="
+# Daily beat count
+TODAY=$(date +%Y-%m-%d)
+TODAY_BEATS=$(grep -c "$TODAY" "$HOME/.neil/heartbeat_log.json" 2>/dev/null || echo 0)
+echo "beats today: $TODAY_BEATS / 50"
+if [ "$TODAY_BEATS" -ge 50 ]; then
+    echo "WARNING: DAILY BUDGET EXHAUSTED"
+fi
+
+# Loop detection: check if last 3 summaries are identical
+if [ -f "$HOME/.neil/heartbeat_log.json" ]; then
+    LAST3=$(tail -3 "$HOME/.neil/heartbeat_log.json" 2>/dev/null | sed 's/.*"summary":"\([^"]*\)".*/\1/' | sort -u | wc -l)
+    if [ "$LAST3" -eq 1 ] 2>/dev/null; then
+        echo "WARNING: LAST 3 BEATS IDENTICAL -- possible loop"
+    fi
+fi
+
+# Quiet hours
+HOUR=$(date +%H)
+if [ "$HOUR" -ge 23 ] || [ "$HOUR" -lt 7 ]; then
+    echo "QUIET HOURS ACTIVE -- heartbeat checks only"
+fi
+
+# Disk usage
+DISK_PCT=$(df / | awk 'NR==2{print $5}' | tr -d '%')
+if [ "$DISK_PCT" -ge 80 ]; then
+    echo "WARNING: DISK USAGE ${DISK_PCT}%"
+fi
+
+# Pending intentions count
+if [ -f "$HOME/.neil/intentions.json" ]; then
+    PENDING=$(grep -c '"pending"' "$HOME/.neil/intentions.json" 2>/dev/null || echo 0)
+    if [ "$PENDING" -ge 20 ]; then
+        echo "WARNING: ${PENDING} pending intentions -- consolidate before adding more"
+    fi
+fi
+
+echo ""
+echo "=== Mirror Remotes ==="
+if [ -d "$HOME/.neil/mirror/remotes" ]; then
+    for DIR in "$HOME/.neil/mirror/remotes"/*/; do
+        [ -d "$DIR" ] || continue
+        NAME=$(basename "$DIR")
+        REMOTE=$(cat "$DIR/.rclone_remote" 2>/dev/null || echo "?")
+        LAST=$(cd "$DIR" && git log -1 --format="%ar: %s" 2>/dev/null || echo "never synced")
+        echo "  $NAME ($REMOTE) -- $LAST"
+    done
+else
+    echo "(none configured)"
+fi

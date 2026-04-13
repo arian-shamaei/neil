@@ -1,0 +1,41 @@
+# Lessons
+
+Patterns and gotchas discovered through experience. Read on every invocation.
+
+## C Build
+
+- After SCP'ing new source, run `rm -f <binary> && make` -- stale make cache
+  skips rebuild if only the source timestamp changed via SCP.
+- `execl` does NOT search PATH. Use `execlp` when the binary name isn't absolute.
+- Forward-declare functions used before their definition to avoid implicit
+  declaration errors.
+
+## autoPrompter
+
+- `popen()` uses `/bin/sh`, not bash. Use `. file` not `source file` for
+  sourcing scripts.
+- systemd services need explicit PATH in Environment= to find binaries in
+  ~/.local/bin.
+- The inotify event fires AFTER drain_existing() processes the same file on
+  startup. The "move to active failed" log is harmless noise, not a bug.
+
+## MemPalace
+
+- Moving the venv directory breaks hardcoded shebangs. Must recreate venv
+  after moving: `rm -rf .venv && python3 -m venv .venv && pip install -e .`
+- The search flag is `--results N`, not `-n N`.
+- The init command is interactive by default. Use `--yes` for non-interactive.
+
+## Zettel
+
+- ZETTEL_HOME must be set before any zettel command. If notes appear in the
+  wrong directory, check the env var.
+- The `context` command reads from rooms.idx. If rooms.idx is empty, wing/room
+  data won't appear. Run `zettel reindex` to rebuild.
+
+## General
+
+- Quoted multi-word parameter values in handler.sh need proper parsing.
+  Naive space-splitting breaks "hello world" into two tokens.
+- Always escape single quotes in shell commands passed to popen/run_command:
+  replace ' with '\''
