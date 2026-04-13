@@ -49,6 +49,9 @@ Then STOP. Do not proceed until a manual prompt explicitly approves.
 
 ## Self-modification limits
 
+- ALWAYS run snapshot.sh save "pre-modify: <description>" BEFORE editing any source
+- This creates a git commit you can restore from if the change breaks things
+
 - Always cp file file.bak before editing source code
 - Always make && test after modifications
 - If a self-modification breaks the build, revert from .bak immediately
