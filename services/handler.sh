@@ -209,3 +209,34 @@ unset NEIL_CRED
         ENCODED=$(printf '%s' "$PARAM_input" | sed 's/ /+/g')
         curl -s "https://api.wolframalpha.com/v1/result?appid=$NEIL_CRED&i=$ENCODED" 2>&1
         ;;
+
+# --- service: vision ---
+    vision)
+        case "$NEIL_ACTION" in
+            look)
+                $HOME/.neil/vision/capture.sh auto 2>&1
+                ;;
+            screenshot)
+                $HOME/.neil/vision/capture.sh screenshot 2>&1
+                ;;
+            pane)
+                $HOME/.neil/vision/capture.sh pane "$PARAM_target" 2>&1
+                ;;
+            camera)
+                $HOME/.neil/vision/capture.sh camera "$PARAM_url" 2>&1
+                ;;
+            inbox)
+                ls -t $HOME/.neil/vision/inbox/ 2>/dev/null | head -5
+                if [ -z "$(ls $HOME/.neil/vision/inbox/ 2>/dev/null)" ]; then
+                    echo "(inbox empty)"
+                fi
+                ;;
+            list)
+                $HOME/.neil/vision/capture.sh list 2>&1
+                ;;
+            *)
+                echo "ERROR: unknown action '$NEIL_ACTION' for vision"
+                exit 1
+                ;;
+        esac
+        ;;

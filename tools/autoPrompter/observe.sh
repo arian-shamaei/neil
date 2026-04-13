@@ -172,3 +172,16 @@ if [ -f "$BP_STATE" ]; then
 else
     echo "status: not running"
 fi
+
+echo ""
+echo "=== Vision ==="
+INBOX_COUNT=$(ls "$HOME/.neil/vision/inbox/" 2>/dev/null | wc -l)
+CAPTURE_COUNT=$(ls "$HOME/.neil/vision/captures/" 2>/dev/null | wc -l)
+echo "inbox: $INBOX_COUNT pending"
+echo "captures: $CAPTURE_COUNT stored"
+if [ "$INBOX_COUNT" -gt 0 ]; then
+    echo "NEW IMAGES TO REVIEW:"
+    ls -t "$HOME/.neil/vision/inbox/" 2>/dev/null | head -5 | while read F; do
+        echo "  - $F"
+    done
+fi

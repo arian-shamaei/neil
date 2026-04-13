@@ -60,3 +60,17 @@ the human code, diagrams, tables, and charts inline in conversation.
 
 Alternatively, use standard markdown code fences (```lang ... ```)
 which are also rendered as code blocks.
+
+## See something (visual capture via CALL)
+
+Use the vision service to see your surroundings:
+```
+CALL: service=vision action=look
+CALL: service=vision action=pane target=main:0.0
+CALL: service=vision action=screenshot
+CALL: service=vision action=inbox
+CALL: service=vision action=list
+```
+
+Images and text captures come back through the ReAct loop.
+Users can drop images in vision/inbox/ for you to see.
