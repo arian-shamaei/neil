@@ -1,0 +1,1 @@
+/home/seal/.neil/plugins/installed/wolfram/registry.md

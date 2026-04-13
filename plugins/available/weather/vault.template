@@ -1,0 +1,3 @@
+OpenWeatherMap API key required.
+Get one at: https://openweathermap.org/api (free tier: 1000 calls/day)
+Save to: ~/.neil/services/vault/weather.key

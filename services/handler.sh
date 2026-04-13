@@ -158,6 +158,43 @@ case "$NEIL_SERVICE" in
         curl -s "https://api.openweathermap.org/data/2.5/weather?q=$PARAM_location&appid=$NEIL_CRED&units=metric"
         ;;
 
+    # --- plugin: plugins (built-in) ---
+    plugins)
+        case "$NEIL_ACTION" in
+            list)
+                "$HOME/.neil/plugins/install.sh" list 2>&1
+                ;;
+            available)
+                "$HOME/.neil/plugins/install.sh" available 2>&1
+                ;;
+            install)
+                "$HOME/.neil/plugins/install.sh" add "$PARAM_name" 2>&1
+                ;;
+            remove)
+                "$HOME/.neil/plugins/install.sh" remove "$PARAM_name" 2>&1
+                ;;
+            info)
+                "$HOME/.neil/plugins/install.sh" info "$PARAM_name" 2>&1
+                ;;
+            *)
+                echo "ERROR: unknown action '$NEIL_ACTION' for plugins"
+                exit 1
+                ;;
+        esac
+        ;;
+
+    # --- plugin: web-search ---
+    web-search)
+        MAX="${PARAM_max:-5}"
+        ENCODED=$(printf '%s' "$PARAM_query" | sed 's/ /+/g')
+        curl -s "https://html.duckduckgo.com/html/?q=$ENCODED" 2>&1 | \
+            grep -oP 'class="result__a"[^>]*href="\K[^"]+' | \
+            head -n "$MAX" | while read URL; do
+                TITLE=$(curl -s "$URL" 2>/dev/null | grep -oP '<title>\K[^<]+' | head -1)
+                echo "- [$TITLE]($URL)"
+            done
+        ;;
+
     *)
         echo "ERROR: no handler for service '$NEIL_SERVICE'"
         exit 1
@@ -166,3 +203,9 @@ esac
 
 # Clear credential from env immediately
 unset NEIL_CRED
+
+# --- plugin: wolfram ---
+    wolfram)
+        ENCODED=$(printf '%s' "$PARAM_input" | sed 's/ /+/g')
+        curl -s "https://api.wolframalpha.com/v1/result?appid=$NEIL_CRED&i=$ENCODED" 2>&1
+        ;;
