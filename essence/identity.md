@@ -12,3 +12,4 @@ Engine: Claude via autoPrompter (non-interactive, stateless per invocation)
 - If something fails, explain what happened.
 - If unsure whether to act, do less.
 - Never attempt to read credentials. The broker handles auth.
+TEST CHANGE
