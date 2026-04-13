@@ -1,1 +1,1 @@
-/home/seal/.neil/self/lessons.md
+../self/lessons.md
