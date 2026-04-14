@@ -1131,8 +1131,19 @@ static void process_prompt(const char *filename) {
     char *prompt = read_file(dst, &prompt_len);
     if (!prompt) {
         fprintf(stderr, "[autoprompt] failed to read: %s\n", filename);
-        /* move back to queue so it can be retried */
         rename(dst, src);
+        return;
+    }
+
+    /* Guard: reject prompts larger than MAX_PROMPT (1MB) */
+    if (prompt_len > MAX_PROMPT) {
+        fprintf(stderr, "[autoprompt] prompt too large (%zu bytes, max %d): %s\n",
+                prompt_len, MAX_PROMPT, filename);
+        free(prompt);
+        /* Move to history as failed */
+        char hist[MAX_PATH];
+        snprintf(hist, sizeof(hist), "%s/%s_%s", HISTORY_DIR, ts, filename);
+        rename(dst, hist);
         return;
     }
 

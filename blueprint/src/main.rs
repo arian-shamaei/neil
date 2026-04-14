@@ -180,7 +180,13 @@ fn main() -> anyhow::Result<()> {
                                     scroll_offset = 0;
                                     let ts = chrono::Local::now().format("%Y%m%dT%H%M%S");
                                     let path = queue_dir.join(format!("{}_chat.md", ts));
-                                    let _ = fs::write(&path, &msg);
+                                    if msg.len() > 50_000 {
+                                        stream.push(StreamEntry::new(EntryKind::System,
+                                            format!("Message too large ({} chars, max 50000). Truncated.", msg.len())));
+                                        let _ = fs::write(&path, &msg[..50_000]);
+                                    } else {
+                                        let _ = fs::write(&path, &msg);
+                                    }
                                     stream.push(StreamEntry::new(EntryKind::System, "thinking...".into()));
                                 }
                             }
@@ -195,7 +201,7 @@ fn main() -> anyhow::Result<()> {
                                         'u' => { input.clear(); cursor_pos = 0; }
                                         _ => {}
                                     }
-                                } else {
+                                } else if input.len() < 4096 {
                                     input.insert(cursor_pos, c);
                                     cursor_pos += 1;
                                     last_input_time = Instant::now();
