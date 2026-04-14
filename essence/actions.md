@@ -74,3 +74,11 @@ CALL: service=vision action=list
 
 Images and text captures come back through the ReAct loop.
 Users can drop images in vision/inbox/ for you to see.
+
+## Snapshots (before self-modification)
+
+Before editing any source file, run:
+
+
+To see recent snapshots: 
+To restore if something breaks: 

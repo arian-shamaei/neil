@@ -31,6 +31,7 @@ enum View {
 }
 
 const PANEL_NAMES: &[(&str, &str)] = &[
+    ("Neil", "Seal art, mood, and consciousness"),
     ("Memory", "Browse wings, rooms, and notes"),
     ("Heartbeat", "Timeline of heartbeat activity"),
     ("Intentions", "Task board with priorities"),
@@ -625,19 +626,20 @@ fn render_panel_selector(frame: &mut ratatui::Frame, area: Rect, selected: usize
 
 fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: &NeilState, fps: u32) {
     let (name, _) = PANEL_NAMES.get(idx).unwrap_or(&("?", ""));
-    let title = format!(" {} | Esc:close 1-7:switch ", name);
+    let title = format!(" {} | Esc:close 1-8:switch ", name);
     let block = Block::default().borders(Borders::ALL).title(title).border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let lines: Vec<Line> = match idx {
-        0 => render_memory_panel(state),
-        1 => render_heartbeat_panel(state),
-        2 => render_intentions_panel(state),
-        3 => render_system_panel(state),
-        4 => render_services_panel(state),
-        5 => render_failures_panel(state),
-        6 => render_logs_panel(),
+        0 => render_seal_panel(state),
+        1 => render_memory_panel(state),
+        2 => render_heartbeat_panel(state),
+        3 => render_intentions_panel(state),
+        4 => render_system_panel(state),
+        5 => render_services_panel(state),
+        6 => render_failures_panel(state),
+        7 => render_logs_panel(),
         _ => vec![Line::from("Unknown panel")],
     };
     frame.render_widget(Paragraph::new(lines), inner);
@@ -650,6 +652,94 @@ fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: 
 }
 
 // ── Panel renderers ──
+
+fn render_seal_panel(s: &NeilState) -> Vec<Line<'static>> {
+    let hour = s.now.format("%H").to_string().parse::<u8>().unwrap_or(12);
+    let (mood_label, mood_color, eyes, mouth) = if hour >= 23 || hour < 7 {
+        ("sleeping", Color::Blue, "-  -", " z ")
+    } else if s.failures.iter().any(|f| f.resolution == "pending") {
+        ("alert!", Color::Red, "O  O", " ! ")
+    } else if s.heartbeat.beats_today > 35 {
+        ("tired", Color::Yellow, "-  -", " ~ ")
+    } else if s.system.queue_count > 0 {
+        ("working", Color::Cyan, "o  o", " . ")
+    } else {
+        ("happy", Color::Green, "^  ^", " w ")
+    };
+
+    let mc = mood_color;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        "  \u{1F9AD} NEIL THE SEAL",
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    let eyes_line = format!("     |  {}  |   ", eyes);
+    let mouth_line = format!("     |   {}   |   ", mouth);
+    let art: Vec<&str> = vec![
+        "        _____      ",
+        "      /       \\    ",
+        &eyes_line,
+        &mouth_line,
+        "      \\ .---. /    ",
+        "       '-----'     ",
+        "      /|     |\\    ",
+        "     / |     | \\   ",
+        "  ~~~~~~~~~~~~~~~~~~",
+    ];
+    for a in art {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", a),
+            Style::default().fg(mc),
+        )));
+    }
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(vec![
+        Span::styled("  mood: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(mood_label.to_string(), Style::default().fg(mc).add_modifier(Modifier::BOLD)),
+    ]));
+
+    let consciousness = format!(
+        "{}b/50 | {}n | {}w",
+        s.heartbeat.beats_today,
+        s.palace.total_notes,
+        s.palace.wings.len(),
+    );
+    lines.push(Line::from(vec![
+        Span::styled("  mind: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(consciousness, Style::default().fg(Color::White)),
+    ]));
+
+    if !s.heartbeat.last_beat.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("  last: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(s.heartbeat.last_beat.clone(), Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    let pending: usize = s.intentions.iter().filter(|i| i.status == "pending").count();
+    let unresolved: usize = s.failures.iter().filter(|f| f.resolution == "pending").count();
+    if pending > 0 || unresolved > 0 {
+        lines.push(Line::from(""));
+        if pending > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  {} pending intentions", pending),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        if unresolved > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  {} unresolved failures", unresolved),
+                Style::default().fg(Color::Red),
+            )));
+        }
+    }
+
+    lines
+}
 
 fn render_memory_panel(s: &NeilState) -> Vec<Line<'static>> {
     let mut l = vec![
