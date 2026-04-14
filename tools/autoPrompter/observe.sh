@@ -185,3 +185,14 @@ if [ "$INBOX_COUNT" -gt 0 ]; then
         echo "  - $F"
     done
 fi
+
+echo ""
+echo "=== Stream ==="
+if [ -f "\$HOME/.neil/.neil_stream" ]; then
+    HEAD=\$(head -1 "\$HOME/.neil/.neil_stream" 2>/dev/null)
+    STATUS=\$(echo "\$HEAD" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
+    SIZE=\$(wc -c < "\$HOME/.neil/.neil_stream" 2>/dev/null)
+    echo "status: \$STATUS (\${SIZE} bytes)"
+else
+    echo "status: idle"
+fi

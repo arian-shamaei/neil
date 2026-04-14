@@ -19,6 +19,8 @@ pub struct BlueprintState {
     pub sidebar_visible: bool,
     pub user_active: bool,      // true if user typed in last 60s
     pub last_input_time: String,
+    pub streaming: bool,        // true if Neil is producing output live
+    pub stream_chars: usize,    // bytes received so far in live stream
 }
 
 impl BlueprintState {

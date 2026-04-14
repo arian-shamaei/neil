@@ -91,6 +91,9 @@ fn main() -> anyhow::Result<()> {
     let mut tick: u64 = 0;
     let mut last_history_count: usize = 0;
     let mut last_input_time = Instant::now();
+    let mut last_stream_len: usize = 0;
+    let mut stream_active = false;
+    let mut live_entry_idx: Option<usize> = None;
     let mut fps = FpsTracker::new();
 
     // Cache: only reload state every 10 ticks
@@ -116,11 +119,75 @@ fn main() -> anyhow::Result<()> {
         }
         let state = cached_state.as_ref().unwrap();
 
+        // Tail stream file every frame for live output
+        {
+            let stream_path = neil_home.join(".neil_stream");
+            if let Ok(content) = fs::read_to_string(&stream_path) {
+                if let Some(nl) = content.find('\n') {
+                    let header = &content[..nl];
+                    let body = &content[nl+1..];
+
+                    // Check if stream is active
+                    let is_running = header.contains("\"running\"");
+                    let is_done = body.contains("{\"status\":\"done\"");
+
+                    // Strip the done marker from display
+                    let display_body = if let Some(done_pos) = body.rfind("\n{\"status\":\"done\"") {
+                        &body[..done_pos]
+                    } else {
+                        body
+                    };
+
+                    if is_running && display_body.len() > last_stream_len {
+                        // New content -- update or create live entry
+                        if let Some(idx) = live_entry_idx {
+                            if idx < stream.len() {
+                                stream[idx] = StreamEntry::new(
+                                    EntryKind::Neil,
+                                    display_body.to_string(),
+                                );
+                            }
+                        } else {
+                            // Remove "thinking..." if present
+                            if let Some(last) = stream.last() {
+                                if matches!(last.kind, EntryKind::System) {
+                                    if last.blocks.first().map(|b| matches!(b, RichBlock::Text(t) if t.contains("thinking"))).unwrap_or(false) {
+                                        stream.pop();
+                                    }
+                                }
+                            }
+                            stream.push(StreamEntry::new(
+                                EntryKind::Neil,
+                                display_body.to_string(),
+                            ));
+                            live_entry_idx = Some(stream.len() - 1);
+                        }
+                        last_stream_len = display_body.len();
+                        stream_active = true;
+                        if auto_scroll { scroll_offset = 0; }
+                        needs_redraw = true;
+                    }
+
+                    if is_done && stream_active {
+                        // Stream finished -- finalize the live entry
+                        stream_active = false;
+                        live_entry_idx = None;
+                        last_stream_len = 0;
+                        // Result file will be picked up by check_new_results
+                    }
+                }
+            }
+        }
+
         // Check for new results every ~2 seconds
-        if tick % 4 == 0 {
+        if tick % 4 == 0 && !stream_active {
             let prev = last_history_count;
             check_new_results(&history_dir, &mut stream, &mut last_history_count, &mut auto_scroll);
-            if last_history_count != prev { needs_redraw = true; }
+            if last_history_count != prev {
+                // If we had a live entry, the result replaces it
+                // (check_new_results won't add duplicate because stream already has it)
+                needs_redraw = true;
+            }
         }
 
         if auto_scroll { scroll_offset = 0; }
@@ -348,6 +415,8 @@ fn main() -> anyhow::Result<()> {
                 last_input_time: if last_input_time.elapsed() < Duration::from_secs(3600) {
                     format!("{}s ago", last_input_time.elapsed().as_secs())
                 } else { "inactive".into() },
+                streaming: stream_active,
+                stream_chars: last_stream_len,
             };
             bp_state.write(&neil_home);
         }

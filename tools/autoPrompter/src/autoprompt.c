@@ -1026,7 +1026,35 @@ static void timestamp_now(char *buf, size_t cap) {
     strftime(buf, cap, "%Y-%m-%dT%H-%M-%S", tm);
 }
 
-/* Execute AI command with prompt and optional system prompt. */
+/* Stream file path for live output */
+static int g_stream_fd = -1;
+
+static void stream_open(const char *prompt_name) {
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s/.neil_stream", g_neil_home);
+    g_stream_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (g_stream_fd >= 0) {
+        dprintf(g_stream_fd, "{\"status\":\"running\",\"prompt\":\"%s\"}\n", prompt_name);
+    }
+}
+
+static void stream_write(const char *data, size_t len) {
+    if (g_stream_fd >= 0) {
+        ssize_t w = write(g_stream_fd, data, len);
+        (void)w;
+    }
+}
+
+static void stream_close(int exit_code) {
+    if (g_stream_fd >= 0) {
+        dprintf(g_stream_fd, "\n{\"status\":\"done\",\"exit_code\":%d}\n", exit_code);
+        close(g_stream_fd);
+        g_stream_fd = -1;
+    }
+}
+
+/* Execute AI command with prompt and optional system prompt.
+ * Streams output to ~/.neil/.neil_stream in real-time. */
 static int run_claude(const char *prompt, const char *system_prompt,
                       char **out, size_t *out_len) {
     int pipefd[2];
@@ -1093,6 +1121,9 @@ static int run_claude(const char *prompt, const char *system_prompt,
 
     ssize_t n;
     while ((n = read(pipefd[0], buf + len, cap - len - 1)) > 0) {
+        /* Stream to file in real-time */
+        stream_write(buf + len, (size_t)n);
+
         len += (size_t)n;
         if (len >= cap - 1) {
             cap *= 2;
@@ -1153,7 +1184,10 @@ static void process_prompt(const char *filename) {
         return;
     }
 
-    /* 3. Build augmented prompt with context + memories */
+    /* 3. Open stream for live output */
+    stream_open(filename);
+
+    /* 4. Build augmented prompt with context + memories */
     char *essence = NULL;
     char *aug_prompt = build_augmented_prompt(prompt, &essence);
 
@@ -1226,6 +1260,13 @@ static void process_prompt(const char *filename) {
             fprintf(stderr, "[autoprompt] ReAct turn %d: CALL results received, re-invoking\n",
                     turn + 1);
 
+            /* Stream turn separator */
+            {
+                char sep[64];
+                int sl = snprintf(sep, sizeof(sep), "\n--- turn %d ---\n", turn + 2);
+                stream_write(sep, (size_t)sl);
+            }
+
             /* Build follow-up prompt with call results */
             size_t followup_cap = output_len + cr_len + 256;
             char *followup = malloc(followup_cap);
@@ -1252,6 +1293,9 @@ static void process_prompt(const char *filename) {
         free(output);
         break;
     }
+
+    /* Close stream */
+    stream_close(exit_code);
 
     /* Reindex mempalace once after all turns */
     reindex_mempalace();
