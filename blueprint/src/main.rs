@@ -691,7 +691,12 @@ fn render_stream(
 fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(6), Constraint::Length(8), Constraint::Min(4)])
+        .constraints([
+            Constraint::Length(6),   // status
+            Constraint::Length(8),   // memory
+            Constraint::Length(6),   // intents
+            Constraint::Min(10),    // seal art
+        ])
         .split(area);
 
     let status_lines = vec![
@@ -734,7 +739,95 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState) {
         Paragraph::new(intent_lines).block(Block::default().borders(Borders::ALL).title(" intents ").border_style(Style::default().fg(Color::DarkGray))),
         chunks[2],
     );
+
+    // Seal art -- compact ASCII seal in the bottom of the sidebar
+    let seal = pick_seal_art(state);
+    let mut seal_lines: Vec<Line> = Vec::new();
+    for art_line in seal {
+        seal_lines.push(Line::from(Span::styled(
+            format!(" {}", art_line),
+            Style::default().fg(Color::Cyan),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(seal_lines).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray))),
+        chunks[3],
+    );
 }
+
+/// Pick a compact seal art based on current state
+fn pick_seal_art(state: &NeilState) -> &'static [&'static str] {
+    let pending_fails = state.failures.iter().filter(|f| f.resolution == "pending").count();
+    let pending_intents = state.intentions.iter().filter(|i| i.status == "pending").count();
+
+    if pending_fails > 0 {
+        SEAL_STRESSED
+    } else if state.system.queue_count > 0 {
+        SEAL_WORKING
+    } else if pending_intents > 0 {
+        SEAL_FOCUSED
+    } else if state.heartbeat.beats_today > 40 {
+        SEAL_TIRED
+    } else {
+        SEAL_HAPPY
+    }
+}
+
+// Compact seal art (fits in ~22 chars wide, ~8 lines)
+const SEAL_HAPPY: &[&str] = &[
+    "      .------.",
+    "     / ^    ^ \\",
+    "    | (o)  (o) |",
+    "    |    __    |",
+    "    |   \\__/   |",
+    "     \\________/",
+    "    ~~ Neil ~~  :)",
+    "   ~ feeling good ~",
+];
+
+const SEAL_FOCUSED: &[&str] = &[
+    "      .------.",
+    "     / -    - \\",
+    "    | (o)  (o) |",
+    "    |    __    |",
+    "    |   |__|   |",
+    "     \\________/",
+    "    ~~ Neil ~~",
+    "   ~ watching... ~",
+];
+
+const SEAL_WORKING: &[&str] = &[
+    "      .------.",
+    "     / *    * \\",
+    "    | (o)  (o) |",
+    "    |    __    |",
+    "    |   |==|   |",
+    "     \\________/",
+    "    ~~ Neil ~~ *",
+    "   ~ working... ~",
+];
+
+const SEAL_STRESSED: &[&str] = &[
+    "     !! ! !!",
+    "      .------.",
+    "     / >    < \\",
+    "    | (x)  (x) |",
+    "    |    __    |",
+    "    |   {><}   |",
+    "     \\________/",
+    "   ~ stressed! ~",
+];
+
+const SEAL_TIRED: &[&str] = &[
+    "      .------.",
+    "     / -    - \\",
+    "    | (-)  (-) |",
+    "    |    __    |",
+    "    |   {__}   | z",
+    "     \\________/  z",
+    "    ~~ Neil ~~  z",
+    "    ~ sleepy... ~",
+];
 
 fn render_panel_selector(frame: &mut ratatui::Frame, area: Rect, selected: usize) {
     let w = 40.min(area.width.saturating_sub(4));
