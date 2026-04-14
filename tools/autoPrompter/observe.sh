@@ -3,6 +3,9 @@
 # Called by autoPrompter before Claude invocation.
 # Output is plain text injected into the [OBSERVATIONS] section.
 
+# Update seal pose for TUI
+"$HOME/.neil/tools/update_seal_pose.sh" 2>/dev/null
+
 echo "=== System ==="
 echo "disk: $(df -h / | awk 'NR==2{print $5 " used, " $4 " free"}')"
 echo "ram: $(free -h | awk 'NR==2{print $3 " used, " $7 " available"}')"
