@@ -176,6 +176,50 @@ impl DotGrid {
             }
         }
     }
+
+    /// Clear (erase) interior of an ellipse -- subtractive geometry
+    fn clear_ellipse(&mut self, cx: f32, cy: f32, rx: f32, ry: f32) {
+        let x0 = (cx - rx).floor() as i32;
+        let x1 = (cx + rx).ceil() as i32;
+        let y0 = (cy - ry).floor() as i32;
+        let y1 = (cy + ry).ceil() as i32;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let dx = (x as f32 - cx) / rx;
+                let dy = (y as f32 - cy) / ry;
+                if dx * dx + dy * dy < 0.85 { // slightly smaller than 1.0 to keep the outline
+                    if x >= 0 && y >= 0 && (x as usize) < DOT_W && (y as usize) < DOT_H {
+                        self.dots[y as usize][x as usize] = false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Clear interior of a rotated ellipse -- subtractive geometry
+    fn clear_ellipse_rotated(&mut self, cx: f32, cy: f32, rx: f32, ry: f32, angle: f32) {
+        let cos_a = angle.cos();
+        let sin_a = angle.sin();
+        let r = rx.max(ry);
+        let x0 = (cx - r - 1.0).floor() as i32;
+        let x1 = (cx + r + 1.0).ceil() as i32;
+        let y0 = (cy - r - 1.0).floor() as i32;
+        let y1 = (cy + r + 1.0).ceil() as i32;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                let lx = dx * cos_a + dy * sin_a;
+                let ly = -dx * sin_a + dy * cos_a;
+                let d = (lx / rx) * (lx / rx) + (ly / ry) * (ly / ry);
+                if d < 0.8 { // keep outline, clear interior
+                    if x >= 0 && y >= 0 && (x as usize) < DOT_W && (y as usize) < DOT_H {
+                        self.dots[y as usize][x as usize] = false;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Draw a line between two points using Bresenham
@@ -410,6 +454,22 @@ pub fn render_seal(pose: &SealPose, tick: u64) -> Vec<String> {
     let nose_y = (head_y + 2.0) as i32;
     g.set(nose_x, nose_y);
     g.set(nose_x + 1, nose_y);
+
+    // ── SUBTRACTIVE GEOMETRY ──
+
+    // 1. Clear the internal seam where head bottom contour meets body top.
+    //    Only remove the head's lower-arc dots inside the body zone.
+    let jx0 = (head_x + 2.0) as i32;
+    let jx1 = (head_x + 7.0) as i32;
+    let jy0 = (head_y + 5.0) as i32;
+    let jy1 = (cy + max_ry * 0.4) as i32;
+    g.clear_rect(jx0, jy0, jx1 - jx0, jy1 - jy0);
+
+    // 2. Clear interior of front flipper so body lines inside it are removed
+    g.clear_ellipse_rotated(cx - 5.0, cy + max_ry * 0.6, 1.5, 6.0, flip_angle);
+
+    // 3. Redraw the flipper outline (it got partially erased by the clear)
+    g.ellipse_rotated(cx - 5.0, cy + max_ry * 0.6, 2.0, 7.0, flip_angle);
 
     // ── Convert to braille ──
     let mut braille_lines = g.to_braille();
