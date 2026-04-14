@@ -63,6 +63,17 @@ impl DotGrid {
         }
     }
 
+    /// Draw ellipse outline centered at (cx,cy) with radii (rx,ry)
+    fn ellipse(&mut self, cx: f32, cy: f32, rx: f32, ry: f32) {
+        let steps = ((rx + ry) * 4.0) as i32;
+        for i in 0..steps {
+            let angle = (i as f32 / steps as f32) * std::f32::consts::TAU;
+            let x = cx + rx * angle.cos();
+            let y = cy + ry * angle.sin();
+            self.set(x as i32, y as i32);
+        }
+    }
+
     /// Fill an ellipse centered at (cx,cy) with radii (rx,ry)
     fn fill_ellipse(&mut self, cx: f32, cy: f32, rx: f32, ry: f32) {
         let x0 = (cx - rx).floor() as i32;
@@ -77,6 +88,21 @@ impl DotGrid {
                     self.set(x, y);
                 }
             }
+        }
+    }
+
+    /// Draw rotated ellipse outline
+    fn ellipse_rotated(&mut self, cx: f32, cy: f32, rx: f32, ry: f32, angle: f32) {
+        let cos_a = angle.cos();
+        let sin_a = angle.sin();
+        let steps = ((rx + ry) * 4.0) as i32;
+        for i in 0..steps {
+            let t = (i as f32 / steps as f32) * std::f32::consts::TAU;
+            let lx = rx * t.cos();
+            let ly = ry * t.sin();
+            let x = cx + lx * cos_a - ly * sin_a;
+            let y = cy + lx * sin_a + ly * cos_a;
+            self.set(x as i32, y as i32);
         }
     }
 
@@ -152,14 +178,27 @@ impl DotGrid {
     }
 }
 
+/// Draw a line between two points using Bresenham
+fn draw_line(g: &mut DotGrid, x0: f32, y0: f32, x1: f32, y1: f32) {
+    let dx = (x1 - x0).abs();
+    let dy = (y1 - y0).abs();
+    let steps = dx.max(dy) as i32 + 1;
+    for i in 0..=steps {
+        let t = if steps > 0 { i as f32 / steps as f32 } else { 0.0 };
+        let x = x0 + (x1 - x0) * t;
+        let y = y0 + (y1 - y0) * t;
+        g.set(x as i32, y as i32);
+    }
+}
+
 /// Render the seal as a side-profile swimming in water.
 pub fn render_seal(pose: &SealPose, tick: u64) -> Vec<String> {
     let mut g = DotGrid::new();
     let t = tick as f64;
 
-    // Body center and params
-    let cx = 22.0_f32;
-    let cy = 18.0_f32;
+    // Body center -- shifted down so seal isn't clipped at top
+    let cx = 20.0_f32;
+    let cy = 22.0_f32;
 
     // Breathing
     let breath = ((t * 0.15).sin() * 0.5 + 0.5) as f32;
@@ -174,25 +213,27 @@ pub fn render_seal(pose: &SealPose, tick: u64) -> Vec<String> {
     };
 
     // ── TAIL FLIPPERS ──
-    let tail_x = cx + 16.0;
+    let tail_x = cx + 14.0;
     let tail_y = cy + curl * 8.0;
-    let splay = 5.0;
+    let splay = 4.0;
     let tail_wave = ((t * 0.3).sin() * 2.0) as f32;
-    g.fill_ellipse_rotated(tail_x + 3.0, tail_y - splay + tail_wave, 1.5, 5.0, -0.5);
-    g.fill_ellipse_rotated(tail_x + 3.0, tail_y + splay + tail_wave, 1.5, 5.0, 0.5);
-    // Tail root
-    g.fill_ellipse(tail_x - 1.0, tail_y + tail_wave * 0.5, 3.0, 3.5);
+    g.ellipse_rotated(tail_x + 3.0, tail_y - splay + tail_wave, 1.5, 5.0, -0.5);
+    g.ellipse_rotated(tail_x + 3.0, tail_y + splay + tail_wave, 1.5, 5.0, 0.5);
 
-    // ── BODY ── fusiform torpedo shape
-    let body_len = 18.0;
-    let max_ry = 9.0 * breath_scale;
+    // ── BODY ── fusiform torpedo shape (outline only)
+    let body_len = 16.0;
+    let max_ry = 8.0 * breath_scale;
 
-    for i in 0..=30 {
-        let t_pos = i as f32 / 30.0;
+    // Draw body as a smooth outline using top and bottom contour
+    let steps = 40;
+    let mut top_points: Vec<(f32, f32)> = Vec::new();
+    let mut bot_points: Vec<(f32, f32)> = Vec::new();
+
+    for i in 0..=steps {
+        let t_pos = i as f32 / steps as f32;
         let x = cx - body_len + t_pos * body_len * 2.0;
         let by = cy + curl * (t_pos - 0.5) * 10.0;
 
-        // Fusiform profile: fat in the middle, tapered at ends
         let ry = if t_pos < 0.2 {
             let s = t_pos / 0.2;
             max_ry * (0.4 + 0.6 * (s * std::f32::consts::FRAC_PI_2).sin())
@@ -200,24 +241,29 @@ pub fn render_seal(pose: &SealPose, tick: u64) -> Vec<String> {
             max_ry
         } else {
             let s = (t_pos - 0.6) / 0.4;
-            max_ry * (0.2 + 0.8 * (s * std::f32::consts::FRAC_PI_2).cos())
+            max_ry * (0.15 + 0.85 * (s * std::f32::consts::FRAC_PI_2).cos())
         };
 
-        if ry > 0.5 {
-            g.fill_ellipse(x, by, 1.5, ry);
-        }
+        top_points.push((x, by - ry));
+        bot_points.push((x, by + ry));
     }
 
-    // ── HEAD ── slightly larger, rounder
+    // Draw contour lines
+    for i in 1..top_points.len() {
+        draw_line(&mut g, top_points[i-1].0, top_points[i-1].1, top_points[i].0, top_points[i].1);
+        draw_line(&mut g, bot_points[i-1].0, bot_points[i-1].1, bot_points[i].0, bot_points[i].1);
+    }
+
+    // ── HEAD ── outline
     let head_x = cx - body_len - 1.0;
     let head_y = cy + curl * -5.0;
-    g.fill_ellipse(head_x, head_y, 7.0, 8.0 * breath_scale);
+    g.ellipse(head_x, head_y, 6.0, 7.0 * breath_scale);
     // Snout
-    g.fill_ellipse(head_x - 5.0, head_y + 2.0, 4.0, 4.5);
+    g.ellipse(head_x - 4.0, head_y + 2.0, 3.5, 4.0);
 
-    // ── FRONT FLIPPER ──
+    // ── FRONT FLIPPER ── outline
     let flip_angle = 0.6 + ((t * 0.25).sin() * 0.3) as f32;
-    g.fill_ellipse_rotated(cx - 8.0, cy + max_ry * 0.6, 2.0, 7.0, flip_angle);
+    g.ellipse_rotated(cx - 6.0, cy + max_ry * 0.6, 1.5, 6.0, flip_angle);
 
     // ── EYE cutout + draw ──
     let eye_x = (head_x - 2.0) as i32;
