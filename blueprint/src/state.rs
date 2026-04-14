@@ -177,12 +177,13 @@ impl NeilState {
         for (name, rooms) in &wing_map {
             let count: usize = rooms.values().sum();
             classified += count;
-            let room_list: Vec<(String, usize)> = rooms.iter()
+            let mut room_list: Vec<(String, usize)> = rooms.iter()
                 .map(|(r, c)| (r.clone(), *c))
                 .collect();
+            room_list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             wings.push(WingInfo { name: name.clone(), count, rooms: room_list });
         }
-        wings.sort_by(|a, b| b.count.cmp(&a.count));
+        wings.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
 
         PalaceState {
             total_notes: total,
