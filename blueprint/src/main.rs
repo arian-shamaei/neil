@@ -740,10 +740,10 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState) {
         chunks[2],
     );
 
-    // Seal art -- compact ASCII seal in the bottom of the sidebar
-    let seal = pick_seal_art(state);
+    // Seal art -- loaded from ~/.neil/blueprint/art/
+    let seal = load_seal_art(state);
     let mut seal_lines: Vec<Line> = Vec::new();
-    for art_line in seal {
+    for art_line in &seal {
         seal_lines.push(Line::from(Span::styled(
             format!(" {}", art_line),
             Style::default().fg(Color::Cyan),
@@ -755,79 +755,42 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState) {
     );
 }
 
-/// Pick a compact seal art based on current state
-fn pick_seal_art(state: &NeilState) -> &'static [&'static str] {
+/// Pick seal art mood based on current state, load from file
+fn load_seal_art(state: &NeilState) -> Vec<String> {
     let pending_fails = state.failures.iter().filter(|f| f.resolution == "pending").count();
     let pending_intents = state.intentions.iter().filter(|i| i.status == "pending").count();
 
-    if pending_fails > 0 {
-        SEAL_STRESSED
+    let mood = if pending_fails > 0 {
+        "stressed"
     } else if state.system.queue_count > 0 {
-        SEAL_WORKING
+        "working"
     } else if pending_intents > 0 {
-        SEAL_FOCUSED
+        "focused"
     } else if state.heartbeat.beats_today > 40 {
-        SEAL_TIRED
+        "sleeping"
     } else {
-        SEAL_HAPPY
-    }
+        "happy"
+    };
+
+    let art_dir = state.neil_home.join("blueprint/art");
+    let art_file = art_dir.join(format!("{}.txt", mood));
+
+    // Try mood-specific file, fall back to happy, fall back to embedded
+    let content = fs::read_to_string(&art_file)
+        .or_else(|_| fs::read_to_string(art_dir.join("happy.txt")))
+        .unwrap_or_else(|_| FALLBACK_SEAL.to_string());
+
+    content.lines().map(|l| l.to_string()).collect()
 }
 
-// Compact seal art (fits in ~22 chars wide, ~8 lines)
-const SEAL_HAPPY: &[&str] = &[
-    "      .------.",
-    "     / ^    ^ \\",
-    "    | (o)  (o) |",
-    "    |    __    |",
-    "    |   \\__/   |",
-    "     \\________/",
-    "    ~~ Neil ~~  :)",
-    "   ~ feeling good ~",
-];
-
-const SEAL_FOCUSED: &[&str] = &[
-    "      .------.",
-    "     / -    - \\",
-    "    | (o)  (o) |",
-    "    |    __    |",
-    "    |   |__|   |",
-    "     \\________/",
-    "    ~~ Neil ~~",
-    "   ~ watching... ~",
-];
-
-const SEAL_WORKING: &[&str] = &[
-    "      .------.",
-    "     / *    * \\",
-    "    | (o)  (o) |",
-    "    |    __    |",
-    "    |   |==|   |",
-    "     \\________/",
-    "    ~~ Neil ~~ *",
-    "   ~ working... ~",
-];
-
-const SEAL_STRESSED: &[&str] = &[
-    "     !! ! !!",
-    "      .------.",
-    "     / >    < \\",
-    "    | (x)  (x) |",
-    "    |    __    |",
-    "    |   {><}   |",
-    "     \\________/",
-    "   ~ stressed! ~",
-];
-
-const SEAL_TIRED: &[&str] = &[
-    "      .------.",
-    "     / -    - \\",
-    "    | (-)  (-) |",
-    "    |    __    |",
-    "    |   {__}   | z",
-    "     \\________/  z",
-    "    ~~ Neil ~~  z",
-    "    ~ sleepy... ~",
-];
+const FALLBACK_SEAL: &str = "\
+      .------.
+     / ^    ^ \\
+    | (o)  (o) |
+    |    __    |
+    |   \\__/   |
+     \\________/
+   ~~ Neil ~~";
 
 fn render_panel_selector(frame: &mut ratatui::Frame, area: Rect, selected: usize) {
     let w = 40.min(area.width.saturating_sub(4));
