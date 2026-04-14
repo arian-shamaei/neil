@@ -3,6 +3,7 @@ mod state;
 mod panels;
 mod stream;
 mod awareness;
+mod seal;
 
 use std::env;
 use std::fs;
@@ -116,6 +117,10 @@ fn main() -> anyhow::Result<()> {
         if tick % 10 == 0 || cached_state.is_none() {
             cached_state = Some(NeilState::load(&neil_home));
             state_tick = tick;
+        }
+        // Update tick on every frame for smooth animation
+        if let Some(ref mut s) = cached_state {
+            s.tick = tick;
         }
         let state = cached_state.as_ref().unwrap();
 
@@ -740,12 +745,13 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState) {
         chunks[2],
     );
 
-    // Seal art -- loaded from ~/.neil/blueprint/art/
-    let seal = load_seal_art(state);
+    // Seal art -- parameterized engine
+    let pose = seal::SealPose::load(&state.neil_home);
+    let seal_lines_raw = seal::render_seal(&pose, state.tick);
     let mut seal_lines: Vec<Line> = Vec::new();
-    for art_line in &seal {
+    for art_line in &seal_lines_raw {
         seal_lines.push(Line::from(Span::styled(
-            format!(" {}", art_line),
+            art_line.clone(),
             Style::default().fg(Color::Cyan),
         )));
     }
@@ -755,42 +761,7 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState) {
     );
 }
 
-/// Pick seal art mood based on current state, load from file
-fn load_seal_art(state: &NeilState) -> Vec<String> {
-    let pending_fails = state.failures.iter().filter(|f| f.resolution == "pending").count();
-    let pending_intents = state.intentions.iter().filter(|i| i.status == "pending").count();
-
-    let mood = if pending_fails > 0 {
-        "stressed"
-    } else if state.system.queue_count > 0 {
-        "working"
-    } else if pending_intents > 0 {
-        "focused"
-    } else if state.heartbeat.beats_today > 40 {
-        "sleeping"
-    } else {
-        "happy"
-    };
-
-    let art_dir = state.neil_home.join("blueprint/art");
-    let art_file = art_dir.join(format!("{}.txt", mood));
-
-    // Try mood-specific file, fall back to happy, fall back to embedded
-    let content = fs::read_to_string(&art_file)
-        .or_else(|_| fs::read_to_string(art_dir.join("happy.txt")))
-        .unwrap_or_else(|_| FALLBACK_SEAL.to_string());
-
-    content.lines().map(|l| l.to_string()).collect()
-}
-
-const FALLBACK_SEAL: &str = "\
-      .------.
-     / ^    ^ \\
-    | (o)  (o) |
-    |    __    |
-    |   \\__/   |
-     \\________/
-   ~~ Neil ~~";
+// Seal rendering moved to seal.rs (parameterized engine)
 
 fn render_panel_selector(frame: &mut ratatui::Frame, area: Rect, selected: usize) {
     let w = 40.min(area.width.saturating_sub(4));

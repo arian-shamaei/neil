@@ -1,39 +1,71 @@
-# Seal Art
+# Seal Art Engine
 
-File-based art system. Each .txt file is one art frame.
-Neil can create new art files and they'll be picked up automatically.
+Parameterized seal renderer. Neil controls the seal's expression and
+state by writing to ~/.neil/.seal_pose.json. The TUI reads this file
+and renders the seal with the specified parameters.
 
-## Format
+## State file: ~/.neil/.seal_pose.json
 
-Plain text, one frame per file. Lines are rendered top-to-bottom.
-Use Unicode block/braille characters for smooth shapes.
-Last line is the mood label (displayed below the art).
-
-## Naming convention
-
-Filename = mood state. The TUI picks art based on Neil's current state:
-- happy.txt -- default, system healthy
-- focused.txt -- has pending work
-- working.txt -- processing a prompt
-- stressed.txt -- unresolved failures
-- sleeping.txt -- quiet hours
-- curious.txt -- researching or exploring
-
-## Creating new art
-
-Just drop a .txt file in this directory. The TUI will find it.
-Neil can create new art:
-```
-echo "new art here" > ~/.neil/blueprint/art/excited.txt
+```json
+{
+  "eyes": "open",
+  "mouth": "smile",
+  "whiskers": "normal",
+  "body": "float",
+  "breath_phase": 0.5,
+  "water_phase": 0.0,
+  "indicator": "none",
+  "label": "feeling good :)"
+}
 ```
 
-## Characters
+### Parameters
 
-Monochromatic. Use these for smooth seal shapes:
-- Braille: ⣿ ⣤ ⣶ ⣴ ⣦ ⣀ ⠿ ⠤ ⠏ ⠃ ⠹ ⠘
-- Block: █ ▓ ▒ ░
-- Box: ─ │ ┌ ┐ └ ┘
-- Eyes: ● ◉ ◎ ◑ ─ ×
-- Mouth: ◡ ─ ∩ ○ ω ⌐
-- Water: ~ ≈
-- Misc: ▼ ♪ ♫ ★ ☆ ✦ ☁ ⚡
+**eyes**: open, half, closed, wide, focused, stressed, wink
+**mouth**: smile, neutral, frown, open, relaxed, smirk, o
+**whiskers**: normal, perked, droopy, spread
+**body**: float, curl, stretch, dive, surface
+**breath_phase**: 0.0-1.0 (exhale to inhale, auto-cycles if not set)
+**water_phase**: 0.0-1.0 (wave offset, auto-cycles if not set)
+**indicator**: none, zzz, alert, thought, bubbles, music, heart
+**label**: text shown below the seal (max ~20 chars)
+
+### Neil controls the seal
+
+Neil can set any parameter:
+```sh
+echo '{"eyes":"focused","mouth":"neutral","indicator":"thought","label":"thinking..."}' > ~/.neil/.seal_pose.json
+```
+
+If the file doesn't exist or is invalid, defaults to happy floating seal.
+The TUI auto-animates breath_phase and water_phase for liveliness.
+
+## Art template files
+
+Each .txt file in this directory is a static fallback frame.
+The engine uses these as reference but renders dynamically.
+Neil can still create .txt files for custom moods beyond the
+parameterized system.
+
+## Character reference
+
+### Body (braille smooth)
+⣀ ⣤ ⣶ ⣴ ⣦ ⣿ ⠿ ⠤ ⠏ ⠃ ⠹ ⠘ ⣠ ⣄ ⣷ ⣾
+
+### Eyes
+● open     ◉ focused    ◎ wide      ◑ half
+─ closed   × stressed   ◐ wink-L    ◑ wink-R
+
+### Mouth
+◡ smile    ─ neutral    ∩ frown     ○ open
+ω relaxed  ⌐ smirk     ◯ big-open
+
+### Whiskers
+═══ normal   ⟋⟍ perked   ─── droopy  ⟋⟍ spread
+
+### Water
+~ ≈ ∼ ～ ˜
+
+### Indicators
+z z z  sleep     ! ! !  alert     . o O  thought
+♪ ♫    music     ♥      heart     ° ○    bubbles
