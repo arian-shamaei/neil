@@ -45,8 +45,8 @@ impl SealPose {
 // Each braille char encodes a 2x4 dot block.
 // Grid is DOT_W x DOT_H dots, rendered as (DOT_W/2) x (DOT_H/4) chars.
 
-const DOT_W: usize = 48;  // 24 chars * 2 dots
-const DOT_H: usize = 40;  // 10 chars * 4 dots
+const DOT_W: usize = 52;  // 26 chars * 2 dots
+const DOT_H: usize = 48;  // 12 chars * 4 dots
 
 struct DotGrid {
     dots: [[bool; DOT_W]; DOT_H],
@@ -196,9 +196,9 @@ pub fn render_seal(pose: &SealPose, tick: u64) -> Vec<String> {
     let mut g = DotGrid::new();
     let t = tick as f64;
 
-    // Body center -- shifted down so seal isn't clipped at top
-    let cx = 20.0_f32;
-    let cy = 22.0_f32;
+    // Body center
+    let cx = 28.0_f32;
+    let cy = 24.0_f32;
 
     // Breathing
     let breath = ((t * 0.15).sin() * 0.5 + 0.5) as f32;
@@ -213,16 +213,16 @@ pub fn render_seal(pose: &SealPose, tick: u64) -> Vec<String> {
     };
 
     // ── TAIL FLIPPERS ──
-    let tail_x = cx + 14.0;
-    let tail_y = cy + curl * 8.0;
+    let tail_x = cx + 12.0;
+    let tail_y = cy + curl * 6.0;
     let splay = 4.0;
-    let tail_wave = ((t * 0.3).sin() * 2.0) as f32;
-    g.ellipse_rotated(tail_x + 3.0, tail_y - splay + tail_wave, 1.5, 5.0, -0.5);
-    g.ellipse_rotated(tail_x + 3.0, tail_y + splay + tail_wave, 1.5, 5.0, 0.5);
+    let tail_wave = ((t * 0.3).sin() * 1.5) as f32;
+    g.ellipse_rotated(tail_x + 2.0, tail_y - splay + tail_wave, 1.2, 4.0, -0.4);
+    g.ellipse_rotated(tail_x + 2.0, tail_y + splay + tail_wave, 1.2, 4.0, 0.4);
 
     // ── BODY ── fusiform torpedo shape (outline only)
-    let body_len = 16.0;
-    let max_ry = 8.0 * breath_scale;
+    let body_len = 13.0;
+    let max_ry = 7.0 * breath_scale;
 
     // Draw body as a smooth outline using top and bottom contour
     let steps = 40;
@@ -248,22 +248,100 @@ pub fn render_seal(pose: &SealPose, tick: u64) -> Vec<String> {
         bot_points.push((x, by + ry));
     }
 
-    // Draw contour lines
+    // Draw contour lines (double for thickness)
     for i in 1..top_points.len() {
         draw_line(&mut g, top_points[i-1].0, top_points[i-1].1, top_points[i].0, top_points[i].1);
+        draw_line(&mut g, top_points[i-1].0, top_points[i-1].1 + 1.0, top_points[i].0, top_points[i].1 + 1.0);
         draw_line(&mut g, bot_points[i-1].0, bot_points[i-1].1, bot_points[i].0, bot_points[i].1);
+        draw_line(&mut g, bot_points[i-1].0, bot_points[i-1].1 - 1.0, bot_points[i].0, bot_points[i].1 - 1.0);
     }
 
-    // ── HEAD ── outline
-    let head_x = cx - body_len - 1.0;
-    let head_y = cy + curl * -5.0;
-    g.ellipse(head_x, head_y, 6.0, 7.0 * breath_scale);
-    // Snout
-    g.ellipse(head_x - 4.0, head_y + 2.0, 3.5, 4.0);
+    // ── HEAD + SNOUT as one smooth profile ──
+    // Draw the head as a series of connected points (smooth contour)
+    let head_x = cx - body_len + 2.0;
+    let head_y = cy - 1.0 + curl * -3.0;
+    let nose_x = head_x - 14.0;
+    let nose_y = head_y + 5.0;
 
-    // ── FRONT FLIPPER ── outline
-    let flip_angle = 0.6 + ((t * 0.25).sin() * 0.3) as f32;
-    g.ellipse_rotated(cx - 6.0, cy + max_ry * 0.6, 1.5, 6.0, flip_angle);
+    // Top of head: rounded dome, slopes to snout
+    let head_top: Vec<(f32, f32)> = vec![
+        (head_x + 5.0, head_y - 4.0),     // back of head
+        (head_x + 3.0, head_y - 8.0),     // rear skull
+        (head_x, head_y - 10.0),           // top of dome
+        (head_x - 4.0, head_y - 9.0),     // front skull
+        (head_x - 7.0, head_y - 6.0),     // forehead slope
+        (head_x - 9.0, head_y - 3.0),     // brow ridge
+        (head_x - 11.0, head_y),           // bridge of nose
+        (head_x - 13.0, head_y + 2.0),    // upper snout
+        (nose_x, nose_y - 1.0),            // nose tip top
+    ];
+    // Bottom: chin curve, jowl, throat
+    let head_bot: Vec<(f32, f32)> = vec![
+        (nose_x, nose_y + 2.0),            // nose tip bottom
+        (nose_x + 2.0, nose_y + 4.0),     // lower lip
+        (head_x - 10.0, head_y + 6.0),    // under jaw
+        (head_x - 6.0, head_y + 9.0),     // chin fullest
+        (head_x - 2.0, head_y + 10.0),    // jowl
+        (head_x + 2.0, head_y + 8.0),     // throat
+        (head_x + 5.0, head_y + 5.0),     // neck into body
+    ];
+
+    for i in 1..head_top.len() {
+        draw_line(&mut g, head_top[i-1].0, head_top[i-1].1, head_top[i].0, head_top[i].1);
+    }
+    for i in 1..head_bot.len() {
+        draw_line(&mut g, head_bot[i-1].0, head_bot[i-1].1, head_bot[i].0, head_bot[i].1);
+    }
+    // Close the nose
+    draw_line(&mut g, nose_x, nose_y - 1.0, nose_x, nose_y + 1.0);
+
+    // ── NOSE dots ──
+    g.set(nose_x as i32, nose_y as i32);
+
+    // ── EYE ── larger, more visible
+    let eye_x = (head_x - 5.0) as i32;
+    let eye_y = (head_y - 2.0) as i32;
+    let blink = tick % 55 < 3;
+    let eye_closed = pose.eyes == "closed" || pose.body == "sleep";
+
+    // Clear area around eye for contrast
+    g.clear_rect(eye_x - 2, eye_y - 2, 5, 5);
+
+    if !blink && !eye_closed {
+        // Open eye - 3x3 filled square with highlight
+        for dy in 0..3 {
+            for dx in 0..3 {
+                g.set(eye_x + dx, eye_y + dy);
+            }
+        }
+        // Clear center for pupil highlight
+        g.clear_rect(eye_x + 1, eye_y, 1, 1);
+    } else {
+        // Closed/blink - horizontal line
+        for dx in 0..4 {
+            g.set(eye_x + dx, eye_y + 1);
+        }
+    }
+
+    // ── MOUTH ── slight curve from nose
+    let mouth_curve = match pose.mouth.as_str() {
+        "smile" => 1.0_f32,
+        "frown" => -1.0,
+        "open" => 0.5,
+        _ => 0.0,
+    };
+    draw_line(&mut g, nose_x + 1.0, nose_y + 1.5, nose_x + 5.0, nose_y + 2.5 + mouth_curve);
+
+    // ── WHISKERS ── from nose area
+    let wh_x = nose_x - 1.0;
+    let wh_y = nose_y;
+    draw_line(&mut g, wh_x, wh_y - 1.0, wh_x - 5.0, wh_y - 4.0);
+    draw_line(&mut g, wh_x, wh_y, wh_x - 6.0, wh_y - 1.0);
+    draw_line(&mut g, wh_x, wh_y + 1.5, wh_x - 5.0, wh_y + 3.0);
+
+    // ── FRONT FLIPPER ── outline, larger
+    let flip_angle = 0.7 + ((t * 0.25).sin() * 0.25) as f32;
+    g.ellipse_rotated(cx - 5.0, cy + max_ry * 0.6, 2.0, 7.0, flip_angle);
 
     // ── EYE cutout + draw ──
     let eye_x = (head_x - 2.0) as i32;
@@ -299,28 +377,38 @@ pub fn render_seal(pose: &SealPose, tick: u64) -> Vec<String> {
     // ── Convert to braille ──
     let mut braille_lines = g.to_braille();
 
-    // ── WATER SURFACE ── overlay on top lines
-    let water_y = 1; // Second line is water surface
+    // ── WATER SURFACE ── at the head level, goes through the body
+    let water_y = 3; // Where the head pokes out
+    let char_w = DOT_W / 2;
     if water_y < braille_lines.len() {
         let wave_offset = (tick % 12) as usize;
-        let water_chars = ['~', '~', '∼', '~', '≈', '~', '~', '∿', '~', '~', '~', '≈'];
-        let mut water_line = String::new();
-        for i in 0..24 {
-            let idx = (i + wave_offset) % water_chars.len();
-            water_line.push(water_chars[idx]);
-        }
-        // Blend: if braille char is not empty, keep it; otherwise use water
+        let water_chars = ['~', '∼', '~', '≈', '~', '~', '∿', '~', '≈', '~', '∼', '~'];
         let orig = &braille_lines[water_y];
         let mut blended = String::new();
         for (i, ch) in orig.chars().enumerate() {
             if ch == '\u{2800}' || ch == ' ' {
-                // Empty braille = show water
                 blended.push(water_chars[(i + wave_offset) % water_chars.len()]);
             } else {
                 blended.push(ch);
             }
         }
         braille_lines[water_y] = blended;
+    }
+    // Also add water to line above for thickness
+    let water_y2 = 2;
+    if water_y2 < braille_lines.len() {
+        let wave_offset = (tick % 12 + 3) as usize;
+        let water_chars = ['~', '~', '≈', '~', '∼', '~', '~', '∿', '~', '≈', '~', '~'];
+        let orig = &braille_lines[water_y2];
+        let mut blended = String::new();
+        for (i, ch) in orig.chars().enumerate() {
+            if ch == '\u{2800}' || ch == ' ' {
+                blended.push(water_chars[(i + wave_offset) % water_chars.len()]);
+            } else {
+                blended.push(ch);
+            }
+        }
+        braille_lines[water_y2] = blended;
     }
 
     // ── INDICATOR ── top-right corner
