@@ -39,3 +39,10 @@ Patterns and gotchas discovered through experience. Read on every invocation.
   Naive space-splitting breaks "hello world" into two tokens.
 - Always escape single quotes in shell commands passed to popen/run_command:
   replace ' with '\''
+
+## File Paths
+
+- When creating files for the user, always use absolute paths. The working
+  directory is the user's home, NOT ~/.neil/. Use $HOME/path or /full/path.
+- Never write files into ~/.neil/ unless they are Neil system files (memory,
+  essence, etc.). User files go in the user's home or wherever specified.

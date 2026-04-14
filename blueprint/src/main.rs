@@ -85,6 +85,7 @@ fn main() -> anyhow::Result<()> {
     let mut view = View::Chat;
     let mut panel_selection: usize = 0;
     let mut show_sidebar = true;
+    let mut mouse_captured = true;
     let mut tick: u64 = 0;
     let mut last_history_count: usize = 0;
     let mut last_input_time = Instant::now();
@@ -134,10 +135,10 @@ fn main() -> anyhow::Result<()> {
                                 .direction(Direction::Horizontal)
                                 .constraints([Constraint::Min(40), Constraint::Length(28)])
                                 .split(size);
-                            render_stream(frame, h[0], &stream, &input, cursor_pos, scroll_offset, fps.fps);
+                            render_stream(frame, h[0], &stream, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured);
                             render_sidebar(frame, h[1], state);
                         } else {
-                            render_stream(frame, size, &stream, &input, cursor_pos, scroll_offset, fps.fps);
+                            render_stream(frame, size, &stream, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured);
                         }
                     }
                     View::PanelSelector => {
@@ -146,10 +147,10 @@ fn main() -> anyhow::Result<()> {
                                 .direction(Direction::Horizontal)
                                 .constraints([Constraint::Min(40), Constraint::Length(28)])
                                 .split(size);
-                            render_stream(frame, h[0], &stream, &input, cursor_pos, scroll_offset, fps.fps);
+                            render_stream(frame, h[0], &stream, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured);
                             render_sidebar(frame, h[1], state);
                         } else {
-                            render_stream(frame, size, &stream, &input, cursor_pos, scroll_offset, fps.fps);
+                            render_stream(frame, size, &stream, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured);
                         }
                         render_panel_selector(frame, size, panel_selection);
                     }
@@ -196,6 +197,16 @@ fn main() -> anyhow::Result<()> {
                                     match c {
                                         'c' | 'q' => break,
                                         's' => show_sidebar = !show_sidebar,
+                                        'm' => {
+                                            mouse_captured = !mouse_captured;
+                                            if mouse_captured {
+                                                let _ = execute!(io::stdout(), crossterm::event::EnableMouseCapture);
+                                                stream.push(StreamEntry::new(EntryKind::System, "Mouse scroll enabled. Ctrl+M to select text.".into()));
+                                            } else {
+                                                let _ = execute!(io::stdout(), crossterm::event::DisableMouseCapture);
+                                                stream.push(StreamEntry::new(EntryKind::System, "Text selection enabled. Ctrl+M for scroll mode.".into()));
+                                            }
+                                        }
                                         'a' => cursor_pos = 0,
                                         'e' => cursor_pos = input.len(),
                                         'u' => { input.clear(); cursor_pos = 0; }
@@ -357,6 +368,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 fn render_stream(
     frame: &mut ratatui::Frame, area: Rect, stream: &[StreamEntry],
     input: &str, cursor_pos: usize, scroll_offset: i32, fps: u32,
+    mouse_captured: bool,
 ) {
     let wrap_width = (area.width as usize).saturating_sub(4);
 
@@ -526,8 +538,9 @@ fn render_stream(
             .title(" > "));
     frame.render_widget(input_widget, input_area);
 
-    // FPS counter (bottom right of input area)
-    let fps_text = format!(" {}fps ", fps);
+    // FPS + mode indicator (bottom right of input area)
+    let mode = if mouse_captured { "scroll" } else { "select" };
+    let fps_text = format!(" {}fps {} ", fps, mode);
     let fps_x = input_area.x + input_area.width - fps_text.len() as u16 - 1;
     let fps_y = input_area.y + input_area.height - 1;
     frame.render_widget(

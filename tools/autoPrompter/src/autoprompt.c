@@ -29,10 +29,6 @@
 #include <fcntl.h>
 #include <ctype.h>
 
-#define QUEUE_DIR   "queue"
-#define ACTIVE_DIR  "active"
-#define HISTORY_DIR "history"
-
 #define MAX_PATH    4096
 #define MAX_LINE    4096
 #define MAX_PROMPT  (1024 * 1024)  /* 1 MB max prompt */
@@ -49,6 +45,9 @@ static int g_max_react_turns = 3;
 
 /* Resolved paths -- set once at startup from NEIL_HOME env var */
 static char g_neil_home[MAX_PATH];
+static char g_queue_dir[MAX_PATH];
+static char g_active_dir[MAX_PATH];
+static char g_history_dir[MAX_PATH];
 static char g_zettel_bin[MAX_PATH];
 static char g_mempalace_venv[MAX_PATH];
 static char g_mempalace_palace[MAX_PATH];
@@ -93,6 +92,13 @@ static void resolve_neil_paths(void) {
         "%s/tools/autoPrompter/observe.sh", g_neil_home);
     snprintf(g_heartbeat_log, sizeof(g_heartbeat_log),
         "%s/heartbeat_log.json", g_neil_home);
+
+    snprintf(g_queue_dir, sizeof(g_queue_dir),
+        "%s/tools/autoPrompter/queue", g_neil_home);
+    snprintf(g_active_dir, sizeof(g_active_dir),
+        "%s/tools/autoPrompter/active", g_neil_home);
+    snprintf(g_history_dir, sizeof(g_history_dir),
+        "%s/tools/autoPrompter/history", g_neil_home);
 
     /* Also set ZETTEL_HOME if not already set */
     if (!getenv("ZETTEL_HOME")) {
@@ -790,7 +796,7 @@ static void queue_self_prompt(const char *output) {
         char path[MAX_PATH];
         char ts[64];
         timestamp_now(ts, sizeof(ts));
-        snprintf(path, sizeof(path), "%s/%s_self.md", QUEUE_DIR, ts);
+        snprintf(path, sizeof(path), "%s/%s_self.md", g_queue_dir, ts);
 
         write_file_atomic(path, p, len);
         fprintf(stderr, "[autoprompt] self-prompt queued: %s\n", path);
@@ -1115,8 +1121,8 @@ static void process_prompt(const char *filename) {
     timestamp_now(ts, sizeof(ts));
 
     /* 1. Move queue/ -> active/ */
-    snprintf(src, sizeof(src), "%s/%s", QUEUE_DIR, filename);
-    snprintf(dst, sizeof(dst), "%s/%s", ACTIVE_DIR, filename);
+    snprintf(src, sizeof(src), "%s/%s", g_queue_dir, filename);
+    snprintf(dst, sizeof(dst), "%s/%s", g_active_dir, filename);
 
     if (rename(src, dst) < 0) {
         fprintf(stderr, "[autoprompt] move to active failed: %s: %s\n",
@@ -1142,7 +1148,7 @@ static void process_prompt(const char *filename) {
         free(prompt);
         /* Move to history as failed */
         char hist[MAX_PATH];
-        snprintf(hist, sizeof(hist), "%s/%s_%s", HISTORY_DIR, ts, filename);
+        snprintf(hist, sizeof(hist), "%s/%s_%s", g_history_dir, ts, filename);
         rename(dst, hist);
         return;
     }
@@ -1285,7 +1291,7 @@ static void process_prompt(const char *filename) {
     /* Write result file */
     char result_path[MAX_PATH];
     snprintf(result_path, sizeof(result_path), "%s/%s_%s.result.md",
-             HISTORY_DIR, ts, filename);
+             g_history_dir, ts, filename);
 
     size_t result_cap = prompt_len + all_output_len + all_calls_len + 1024;
     char *result = malloc(result_cap);
@@ -1316,7 +1322,7 @@ static void process_prompt(const char *filename) {
 
     /* Move prompt from active/ to history/ */
     char hist[MAX_PATH];
-    snprintf(hist, sizeof(hist), "%s/%s_%s", HISTORY_DIR, ts, filename);
+    snprintf(hist, sizeof(hist), "%s/%s_%s", g_history_dir, ts, filename);
     rename(dst, hist);
 
     printf("[autoprompt] [%s] done: %s -> exit %d (%d turns)\n",
@@ -1327,7 +1333,7 @@ static void process_prompt(const char *filename) {
 
 /* Drain any .md files already in queue/ on startup. */
 static void drain_existing(void) {
-    DIR *d = opendir(QUEUE_DIR);
+    DIR *d = opendir(g_queue_dir);
     if (!d) return;
 
     struct dirent *ent;
@@ -1342,7 +1348,7 @@ static void drain_existing(void) {
 
 /* Recover any files left in active/ (crash recovery). */
 static void recover_active(void) {
-    DIR *d = opendir(ACTIVE_DIR);
+    DIR *d = opendir(g_active_dir);
     if (!d) return;
 
     struct dirent *ent;
@@ -1350,8 +1356,8 @@ static void recover_active(void) {
         if (ent->d_name[0] == '.') continue;
 
         char src[MAX_PATH], dst[MAX_PATH];
-        snprintf(src, sizeof(src), "%s/%s", ACTIVE_DIR, ent->d_name);
-        snprintf(dst, sizeof(dst), "%s/%s", QUEUE_DIR, ent->d_name);
+        snprintf(src, sizeof(src), "%s/%s", g_active_dir, ent->d_name);
+        snprintf(dst, sizeof(dst), "%s/%s", g_queue_dir, ent->d_name);
 
         fprintf(stderr, "[autoprompt] recovering: %s\n", ent->d_name);
         rename(src, dst);
@@ -1368,9 +1374,9 @@ int main(int argc, char **argv) {
         snprintf(g_ai_command, sizeof(g_ai_command), "%s", argv[1]);
 
     /* Ensure directories exist */
-    mkdir(QUEUE_DIR, 0755);
-    mkdir(ACTIVE_DIR, 0755);
-    mkdir(HISTORY_DIR, 0755);
+    mkdir(g_queue_dir, 0755);
+    mkdir(g_active_dir, 0755);
+    mkdir(g_history_dir, 0755);
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
@@ -1385,7 +1391,7 @@ int main(int argc, char **argv) {
         if (access(wakeup_src, F_OK) == 0) {
             char ts[64];
             timestamp_now(ts, sizeof(ts));
-            snprintf(wakeup_dst, sizeof(wakeup_dst), "%s/%s_wakeup.md", QUEUE_DIR, ts);
+            snprintf(wakeup_dst, sizeof(wakeup_dst), "%s/%s_wakeup.md", g_queue_dir, ts);
 
             size_t wlen;
             char *wdata = read_file(wakeup_src, &wlen);
@@ -1407,14 +1413,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int wd = inotify_add_watch(ifd, QUEUE_DIR, IN_CLOSE_WRITE | IN_MOVED_TO);
+    int wd = inotify_add_watch(ifd, g_queue_dir, IN_CLOSE_WRITE | IN_MOVED_TO);
     if (wd < 0) {
         perror("[autoprompt] inotify_add_watch");
         close(ifd);
         return 1;
     }
 
-    printf("[autoprompt] watching %s/ for prompts...\n", QUEUE_DIR);
+    printf("[autoprompt] watching %s/ for prompts...\n", g_queue_dir);
     fflush(stdout);
 
     /* Event loop */
