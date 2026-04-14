@@ -31,7 +31,6 @@ enum View {
 }
 
 const PANEL_NAMES: &[(&str, &str)] = &[
-    ("Neil", "Seal art, mood, and consciousness"),
     ("Memory", "Browse wings, rooms, and notes"),
     ("Heartbeat", "Timeline of heartbeat activity"),
     ("Intentions", "Task board with priorities"),
@@ -71,7 +70,9 @@ fn main() -> anyhow::Result<()> {
 
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, crossterm::event::EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
+    // Mouse capture OFF by default -- native text selection works
+    // Ctrl+M enables mouse capture for scroll wheel support
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -86,7 +87,7 @@ fn main() -> anyhow::Result<()> {
     let mut view = View::Chat;
     let mut panel_selection: usize = 0;
     let mut show_sidebar = true;
-    let mut mouse_captured = true;
+    let mut mouse_captured = false; // default: text selection enabled
     let mut tick: u64 = 0;
     let mut last_history_count: usize = 0;
     let mut last_input_time = Instant::now();
@@ -202,19 +203,24 @@ fn main() -> anyhow::Result<()> {
                                             mouse_captured = !mouse_captured;
                                             if mouse_captured {
                                                 let _ = execute!(io::stdout(), crossterm::event::EnableMouseCapture);
-                                                stream.push(StreamEntry::new(EntryKind::System, "Mouse scroll enabled. Ctrl+M to select text.".into()));
+                                                stream.push(StreamEntry::new(EntryKind::System, "Mouse scroll enabled. Ctrl+M for text select.".into()));
                                             } else {
                                                 let _ = execute!(io::stdout(), crossterm::event::DisableMouseCapture);
-                                                stream.push(StreamEntry::new(EntryKind::System, "Text selection enabled. Ctrl+M for scroll mode.".into()));
+                                                stream.push(StreamEntry::new(EntryKind::System, "Text select enabled. Ctrl+M for mouse scroll.".into()));
                                             }
                                         }
                                         'a' => cursor_pos = 0,
-                                        'e' => cursor_pos = input.len(),
+                                        'e' => cursor_pos = input.chars().count(),
                                         'u' => { input.clear(); cursor_pos = 0; }
                                         _ => {}
                                     }
                                 } else if input.len() < 4096 {
-                                    input.insert(cursor_pos, c);
+                                    // cursor_pos is a char index; convert to byte index for insert
+                                    let byte_pos = input.char_indices()
+                                        .nth(cursor_pos)
+                                        .map(|(i, _)| i)
+                                        .unwrap_or(input.len());
+                                    input.insert(byte_pos, c);
                                     cursor_pos += 1;
                                     last_input_time = Instant::now();
                                 }
@@ -222,14 +228,32 @@ fn main() -> anyhow::Result<()> {
                             KeyCode::Backspace => {
                                 if cursor_pos > 0 {
                                     cursor_pos -= 1;
-                                    input.remove(cursor_pos);
+                                    let byte_pos = input.char_indices()
+                                        .nth(cursor_pos)
+                                        .map(|(i, _)| i)
+                                        .unwrap_or(input.len());
+                                    if byte_pos < input.len() {
+                                        input.remove(byte_pos);
+                                    }
                                 }
                             }
                             KeyCode::Delete => {
-                                if cursor_pos < input.len() { input.remove(cursor_pos); }
+                                let char_count = input.chars().count();
+                                if cursor_pos < char_count {
+                                    let byte_pos = input.char_indices()
+                                        .nth(cursor_pos)
+                                        .map(|(i, _)| i)
+                                        .unwrap_or(input.len());
+                                    if byte_pos < input.len() {
+                                        input.remove(byte_pos);
+                                    }
+                                }
                             }
                             KeyCode::Left => { cursor_pos = cursor_pos.saturating_sub(1); }
-                            KeyCode::Right => { cursor_pos = (cursor_pos + 1).min(input.len()); }
+                            KeyCode::Right => {
+                                let char_count = input.chars().count();
+                                cursor_pos = (cursor_pos + 1).min(char_count);
+                            }
                             KeyCode::Home => {
                                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                                     scroll_offset = 9999; auto_scroll = false;
@@ -241,7 +265,7 @@ fn main() -> anyhow::Result<()> {
                                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                                     scroll_offset = 0; auto_scroll = true;
                                 } else {
-                                    cursor_pos = input.len();
+                                    cursor_pos = input.chars().count();
                                 }
                             }
                             KeyCode::Up => { scroll_offset += 3; auto_scroll = false; }
@@ -331,7 +355,11 @@ fn main() -> anyhow::Result<()> {
 
     awareness::BlueprintState::clear(&neil_home);
     terminal::disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, crossterm::event::DisableMouseCapture)?;
+    if mouse_captured {
+        execute!(terminal.backend_mut(), LeaveAlternateScreen, crossterm::event::DisableMouseCapture)?;
+    } else {
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    }
     Ok(())
 }
 
@@ -511,14 +539,20 @@ fn render_stream(
     } else {
         let wrapped = wrap_text(input, inner_w);
         let mut result: Vec<Line> = Vec::new();
-        let mut char_count = 0;
+        let mut char_count: usize = 0;
         for wl in &wrapped {
+            let line_char_count = wl.chars().count();
             let line_start = char_count;
-            let line_end = char_count + wl.len();
+            let line_end = char_count + line_char_count;
             if cursor_pos >= line_start && cursor_pos <= line_end {
-                let local_pos = cursor_pos - line_start;
-                let before = &wl[..local_pos];
-                let after = &wl[local_pos..];
+                let local_char_pos = cursor_pos - line_start;
+                // Convert char pos to byte pos for slicing
+                let byte_pos = wl.char_indices()
+                    .nth(local_char_pos)
+                    .map(|(i, _)| i)
+                    .unwrap_or(wl.len());
+                let before = &wl[..byte_pos];
+                let after = &wl[byte_pos..];
                 result.push(Line::from(vec![
                     Span::styled(before.to_string(), Style::default().fg(Color::White)),
                     Span::styled("_", Style::default().fg(Color::Cyan).add_modifier(Modifier::SLOW_BLINK)),
@@ -527,7 +561,7 @@ fn render_stream(
             } else {
                 result.push(Line::from(Span::styled(wl.clone(), Style::default().fg(Color::White))));
             }
-            char_count = line_end + 1; // +1 for the space/wrap break
+            char_count = line_end;
         }
         result
     };
@@ -626,20 +660,19 @@ fn render_panel_selector(frame: &mut ratatui::Frame, area: Rect, selected: usize
 
 fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: &NeilState, fps: u32) {
     let (name, _) = PANEL_NAMES.get(idx).unwrap_or(&("?", ""));
-    let title = format!(" {} | Esc:close 1-8:switch ", name);
+    let title = format!(" {} | Esc:close 1-7:switch ", name);
     let block = Block::default().borders(Borders::ALL).title(title).border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let lines: Vec<Line> = match idx {
-        0 => render_seal_panel(state),
-        1 => render_memory_panel(state),
-        2 => render_heartbeat_panel(state),
-        3 => render_intentions_panel(state),
-        4 => render_system_panel(state),
-        5 => render_services_panel(state),
-        6 => render_failures_panel(state),
-        7 => render_logs_panel(),
+        0 => render_memory_panel(state),
+        1 => render_heartbeat_panel(state),
+        2 => render_intentions_panel(state),
+        3 => render_system_panel(state),
+        4 => render_services_panel(state),
+        5 => render_failures_panel(state),
+        6 => render_logs_panel(),
         _ => vec![Line::from("Unknown panel")],
     };
     frame.render_widget(Paragraph::new(lines), inner);
@@ -652,94 +685,6 @@ fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: 
 }
 
 // ── Panel renderers ──
-
-fn render_seal_panel(s: &NeilState) -> Vec<Line<'static>> {
-    let hour = s.now.format("%H").to_string().parse::<u8>().unwrap_or(12);
-    let (mood_label, mood_color, eyes, mouth) = if hour >= 23 || hour < 7 {
-        ("sleeping", Color::Blue, "-  -", " z ")
-    } else if s.failures.iter().any(|f| f.resolution == "pending") {
-        ("alert!", Color::Red, "O  O", " ! ")
-    } else if s.heartbeat.beats_today > 35 {
-        ("tired", Color::Yellow, "-  -", " ~ ")
-    } else if s.system.queue_count > 0 {
-        ("working", Color::Cyan, "o  o", " . ")
-    } else {
-        ("happy", Color::Green, "^  ^", " w ")
-    };
-
-    let mc = mood_color;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    lines.push(Line::from(Span::styled(
-        "  \u{1F9AD} NEIL THE SEAL",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(""));
-
-    let eyes_line = format!("     |  {}  |   ", eyes);
-    let mouth_line = format!("     |   {}   |   ", mouth);
-    let art: Vec<&str> = vec![
-        "        _____      ",
-        "      /       \\    ",
-        &eyes_line,
-        &mouth_line,
-        "      \\ .---. /    ",
-        "       '-----'     ",
-        "      /|     |\\    ",
-        "     / |     | \\   ",
-        "  ~~~~~~~~~~~~~~~~~~",
-    ];
-    for a in art {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", a),
-            Style::default().fg(mc),
-        )));
-    }
-    lines.push(Line::from(""));
-
-    lines.push(Line::from(vec![
-        Span::styled("  mood: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(mood_label.to_string(), Style::default().fg(mc).add_modifier(Modifier::BOLD)),
-    ]));
-
-    let consciousness = format!(
-        "{}b/50 | {}n | {}w",
-        s.heartbeat.beats_today,
-        s.palace.total_notes,
-        s.palace.wings.len(),
-    );
-    lines.push(Line::from(vec![
-        Span::styled("  mind: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(consciousness, Style::default().fg(Color::White)),
-    ]));
-
-    if !s.heartbeat.last_beat.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("  last: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(s.heartbeat.last_beat.clone(), Style::default().fg(Color::DarkGray)),
-        ]));
-    }
-
-    let pending: usize = s.intentions.iter().filter(|i| i.status == "pending").count();
-    let unresolved: usize = s.failures.iter().filter(|f| f.resolution == "pending").count();
-    if pending > 0 || unresolved > 0 {
-        lines.push(Line::from(""));
-        if pending > 0 {
-            lines.push(Line::from(Span::styled(
-                format!("  {} pending intentions", pending),
-                Style::default().fg(Color::Yellow),
-            )));
-        }
-        if unresolved > 0 {
-            lines.push(Line::from(Span::styled(
-                format!("  {} unresolved failures", unresolved),
-                Style::default().fg(Color::Red),
-            )));
-        }
-    }
-
-    lines
-}
 
 fn render_memory_panel(s: &NeilState) -> Vec<Line<'static>> {
     let mut l = vec![
