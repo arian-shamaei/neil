@@ -196,9 +196,9 @@ pub fn render_seal(pose: &SealPose, tick: u64) -> Vec<String> {
     let mut g = DotGrid::new();
     let t = tick as f64;
 
-    // Body center
+    // Body center -- positioned so seal fills the box
     let cx = 28.0_f32;
-    let cy = 24.0_f32;
+    let cy = 20.0_f32;
 
     // Breathing
     let breath = ((t * 0.15).sin() * 0.5 + 0.5) as f32;
@@ -248,12 +248,32 @@ pub fn render_seal(pose: &SealPose, tick: u64) -> Vec<String> {
         bot_points.push((x, by + ry));
     }
 
-    // Draw contour lines (double for thickness)
+    // Fill the body interior (scanline fill between top and bottom contours)
+    for i in 0..=steps {
+        let t_pos = i as f32 / steps as f32;
+        let x = cx - body_len + t_pos * body_len * 2.0;
+        let by = cy + curl * (t_pos - 0.5) * 10.0;
+        let ry = if t_pos < 0.2 {
+            let s = t_pos / 0.2;
+            max_ry * (0.4 + 0.6 * (s * std::f32::consts::FRAC_PI_2).sin())
+        } else if t_pos < 0.6 {
+            max_ry
+        } else {
+            let s = (t_pos - 0.6) / 0.4;
+            max_ry * (0.15 + 0.85 * (s * std::f32::consts::FRAC_PI_2).cos())
+        };
+        // Fill vertical stripe -- only the dorsal (top) portion for depth
+        // Full fill from top contour to center
+        let top_y = (by - ry) as i32;
+        let mid_y = by as i32;
+        for y in top_y..=mid_y {
+            g.set(x as i32, y);
+        }
+    }
+    // Draw contour edges
     for i in 1..top_points.len() {
         draw_line(&mut g, top_points[i-1].0, top_points[i-1].1, top_points[i].0, top_points[i].1);
-        draw_line(&mut g, top_points[i-1].0, top_points[i-1].1 + 1.0, top_points[i].0, top_points[i].1 + 1.0);
         draw_line(&mut g, bot_points[i-1].0, bot_points[i-1].1, bot_points[i].0, bot_points[i].1);
-        draw_line(&mut g, bot_points[i-1].0, bot_points[i-1].1 - 1.0, bot_points[i].0, bot_points[i].1 - 1.0);
     }
 
     // ── HEAD + SNOUT as one smooth profile ──
@@ -286,6 +306,7 @@ pub fn render_seal(pose: &SealPose, tick: u64) -> Vec<String> {
         (head_x + 5.0, head_y + 5.0),     // neck into body
     ];
 
+    // Draw head contour
     for i in 1..head_top.len() {
         draw_line(&mut g, head_top[i-1].0, head_top[i-1].1, head_top[i].0, head_top[i].1);
     }
@@ -294,6 +315,22 @@ pub fn render_seal(pose: &SealPose, tick: u64) -> Vec<String> {
     }
     // Close the nose
     draw_line(&mut g, nose_x, nose_y - 1.0, nose_x, nose_y + 1.0);
+
+    // Fill head dorsal half (above the eye line) for mass
+    let fill_top = (head_y - 10.0) as i32;
+    let fill_bot = (head_y + 2.0) as i32;
+    let fill_left = (nose_x - 1.0) as i32;
+    let fill_right = (head_x + 5.0) as i32;
+    for y in fill_top..=fill_bot {
+        for x in fill_left..=fill_right {
+            // Only fill if inside the head outline (rough bounding)
+            let rel_x = (x as f32 - head_x) / 10.0;
+            let rel_y = (y as f32 - head_y) / 10.0;
+            if rel_x * rel_x * 0.8 + rel_y * rel_y < 0.9 {
+                g.set(x, y);
+            }
+        }
+    }
 
     // ── NOSE dots ──
     g.set(nose_x as i32, nose_y as i32);
