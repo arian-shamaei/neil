@@ -699,8 +699,8 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState) {
         .constraints([
             Constraint::Length(6),   // status
             Constraint::Length(8),   // memory
-            Constraint::Length(16),  // seal art (fixed)
-            Constraint::Min(4),     // intents (fills remaining)
+            Constraint::Min(4),     // intents (dynamic)
+            Constraint::Length(16),  // seal art (fixed bottom)
         ])
         .split(area);
 
@@ -740,7 +740,12 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState) {
             ]));
         }
     }
-    // Seal art -- fixed size, chunks[2]
+    frame.render_widget(
+        Paragraph::new(intent_lines).block(Block::default().borders(Borders::ALL).title(" intents ").border_style(Style::default().fg(Color::DarkGray))),
+        chunks[2],
+    );
+
+    // Seal art -- parameterized engine
     let pose = seal::SealPose::load(&state.neil_home);
     let seal_lines_raw = seal::render_seal(&pose, state.tick);
     let mut seal_lines: Vec<Line> = Vec::new();
@@ -752,12 +757,6 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState) {
     }
     frame.render_widget(
         Paragraph::new(seal_lines).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray))),
-        chunks[2],
-    );
-
-    // Intents -- dynamic size, chunks[3]
-    frame.render_widget(
-        Paragraph::new(intent_lines).block(Block::default().borders(Borders::ALL).title(" intents ").border_style(Style::default().fg(Color::DarkGray))),
         chunks[3],
     );
 }
