@@ -402,25 +402,43 @@ fn render_stream(
     let wrap_width = (area.width as usize).saturating_sub(4);
 
     // Dynamic input box: grows with content, min 3 lines, max 8
-    let input_lines = if input.is_empty() { 1 } else {
-        wrap_text(input, wrap_width.saturating_sub(2)).len()
-    };
+    let input_char_count = input.chars().count();
+    let input_lines = if input.is_empty() { 1 }
+        else if input_char_count > 200 { 2 } // collapsed summary
+        else { wrap_text(input, wrap_width.saturating_sub(2)).len() };
     let input_height = (input_lines as u16 + 2).clamp(3, 8);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(input_height)])
+        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(input_height)])
         .split(area);
 
-    let conv_area = chunks[0];
+    // Header bar
+    let time_str = chrono::Local::now().format("%H:%M:%S").to_string();
+    let header = Line::from(vec![
+        Span::styled(" NEIL ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Span::styled(format!(" {} ", time_str), Style::default().fg(Color::DarkGray)),
+        Span::styled("| Tab:panels Ctrl+S:sidebar Ctrl+M:mouse Esc:quit ", Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(header), chunks[0]);
+
+    let conv_area = chunks[1];
     let mut lines: Vec<Line> = Vec::new();
 
     for entry in stream.iter() {
-        let (prefix, color) = match entry.kind {
-            EntryKind::Neil => ("neil", Color::Cyan),
-            EntryKind::Human => ("you", Color::Green),
-            EntryKind::System => ("sys", Color::DarkGray),
+        let (prefix, color, text_color) = match entry.kind {
+            EntryKind::Neil => ("neil", Color::Cyan, Color::White),
+            EntryKind::Human => (" you", Color::Green, Color::Green),
+            EntryKind::System => (" sys", Color::DarkGray, Color::DarkGray),
         };
+
+        // Separator before each message (except first)
+        if !lines.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", "─".repeat(wrap_width.saturating_sub(2))),
+                Style::default().fg(Color::Rgb(40, 40, 40)),
+            )));
+        }
 
         lines.push(Line::from(vec![
             Span::styled(format!(" {} ", prefix), Style::default().fg(Color::Black).bg(color)),
@@ -438,9 +456,9 @@ fn render_stream(
                         {
                             Style::default().fg(Color::Magenta)
                         } else if wrapped.starts_with("**") || wrapped.starts_with("##") {
-                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                            Style::default().fg(text_color).add_modifier(Modifier::BOLD)
                         } else {
-                            Style::default().fg(Color::White)
+                            Style::default().fg(text_color)
                         };
                         lines.push(Line::from(Span::styled(format!("  {}", wrapped), style)));
                     }
@@ -530,23 +548,39 @@ fn render_stream(
     }
 
     // Input box (dynamic height, word-wrapped)
-    let input_area = chunks[1];
+    let input_area = chunks[2];
     let inner_w = (input_area.width as usize).saturating_sub(4);
 
     // Build display text with cursor
+    let char_count_total = input.chars().count();
     let display_input = if input.is_empty() {
         vec![Line::from(Span::styled("_", Style::default().fg(Color::Cyan).add_modifier(Modifier::SLOW_BLINK)))]
+    } else if char_count_total > 200 {
+        // Large paste: show summary instead of rendering the full text
+        let preview: String = input.chars().take(40).collect();
+        let lines_est = input.lines().count();
+        vec![
+            Line::from(vec![
+                Span::styled(format!("{}...", preview), Style::default().fg(Color::DarkGray)),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    format!(" [{} chars, ~{} lines] ", char_count_total, lines_est),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled("Enter to send, Esc to clear", Style::default().fg(Color::DarkGray)),
+            ]),
+        ]
     } else {
         let wrapped = wrap_text(input, inner_w);
         let mut result: Vec<Line> = Vec::new();
-        let mut char_count: usize = 0;
+        let mut cc: usize = 0;
         for wl in &wrapped {
             let line_char_count = wl.chars().count();
-            let line_start = char_count;
-            let line_end = char_count + line_char_count;
+            let line_start = cc;
+            let line_end = cc + line_char_count;
             if cursor_pos >= line_start && cursor_pos <= line_end {
                 let local_char_pos = cursor_pos - line_start;
-                // Convert char pos to byte pos for slicing
                 let byte_pos = wl.char_indices()
                     .nth(local_char_pos)
                     .map(|(i, _)| i)
@@ -561,7 +595,7 @@ fn render_stream(
             } else {
                 result.push(Line::from(Span::styled(wl.clone(), Style::default().fg(Color::White))));
             }
-            char_count = line_end;
+            cc = line_end;
         }
         result
     };
@@ -576,11 +610,12 @@ fn render_stream(
     // FPS + mode indicator (bottom right of input area)
     let mode = if mouse_captured { "scroll" } else { "select" };
     let fps_text = format!(" {}fps {} ", fps, mode);
-    let fps_x = input_area.x + input_area.width - fps_text.len() as u16 - 1;
+    let fps_len = fps_text.len() as u16;
+    let fps_x = input_area.x + input_area.width.saturating_sub(fps_len + 1);
     let fps_y = input_area.y + input_area.height - 1;
     frame.render_widget(
         Paragraph::new(Span::styled(fps_text, Style::default().fg(Color::DarkGray))),
-        Rect::new(fps_x, fps_y, 8, 1),
+        Rect::new(fps_x, fps_y, fps_len, 1),
     );
 }
 
@@ -679,9 +714,10 @@ fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: 
 
     // FPS bottom right
     let fps_text = format!(" {}fps ", fps);
-    let fx = area.x + area.width - fps_text.len() as u16 - 1;
+    let fl = fps_text.len() as u16;
+    let fx = area.x + area.width.saturating_sub(fl + 1);
     let fy = area.y + area.height - 1;
-    frame.render_widget(Paragraph::new(Span::styled(fps_text, Style::default().fg(Color::DarkGray))), Rect::new(fx, fy, 8, 1));
+    frame.render_widget(Paragraph::new(Span::styled(fps_text, Style::default().fg(Color::DarkGray))), Rect::new(fx, fy, fl, 1));
 }
 
 // ── Panel renderers ──
