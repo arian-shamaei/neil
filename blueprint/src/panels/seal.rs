@@ -4,6 +4,8 @@ use ratatui::style::{Color, Style, Modifier};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
+use std::fs;
+
 use crate::panel::Panel;
 use crate::state::NeilState;
 
@@ -12,6 +14,7 @@ use crate::state::NeilState;
 enum Mood {
     Happy,      // all good, low beats
     Working,    // actively processing
+    Curious,    // idle, exploring
     Tired,      // high beat count
     Alert,      // failures exist
     Sleeping,   // quiet hours (23-07)
@@ -23,7 +26,9 @@ impl Mood {
         if hour >= 23 || hour < 7 {
             return Mood::Sleeping;
         }
-        if !s.failures.iter().filter(|f| f.resolution == "pending").collect::<Vec<_>>().is_empty() {
+        if !s.failures.iter().any(|f| f.resolution == "pending") {
+            // no failures -- check other conditions
+        } else {
             return Mood::Alert;
         }
         if s.heartbeat.beats_today > 35 {
@@ -32,13 +37,19 @@ impl Mood {
         if s.system.queue_count > 0 {
             return Mood::Working;
         }
-        Mood::Happy
+        // Idle -- alternate between happy and curious based on tick
+        if s.tick % 4 == 0 {
+            Mood::Curious
+        } else {
+            Mood::Happy
+        }
     }
 
     fn label(&self) -> &str {
         match self {
             Mood::Happy => "happy",
             Mood::Working => "working",
+            Mood::Curious => "curious",
             Mood::Tired => "tired",
             Mood::Alert => "alert!",
             Mood::Sleeping => "sleeping",
@@ -49,73 +60,67 @@ impl Mood {
         match self {
             Mood::Happy => Color::Green,
             Mood::Working => Color::Cyan,
+            Mood::Curious => Color::Magenta,
             Mood::Tired => Color::Yellow,
             Mood::Alert => Color::Red,
             Mood::Sleeping => Color::Blue,
         }
     }
 
-    fn eyes(&self) -> &str {
+    fn art_file(&self) -> &str {
         match self {
-            Mood::Happy => "^  ^",
-            Mood::Working => "o  o",
-            Mood::Tired => "-  -",
-            Mood::Alert => "O  O",
-            Mood::Sleeping => "-  -",
+            Mood::Happy => "happy.txt",
+            Mood::Working => "working.txt",
+            Mood::Curious => "curious.txt",
+            Mood::Tired => "working.txt",
+            Mood::Alert => "stressed.txt",
+            Mood::Sleeping => "sleeping.txt",
         }
     }
 
-    fn mouth(&self) -> &str {
+    fn emoji(&self) -> &str {
         match self {
-            Mood::Happy => " w ",
-            Mood::Working => " . ",
-            Mood::Tired => " ~ ",
-            Mood::Alert => " ! ",
-            Mood::Sleeping => " z ",
+            Mood::Happy => ":)",
+            Mood::Working => "o.o",
+            Mood::Curious => ":?",
+            Mood::Tired => "~.~",
+            Mood::Alert => "O_O",
+            Mood::Sleeping => "z.z",
         }
     }
 }
 
-/// Generate seal ASCII art lines based on mood
-fn seal_art(mood: &Mood) -> Vec<&'static str> {
-    match mood {
-        Mood::Sleeping => vec![
-            r"        _____      ",
-            r"      /       \    ",
-            r"     |  -   -  |   ",
-            r"     |    z    |   ",
-            r"      \ .---. /    ",
-            r"       '-----'     ",
-            r"      /|     |\    ",
-            r"     / |     | \   ",
-            r"  ~~~~~~~~~~~~~~~~~~",
-            r"      z z z        ",
-        ],
-        Mood::Alert => vec![
-            r"        _____      ",
-            r"      /       \    ",
-            r"     |  O   O  |   ",
-            r"     |    !    |   ",
-            r"      \ .---. /    ",
-            r"       '-----'     ",
-            r"      /|     |\    ",
-            r"     / |     | \   ",
-            r"  ~~~~~~~~~~~~~~~~~~",
-            r"         !!        ",
-        ],
-        _ => vec![
-            r"        _____      ",
-            r"      /       \    ",
-            &"",  // eyes placeholder
-            &"",  // mouth placeholder
-            r"      \ .---. /    ",
-            r"       '-----'     ",
-            r"      /|     |\    ",
-            r"     / |     | \   ",
-            r"  ~~~~~~~~~~~~~~~~~~",
-            r"                   ",
-        ],
+/// Read seal art from art/ file, with inline fallback
+fn load_art(neil_home: &std::path::PathBuf, mood: &Mood) -> Vec<String> {
+    let art_path = neil_home.join("blueprint/art").join(mood.art_file());
+    if let Ok(content) = fs::read_to_string(&art_path) {
+        content.lines().map(|l| l.to_string()).collect()
+    } else {
+        // Fallback: simple ASCII seal
+        vec![
+            "      _____      ".into(),
+            "    /       \\    ".into(),
+            format!("   |  {}  |   ", mood.emoji()),
+            "    \\ .---. /    ".into(),
+            "     '-----'     ".into(),
+            "    /|     |\\    ".into(),
+            "~~~~~~~~~~~~~~~~~~".into(),
+        ]
     }
+}
+
+/// Build a beat budget bar: [========--] 10/50
+fn beat_bar(beats: usize, max: usize, width: usize) -> String {
+    let filled = if max > 0 { (beats * width) / max } else { 0 };
+    let filled = filled.min(width);
+    let empty = width.saturating_sub(filled);
+    format!(
+        "[{}{}] {}/{}",
+        "=".repeat(filled),
+        "-".repeat(empty),
+        beats,
+        max,
+    )
 }
 
 pub struct SealPanel;
@@ -131,54 +136,9 @@ impl Panel for SealPanel {
 
         let mut lines: Vec<Line> = Vec::new();
 
-        // Title
-        lines.push(Line::from(Span::styled(
-            "  🦭 NEIL THE SEAL",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(""));
-
-        // Seal art (hardcoded for each mood to avoid lifetime issues)
-        let art_lines: Vec<String> = match mood {
-            Mood::Sleeping => vec![
-                "        _____      ".into(),
-                "      /       \\    ".into(),
-                "     |  -   -  |   ".into(),
-                "     |    z    |   ".into(),
-                "      \\ .---. /    ".into(),
-                "       '-----'     ".into(),
-                "      /|     |\\    ".into(),
-                "     / |     | \\   ".into(),
-                "  ~~~~~~~~~~~~~~~~~~".into(),
-                "      z z z        ".into(),
-            ],
-            Mood::Alert => vec![
-                "        _____      ".into(),
-                "      /       \\    ".into(),
-                "     |  O   O  |   ".into(),
-                "     |    !    |   ".into(),
-                "      \\ .---. /    ".into(),
-                "       '-----'     ".into(),
-                "      /|     |\\    ".into(),
-                "     / |     | \\   ".into(),
-                "  ~~~~~~~~~~~~~~~~~~".into(),
-                "         !!        ".into(),
-            ],
-            _ => vec![
-                "        _____      ".into(),
-                "      /       \\    ".into(),
-                format!("     |  {}  |   ", mood.eyes()),
-                format!("     |   {}   |   ", mood.mouth()),
-                "      \\ .---. /    ".into(),
-                "       '-----'     ".into(),
-                "      /|     |\\    ".into(),
-                "     / |     | \\   ".into(),
-                "  ~~~~~~~~~~~~~~~~~~".into(),
-                "                   ".into(),
-            ],
-        };
-
-        for a in &art_lines {
+        // Seal art from art/ files
+        let art = load_art(&state.neil_home, &mood);
+        for a in &art {
             lines.push(Line::from(Span::styled(
                 format!("  {}", a),
                 Style::default().fg(mc),
@@ -187,30 +147,69 @@ impl Panel for SealPanel {
 
         lines.push(Line::from(""));
 
-        // Mood
+        // Mood line
         lines.push(Line::from(vec![
             Span::styled("  mood: ", Style::default().fg(Color::DarkGray)),
             Span::styled(mood.label(), Style::default().fg(mc).add_modifier(Modifier::BOLD)),
         ]));
 
-        // Consciousness - simple awareness indicator
-        let consciousness = format!(
-            "{}b/50 | {}n | {}w",
-            state.heartbeat.beats_today,
-            state.palace.total_notes,
-            state.palace.wings.len(),
-        );
+        // Consciousness section
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  -- consciousness --",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        // Beat budget bar
+        let bar = beat_bar(state.heartbeat.beats_today, 50, 14);
         lines.push(Line::from(vec![
-            Span::styled("  mind: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(consciousness, Style::default().fg(Color::White)),
+            Span::styled("  beats: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(bar, Style::default().fg(
+                if state.heartbeat.beats_today > 40 { Color::Red }
+                else if state.heartbeat.beats_today > 25 { Color::Yellow }
+                else { Color::Green }
+            )),
         ]));
 
-        // Uptime / last beat
-        if !state.heartbeat.last_beat.is_empty() {
+        // Memory
+        lines.push(Line::from(vec![
+            Span::styled("  notes: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} across {} wings", state.palace.total_notes, state.palace.wings.len()),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+
+        // Wing breakdown (compact)
+        if !state.palace.wings.is_empty() {
+            let wing_summary: String = state.palace.wings.iter()
+                .take(3)
+                .map(|w| format!("{}({})", w.name, w.count))
+                .collect::<Vec<_>>()
+                .join(" ");
             lines.push(Line::from(vec![
-                Span::styled("  last: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(state.heartbeat.last_beat.clone(), Style::default().fg(Color::DarkGray)),
+                Span::styled("  wings: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(wing_summary, Style::default().fg(Color::DarkGray)),
             ]));
+        }
+
+        // Last thought (last heartbeat summary, truncated)
+        if let Some(last) = state.heartbeat.entries.last() {
+            if !last.summary.is_empty() {
+                let thought = if last.summary.len() > 40 {
+                    format!("{}...", &last.summary[..40])
+                } else {
+                    last.summary.clone()
+                };
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled("  last thought: ", Style::default().fg(Color::DarkGray)),
+                ]));
+                lines.push(Line::from(Span::styled(
+                    format!("  \"{}\"", thought),
+                    Style::default().fg(Color::White).add_modifier(Modifier::ITALIC),
+                )));
+            }
         }
 
         // Pending work
@@ -238,6 +237,6 @@ impl Panel for SealPanel {
 
     fn compact(&self, state: &NeilState) -> String {
         let mood = Mood::from_state(state);
-        format!("🦭 {}", mood.label())
+        format!("🦭 {} | {}b | {}n", mood.label(), state.heartbeat.beats_today, state.palace.total_notes)
     }
 }
