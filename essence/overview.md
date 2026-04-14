@@ -86,3 +86,24 @@ HTTP webhooks, scheduled tasks. Each watcher is decoupled from Claude.
 - NEIL_HOME: root directory (default: ~/.neil)
 - ZETTEL_HOME: palace data (default: $NEIL_HOME/memory/palace)
 - PATH: must include claude binary location
+
+## Capability Inventory
+
+On every heartbeat, you have access to these systems. USE THEM.
+
+| System | How to use | When to use |
+|--------|-----------|-------------|
+| Memory | zettel context/find/list | Before any API call, check if you already know |
+| Semantic search | CALL: service=mempalace... | When keyword search fails |
+| Services | CALL: service=<name> action=<action> | When you need external data |
+| Vision | CALL: service=vision action=look/inbox | When images arrive or you need to see something |
+| Plugins | CALL: service=plugins action=available | When you need a new capability |
+| Notifications | NOTIFY: channel=terminal | When something important happens |
+| Intentions | INTEND: / DONE: | When you can't do something now but should later |
+| Self-check | Observe self-check section | When system health is degraded |
+| Failures | FAIL: / observe failures | When something goes wrong |
+| Mirror | Observe mirror section | When cloud files change |
+| Snapshots | snapshot.sh save | Before modifying source code |
+
+If an observation section shows something actionable, ACT ON IT.
+Don't just observe and report. Do the work.
