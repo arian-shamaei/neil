@@ -92,7 +92,7 @@ ok "Zettel source"
 
 # ── MemPalace (Python package, no venv or .git) ─────────────────────
 mkdir -p "$STAGING/memory/mempalace"
-for F in "$NEIL_HOME"/memory/mempalace/*.py "$NEIL_HOME"/memory/mempalace/*.toml "$NEIL_HOME"/memory/mempalace/*.cfg; do
+for F in "$NEIL_HOME"/memory/mempalace/*.py "$NEIL_HOME"/memory/mempalace/*.toml "$NEIL_HOME"/memory/mempalace/*.cfg "$NEIL_HOME"/memory/mempalace/*.md; do
     [ -f "$F" ] && cp "$F" "$STAGING/memory/mempalace/"
 done
 # Copy the package directory if it exists

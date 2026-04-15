@@ -258,15 +258,17 @@ else
         cp -r "$SRC/memory/mempalace/"*.py "$NEIL_HOME/memory/mempalace/" 2>/dev/null || true
         cp -r "$SRC/memory/mempalace/"*.toml "$NEIL_HOME/memory/mempalace/" 2>/dev/null || true
         cp -r "$SRC/memory/mempalace/"*.cfg "$NEIL_HOME/memory/mempalace/" 2>/dev/null || true
+        cp -r "$SRC/memory/mempalace/"*.md "$NEIL_HOME/memory/mempalace/" 2>/dev/null || true
         [ -d "$SRC/memory/mempalace/mempalace" ] && cp -r "$SRC/memory/mempalace/mempalace" "$NEIL_HOME/memory/mempalace/"
     fi
 
     cd "$NEIL_HOME/memory/mempalace"
     python3 -m venv .venv
     . .venv/bin/activate
-    pip install -e . 2>/dev/null || pip install chromadb 2>/dev/null || {
+    pip install hatchling 2>/dev/null
+    pip install . 2>/dev/null || pip install -e . 2>/dev/null || pip install chromadb pyyaml 2>/dev/null || {
         warn "MemPalace pip install failed -- semantic search may not work"
-        warn "Fix manually: cd $NEIL_HOME/memory/mempalace && . .venv/bin/activate && pip install -e ."
+        warn "Fix manually: cd $NEIL_HOME/memory/mempalace && . .venv/bin/activate && pip install ."
     }
     deactivate 2>/dev/null || true
     cd "$HOME"

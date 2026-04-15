@@ -173,7 +173,7 @@ fn main() -> anyhow::Result<()> {
                         } else {
                             if let Some(last) = stream.last() {
                                 if matches!(last.kind, EntryKind::System) {
-                                    if last.blocks.first().map(|b| matches!(b, RichBlock::Text(t) if t.contains("thinking"))).unwrap_or(false) {
+                                    if last.blocks.first().map(|b| matches!(b, RichBlock::Text(t) if t.contains("sending to neil"))).unwrap_or(false) {
                                         stream.pop();
                                     }
                                 }
@@ -288,10 +288,10 @@ fn main() -> anyhow::Result<()> {
                                 .direction(Direction::Horizontal)
                                 .constraints([Constraint::Min(40), Constraint::Length(28)])
                                 .split(size);
-                            render_stream_cached(frame, h[0], &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured);
-                            render_sidebar(frame, h[1], state, &cached_seal_lines);
+                            render_stream_cached(frame, h[0], &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured, stream_active, tick);
+                            render_sidebar(frame, h[1], state, &cached_seal_lines, stream_active, tick);
                         } else {
-                            render_stream_cached(frame, size, &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured);
+                            render_stream_cached(frame, size, &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured, stream_active, tick);
                         }
                     }
                     View::PanelSelector => {
@@ -300,10 +300,10 @@ fn main() -> anyhow::Result<()> {
                                 .direction(Direction::Horizontal)
                                 .constraints([Constraint::Min(40), Constraint::Length(28)])
                                 .split(size);
-                            render_stream_cached(frame, h[0], &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured);
-                            render_sidebar(frame, h[1], state, &cached_seal_lines);
+                            render_stream_cached(frame, h[0], &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured, stream_active, tick);
+                            render_sidebar(frame, h[1], state, &cached_seal_lines, stream_active, tick);
                         } else {
-                            render_stream_cached(frame, size, &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured);
+                            render_stream_cached(frame, size, &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured, stream_active, tick);
                         }
                         render_panel_selector(frame, size, panel_selection);
                     }
@@ -342,7 +342,7 @@ fn main() -> anyhow::Result<()> {
                                     } else {
                                         let _ = fs::write(&path, &msg);
                                     }
-                                    stream.push(StreamEntry::new(EntryKind::System, "thinking...".into()));
+                                    stream.push(StreamEntry::new(EntryKind::System, "⠋ sending to neil...".into()));
                                 }
                             }
                             KeyCode::Tab => { view = View::PanelSelector; }
@@ -573,18 +573,50 @@ fn build_chat_lines(stream: &[StreamEntry], wrap_width: usize) -> Vec<Line<'stat
             match block {
                 RichBlock::Text(t) => {
                     for wrapped in wrap_text(t, wrap_width) {
-                        let style = if wrapped.starts_with("MEMORY:") || wrapped.starts_with("CALL:")
-                            || wrapped.starts_with("NOTIFY:") || wrapped.starts_with("HEARTBEAT:")
-                            || wrapped.starts_with("INTEND:") || wrapped.starts_with("DONE:")
-                            || wrapped.starts_with("FAIL:") || wrapped.starts_with("SHOW:")
+                        let trimmed = wrapped.trim_start();
+                        let style = if trimmed.starts_with("MEMORY:") || trimmed.starts_with("CALL:")
+                            || trimmed.starts_with("NOTIFY:") || trimmed.starts_with("HEARTBEAT:")
+                            || trimmed.starts_with("INTEND:") || trimmed.starts_with("DONE:")
+                            || trimmed.starts_with("FAIL:") || trimmed.starts_with("SHOW:")
                         {
+                            // Action lines: magenta with arrow prefix
                             Style::default().fg(Color::Magenta)
-                        } else if wrapped.starts_with("**") || wrapped.starts_with("##") {
+                        } else if trimmed.starts_with("$ ") || trimmed.starts_with("❯ ") {
+                            // Shell commands
+                            Style::default().fg(Color::Yellow)
+                        } else if trimmed.starts_with("✓ ") || trimmed.starts_with("✔ ") {
+                            // Success
+                            Style::default().fg(Color::Green)
+                        } else if trimmed.starts_with("✗ ") || trimmed.starts_with("✘ ") || trimmed.starts_with("ERROR") {
+                            // Error
+                            Style::default().fg(Color::Red)
+                        } else if trimmed.starts_with("→ ") || trimmed.starts_with("- ") {
+                            // List items / steps
+                            Style::default().fg(Color::Cyan)
+                        } else if trimmed.starts_with("**") || trimmed.starts_with("##") {
+                            // Bold headers
                             Style::default().fg(text_color).add_modifier(Modifier::BOLD)
+                        } else if trimmed.contains("~/") || trimmed.contains("/.neil/")
+                            || trimmed.contains("/home/") || trimmed.contains(".md")
+                            || trimmed.contains(".rs") || trimmed.contains(".py")
+                            || trimmed.contains(".json") || trimmed.contains(".sh")
+                        {
+                            // File paths
+                            Style::default().fg(Color::Rgb(180, 180, 220))
                         } else {
                             Style::default().fg(text_color)
                         };
-                        lines.push(Line::from(Span::styled(format!("  {}", wrapped), style)));
+
+                        // Prefix action lines with arrow
+                        let display = if trimmed.starts_with("MEMORY:") || trimmed.starts_with("CALL:")
+                            || trimmed.starts_with("NOTIFY:") || trimmed.starts_with("INTEND:")
+                            || trimmed.starts_with("FAIL:")
+                        {
+                            format!("  ▸ {}", wrapped)
+                        } else {
+                            format!("  {}", wrapped)
+                        };
+                        lines.push(Line::from(Span::styled(display, style)));
                     }
                 }
                 RichBlock::Code { lang, content } => {
@@ -659,7 +691,7 @@ fn build_chat_lines(stream: &[StreamEntry], wrap_width: usize) -> Vec<Line<'stat
 fn render_stream_cached(
     frame: &mut ratatui::Frame, area: Rect, cached_lines: &[Line<'static>],
     input: &str, cursor_pos: usize, scroll_offset: i32, fps: u32,
-    mouse_captured: bool,
+    mouse_captured: bool, stream_active: bool, tick: u64,
 ) {
     let wrap_width = (area.width as usize).saturating_sub(4);
 
@@ -675,12 +707,25 @@ fn render_stream_cached(
         .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(input_height)])
         .split(area);
 
-    // Header bar
+    // Header bar with spinner and status
     let time_str = chrono::Local::now().format("%H:%M:%S").to_string();
+    let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let spinner = spinner_chars[(tick as usize / 2) % spinner_chars.len()];
+
+    let status_span = if stream_active {
+        Span::styled(
+            format!(" {} working... ", spinner),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(" idle ", Style::default().fg(Color::DarkGray))
+    };
+
     let header = Line::from(vec![
         Span::styled(" NEIL ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-        Span::styled(format!(" {} ", time_str), Style::default().fg(Color::DarkGray)),
-        Span::styled("| Tab:panels Ctrl+S:sidebar Ctrl+M:mouse Esc:quit ", Style::default().fg(Color::DarkGray)),
+        status_span,
+        Span::styled(format!("{} ", time_str), Style::default().fg(Color::DarkGray)),
+        Span::styled("Tab:panels Ctrl+S:sidebar Esc:quit ", Style::default().fg(Color::Rgb(60, 60, 60))),
     ]);
     frame.render_widget(Paragraph::new(header), chunks[0]);
 
@@ -774,7 +819,7 @@ fn render_stream_cached(
     );
 }
 
-fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState, seal_lines_raw: &[String]) {
+fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState, seal_lines_raw: &[String], stream_active: bool, tick: u64) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -826,8 +871,32 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState, sea
         chunks[2],
     );
 
-    // Seal art -- uses pre-cached render (computed outside draw closure)
+    // Seal art with speech bubble
     let mut seal_lines: Vec<Line> = Vec::new();
+
+    // Speech bubble -- contextual message above the seal
+    let bubble_text = if stream_active {
+        let dots = ".".repeat(((tick / 4) % 4) as usize + 1);
+        format!("working{}", dots)
+    } else {
+        let pending_fails = state.failures.iter().filter(|f| f.resolution == "pending").count();
+        let pending_intents = state.intentions.iter().filter(|i| i.status == "pending").count();
+        if pending_fails > 0 {
+            "need to fix something...".into()
+        } else if pending_intents > 0 {
+            format!("{} things on my mind", pending_intents)
+        } else if state.heartbeat.beats_today > 40 {
+            "getting tired...".into()
+        } else {
+            "all good :)".into()
+        }
+    };
+
+    seal_lines.push(Line::from(vec![
+        Span::styled(" ◃ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(&bubble_text, Style::default().fg(Color::White)),
+    ]));
+
     for art_line in seal_lines_raw {
         seal_lines.push(Line::from(Span::styled(
             art_line.clone(),
@@ -1021,7 +1090,7 @@ fn check_new_results(hd: &PathBuf, stream: &mut Vec<StreamEntry>, count: &mut us
                         if !o.is_empty() {
                             if let Some(last) = stream.last() {
                                 if matches!(last.kind, EntryKind::System) {
-                                    if last.blocks.first().map(|b| matches!(b, RichBlock::Text(t) if t.contains("thinking"))).unwrap_or(false) {
+                                    if last.blocks.first().map(|b| matches!(b, RichBlock::Text(t) if t.contains("sending to neil"))).unwrap_or(false) {
                                         stream.pop();
                                     }
                                 }
