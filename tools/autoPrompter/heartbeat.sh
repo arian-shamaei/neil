@@ -20,6 +20,14 @@ if [ "$EXISTING" -gt 0 ]; then
     exit 0
 fi
 
+# Adaptive gate: check if this tick should fire based on activity patterns
+GATE_SCRIPT="$HOME/.neil/tools/autoPrompter/adaptive_gate.sh"
+if [ -x "$GATE_SCRIPT" ]; then
+    if ! "$GATE_SCRIPT"; then
+        exit 0
+    fi
+fi
+
 # Write heartbeat prompt to queue
 cp "$HEARTBEAT_TEMPLATE" "$QUEUE_DIR/${TS}_heartbeat.md"
 echo "[heartbeat] queued: ${TS}_heartbeat.md"

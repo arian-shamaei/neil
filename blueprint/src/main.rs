@@ -223,16 +223,22 @@ fn main() -> anyhow::Result<()> {
             } else {
                 let prev_len = stream.len();
                 check_new_results(&history_dir, &mut stream, &mut last_history_count, &mut auto_scroll);
-                // Dedup: if check_new_results added an entry that matches the previous last entry, remove it
-                if stream.len() > prev_len && prev_len >= 2 {
+                // Dedup: if the new entry matches ANY recent Neil entry, remove it
+                if stream.len() > prev_len {
                     let new_text = stream.last().and_then(|e| e.blocks.first().map(|b| match b {
                         RichBlock::Text(t) => t.clone(), _ => String::new()
                     })).unwrap_or_default();
-                    let prev_text = stream.get(prev_len - 1).and_then(|e| e.blocks.first().map(|b| match b {
-                        RichBlock::Text(t) => t.clone(), _ => String::new()
-                    })).unwrap_or_default();
-                    if !new_text.is_empty() && new_text == prev_text {
-                        stream.pop(); // duplicate -- remove
+                    if !new_text.is_empty() {
+                        let is_dup = stream.iter().rev().skip(1).take(5).any(|e| {
+                            matches!(e.kind, EntryKind::Neil) &&
+                            e.blocks.first().map(|b| match b {
+                                RichBlock::Text(t) => t == &new_text,
+                                _ => false,
+                            }).unwrap_or(false)
+                        });
+                        if is_dup {
+                            stream.pop();
+                        }
                     }
                 }
             }
