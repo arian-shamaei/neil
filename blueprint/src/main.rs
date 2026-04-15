@@ -189,6 +189,12 @@ fn main() -> anyhow::Result<()> {
                         body
                     };
 
+                    // Mark as active as soon as stream shows "running"
+                    if is_running && !stream_active && !is_done {
+                        stream_active = true;
+                        needs_redraw = true;
+                    }
+
                     if is_running && display_body.len() > last_stream_len {
                         if let Some(idx) = live_entry_idx {
                             if idx < stream.len() {
@@ -200,7 +206,7 @@ fn main() -> anyhow::Result<()> {
                         } else {
                             if let Some(last) = stream.last() {
                                 if matches!(last.kind, EntryKind::System) {
-                                    if last.blocks.first().map(|b| matches!(b, RichBlock::Text(t) if t.contains("sending to neil"))).unwrap_or(false) {
+                                    if last.blocks.first().map(|b| matches!(b, RichBlock::Text(t) if t.contains("sending to neil") || t.contains("thinking"))).unwrap_or(false) {
                                         stream.pop();
                                     }
                                 }
@@ -435,7 +441,7 @@ fn main() -> anyhow::Result<()> {
                                         } else {
                                             let _ = fs::write(&path, &msg);
                                         }
-                                        stream.push(StreamEntry::new(EntryKind::System, "⠋ sending to neil...".into()));
+                                        stream.push(StreamEntry::new(EntryKind::System, "sending to neil...".into()));
                                     }
                                 }
                             }
@@ -833,15 +839,22 @@ fn render_stream_cached(
         .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(input_height)])
         .split(area);
 
-    // Header bar with spinner and status
+    // Header bar with animated seal status
     let time_str = chrono::Local::now().format("%H:%M:%S").to_string();
-    let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    let spinner = spinner_chars[(tick as usize / 2) % spinner_chars.len()];
 
     let status_span = if stream_active {
+        // Swimming seal animation (ASCII, no emoji)
+        let pos = (tick as usize / 2) % 20;
+        let rpos = if pos > 10 { 20 - pos } else { pos };
+        let mut wave: String = (0..16).map(|i| {
+            if i == rpos { 'o' }
+            else if i == rpos + 1 { '>' }
+            else { ['~', '~', '~', '≈', '~', '∼'][((i + tick as usize) / 2) % 6] }
+        }).collect();
+        wave.push_str(" working");
         Span::styled(
-            format!(" {} working... ", spinner),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            format!(" {} ", wave),
+            Style::default().fg(Color::Cyan),
         )
     } else {
         Span::styled(" idle ", Style::default().fg(Color::DarkGray))
@@ -1216,7 +1229,7 @@ fn check_new_results(hd: &PathBuf, stream: &mut Vec<StreamEntry>, count: &mut us
                         if !o.is_empty() {
                             if let Some(last) = stream.last() {
                                 if matches!(last.kind, EntryKind::System) {
-                                    if last.blocks.first().map(|b| matches!(b, RichBlock::Text(t) if t.contains("sending to neil"))).unwrap_or(false) {
+                                    if last.blocks.first().map(|b| matches!(b, RichBlock::Text(t) if t.contains("sending to neil") || t.contains("thinking"))).unwrap_or(false) {
                                         stream.pop();
                                     }
                                 }
