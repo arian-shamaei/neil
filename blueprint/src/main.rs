@@ -835,35 +835,24 @@ fn render_stream_cached(
         else if input_char_count > 200 { 2 }
         else { wrap_text(input, wrap_width.saturating_sub(2)).len() };
     let input_height = (input_lines as u16 + 2).clamp(3, 8);
+    let show_loading = stream_active || prompt_pending;
+    let loading_height: u16 = if show_loading { 1 } else { 0 };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(input_height)])
+        .constraints([
+            Constraint::Length(1),           // header
+            Constraint::Min(3),              // conversation
+            Constraint::Length(loading_height), // loading animation (0 when idle)
+            Constraint::Length(input_height), // input box
+        ])
         .split(area);
 
     // Header bar with animated seal status
     let time_str = chrono::Local::now().format("%H:%M:%S").to_string();
 
-    let status_span = if prompt_pending {
-        let dots = ".".repeat(((tick / 4) % 4) as usize + 1);
-        Span::styled(
-            format!(" queued{} ", dots),
-            Style::default().fg(Color::Yellow),
-        )
-    } else if stream_active {
-        // Swimming seal animation (ASCII, no emoji)
-        let pos = (tick as usize / 2) % 20;
-        let rpos = if pos > 10 { 20 - pos } else { pos };
-        let mut wave: String = (0..16).map(|i| {
-            if i == rpos { 'o' }
-            else if i == rpos + 1 { '>' }
-            else { ['~', '~', '~', '≈', '~', '∼'][((i + tick as usize) / 2) % 6] }
-        }).collect();
-        wave.push_str(" working");
-        Span::styled(
-            format!(" {} ", wave),
-            Style::default().fg(Color::Cyan),
-        )
+    let status_span = if stream_active || prompt_pending {
+        Span::styled(" working ", Style::default().fg(Color::Yellow))
     } else {
         Span::styled(" idle ", Style::default().fg(Color::DarkGray))
     };
@@ -896,8 +885,27 @@ fn render_stream_cached(
         );
     }
 
+    // Loading animation (between conversation and input)
+    if show_loading {
+        let pos = (tick as usize / 2) % 20;
+        let rpos = if pos > 10 { 20 - pos } else { pos };
+        let anim_width = (area.width as usize).saturating_sub(4);
+        let wave: String = (0..anim_width).map(|i| {
+            if i == rpos { 'o' }
+            else if i == rpos + 1 { '>' }
+            else { ['~', '~', '~', '≈', '~', '∼'][((i + tick as usize) / 2) % 6] }
+        }).collect();
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("  {}", wave),
+                Style::default().fg(Color::Cyan),
+            ))),
+            chunks[2],
+        );
+    }
+
     // Input box (dynamic height, word-wrapped)
-    let input_area = chunks[2];
+    let input_area = chunks[3];
     let inner_w = (input_area.width as usize).saturating_sub(4);
 
     let char_count_total = input.chars().count();
