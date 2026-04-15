@@ -112,10 +112,7 @@ echo "=== Guardrails ==="
 # Daily beat count
 TODAY=$(date +%Y-%m-%d)
 TODAY_BEATS=$(grep -c "$TODAY" "$HOME/.neil/heartbeat_log.json" 2>/dev/null || echo 0)
-echo "beats today: $TODAY_BEATS / 50"
-if [ "$TODAY_BEATS" -ge 50 ]; then
-    echo "WARNING: DAILY BUDGET EXHAUSTED"
-fi
+echo "beats today: $TODAY_BEATS (no cap)"
 
 # Loop detection: check if last 3 summaries are identical
 if [ -f "$HOME/.neil/heartbeat_log.json" ]; then

@@ -885,15 +885,23 @@ fn render_stream_cached(
         );
     }
 
-    // Loading animation (between conversation and input)
+    // Loading animation -- ocean wave physics
     if show_loading {
-        let pos = (tick as usize / 2) % 20;
-        let rpos = if pos > 10 { 20 - pos } else { pos };
-        let anim_width = (area.width as usize).saturating_sub(4);
-        let wave: String = (0..anim_width).map(|i| {
-            if i == rpos { 'o' }
-            else if i == rpos + 1 { '>' }
-            else { ['~', '~', '~', '≈', '~', '∼'][((i + tick as usize) / 2) % 6] }
+        let t = tick as f64 * 0.15;
+        let w = (area.width as usize).saturating_sub(4);
+        let wave: String = (0..w).map(|i| {
+            let x = i as f64;
+            // Three overlapping sine waves at different frequencies
+            let h = (x * 0.3 + t).sin() * 0.4
+                  + (x * 0.15 - t * 0.7).sin() * 0.3
+                  + (x * 0.5 + t * 1.3).sin() * 0.2;
+            // Map wave height to characters
+            if h > 0.5 { '≈' }
+            else if h > 0.2 { '∿' }
+            else if h > -0.1 { '~' }
+            else if h > -0.3 { '∼' }
+            else if h > -0.5 { '·' }
+            else { ' ' }
         }).collect();
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(

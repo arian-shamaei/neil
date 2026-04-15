@@ -4,10 +4,8 @@ Hard limits on autonomous behavior. These override all other instructions.
 
 ## Token budget
 
-- Maximum 50 heartbeats per day (25 hours of 30-min beats)
-- If heartbeat_log.json has 50+ entries with today's date, STOP. Output:
-  NOTIFY: channel=terminal | Daily token budget exhausted. Pausing until tomorrow.
-  Then do nothing else.
+- No daily beat cap. Run as many heartbeats as needed.
+- Loop prevention (below) still applies -- don't repeat identical work.
 
 ## Loop prevention
 
