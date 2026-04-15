@@ -95,7 +95,8 @@ fn main() -> anyhow::Result<()> {
     let mut last_stream_len: usize = 0;
     let mut stream_active = false;
     let mut live_entry_idx: Option<usize> = None;
-    let mut skip_next_result = false; // prevents duplicate after stream finishes
+    let mut skip_next_result = false;
+    let mut prompt_pending = false; // true between submit and stream_active
     let mut prompt_history: Vec<String> = Vec::new();
     let mut history_idx: Option<usize> = None;
     let mut saved_input: String = String::new();
@@ -192,6 +193,7 @@ fn main() -> anyhow::Result<()> {
                     // Mark as active as soon as stream shows "running"
                     if is_running && !stream_active && !is_done {
                         stream_active = true;
+                        prompt_pending = false;
                         needs_redraw = true;
                     }
 
@@ -206,7 +208,7 @@ fn main() -> anyhow::Result<()> {
                         } else {
                             if let Some(last) = stream.last() {
                                 if matches!(last.kind, EntryKind::System) {
-                                    if last.blocks.first().map(|b| matches!(b, RichBlock::Text(t) if t.contains("sending to neil") || t.contains("thinking"))).unwrap_or(false) {
+                                    if last.blocks.first().map(|b| matches!(b, RichBlock::Text(t) if t.contains("sending to neil") || t.contains("thinking") || t.contains("queued"))).unwrap_or(false) {
                                         stream.pop();
                                     }
                                 }
@@ -327,10 +329,10 @@ fn main() -> anyhow::Result<()> {
                                 .direction(Direction::Horizontal)
                                 .constraints([Constraint::Min(40), Constraint::Length(28)])
                                 .split(size);
-                            render_stream_cached(frame, h[0], &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured, stream_active, tick);
+                            render_stream_cached(frame, h[0], &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured, stream_active, prompt_pending, tick);
                             render_sidebar(frame, h[1], state, &cached_seal_lines, stream_active, tick);
                         } else {
-                            render_stream_cached(frame, size, &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured, stream_active, tick);
+                            render_stream_cached(frame, size, &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured, stream_active, prompt_pending, tick);
                         }
                     }
                     View::PanelSelector => {
@@ -339,10 +341,10 @@ fn main() -> anyhow::Result<()> {
                                 .direction(Direction::Horizontal)
                                 .constraints([Constraint::Min(40), Constraint::Length(28)])
                                 .split(size);
-                            render_stream_cached(frame, h[0], &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured, stream_active, tick);
+                            render_stream_cached(frame, h[0], &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured, stream_active, prompt_pending, tick);
                             render_sidebar(frame, h[1], state, &cached_seal_lines, stream_active, tick);
                         } else {
-                            render_stream_cached(frame, size, &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured, stream_active, tick);
+                            render_stream_cached(frame, size, &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured, stream_active, prompt_pending, tick);
                         }
                         render_panel_selector(frame, size, panel_selection);
                     }
@@ -441,7 +443,7 @@ fn main() -> anyhow::Result<()> {
                                         } else {
                                             let _ = fs::write(&path, &msg);
                                         }
-                                        stream.push(StreamEntry::new(EntryKind::System, "sending to neil...".into()));
+                                        prompt_pending = true;
                                     }
                                 }
                             }
@@ -823,7 +825,7 @@ fn build_chat_lines(stream: &[StreamEntry], wrap_width: usize) -> Vec<Line<'stat
 fn render_stream_cached(
     frame: &mut ratatui::Frame, area: Rect, cached_lines: &[Line<'static>],
     input: &str, cursor_pos: usize, scroll_offset: i32, fps: u32,
-    mouse_captured: bool, stream_active: bool, tick: u64,
+    mouse_captured: bool, stream_active: bool, prompt_pending: bool, tick: u64,
 ) {
     let wrap_width = (area.width as usize).saturating_sub(4);
 
@@ -842,7 +844,13 @@ fn render_stream_cached(
     // Header bar with animated seal status
     let time_str = chrono::Local::now().format("%H:%M:%S").to_string();
 
-    let status_span = if stream_active {
+    let status_span = if prompt_pending {
+        let dots = ".".repeat(((tick / 4) % 4) as usize + 1);
+        Span::styled(
+            format!(" queued{} ", dots),
+            Style::default().fg(Color::Yellow),
+        )
+    } else if stream_active {
         // Swimming seal animation (ASCII, no emoji)
         let pos = (tick as usize / 2) % 20;
         let rpos = if pos > 10 { 20 - pos } else { pos };
@@ -1229,7 +1237,7 @@ fn check_new_results(hd: &PathBuf, stream: &mut Vec<StreamEntry>, count: &mut us
                         if !o.is_empty() {
                             if let Some(last) = stream.last() {
                                 if matches!(last.kind, EntryKind::System) {
-                                    if last.blocks.first().map(|b| matches!(b, RichBlock::Text(t) if t.contains("sending to neil") || t.contains("thinking"))).unwrap_or(false) {
+                                    if last.blocks.first().map(|b| matches!(b, RichBlock::Text(t) if t.contains("sending to neil") || t.contains("thinking") || t.contains("queued"))).unwrap_or(false) {
                                         stream.pop();
                                     }
                                 }
