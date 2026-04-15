@@ -29,10 +29,10 @@ Core system complete. All components built and verified:
 
 ## Remaining for release
 
-- Populate more blueprint panels (seal art, mood, consciousness)
+- ~~Populate more blueprint panels~~ (DONE: all 7 panels implemented, seal art with 6 moods, consciousness bar)
+- ~~Package as distributable (install script or tarball)~~ (DONE: install.sh 516 lines, release.sh 206 lines, openclaw-v0.1.tar.gz 216K/133 files)
+- ~~Documentation for new users~~ (DONE: QUICKSTART.md + README.md with architecture, commands, troubleshooting)
 - End-to-end release test on clean machine
-- Package as distributable (install script or tarball)
-- Documentation for new users
 
 ## Constraints
 
