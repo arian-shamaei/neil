@@ -95,6 +95,7 @@ fn main() -> anyhow::Result<()> {
     let mut last_stream_len: usize = 0;
     let mut stream_active = false;
     let mut live_entry_idx: Option<usize> = None;
+    let mut skip_next_result = false; // prevents duplicate after stream finishes
     let mut fps = FpsTracker::new();
 
     // Cache: only reload state on timed intervals
@@ -192,20 +193,58 @@ fn main() -> anyhow::Result<()> {
                     if is_done && stream_active {
                         stream_active = false;
                         live_entry_idx = None;
+                        skip_next_result = true; // result file will have same content
+                    }
+
+                    // Detect new stream (different prompt) -- reset len tracker
+                    if is_running && !stream_active && display_body.is_empty() {
                         last_stream_len = 0;
                     }
                 }
             }
         }
 
-        // Check for new results every 2 seconds (time-gated)
+        // Check for new results every 2 seconds
         if last_results_check.elapsed() >= Duration::from_secs(2) && !stream_active {
             last_results_check = Instant::now();
             let prev = last_history_count;
-            check_new_results(&history_dir, &mut stream, &mut last_history_count, &mut auto_scroll);
+
+            if skip_next_result {
+                // Stream already delivered this response -- just update the file count
+                if let Ok(entries) = fs::read_dir(&history_dir) {
+                    last_history_count = entries.filter_map(|e| e.ok())
+                        .filter(|e| e.file_name().to_string_lossy().ends_with(".result.md"))
+                        .count();
+                }
+                skip_next_result = false;
+            } else {
+                let prev_len = stream.len();
+                check_new_results(&history_dir, &mut stream, &mut last_history_count, &mut auto_scroll);
+                // Dedup: if check_new_results added an entry that matches the previous last entry, remove it
+                if stream.len() > prev_len && prev_len >= 2 {
+                    let new_text = stream.last().and_then(|e| e.blocks.first().map(|b| match b {
+                        RichBlock::Text(t) => t.clone(), _ => String::new()
+                    })).unwrap_or_default();
+                    let prev_text = stream.get(prev_len - 1).and_then(|e| e.blocks.first().map(|b| match b {
+                        RichBlock::Text(t) => t.clone(), _ => String::new()
+                    })).unwrap_or_default();
+                    if !new_text.is_empty() && new_text == prev_text {
+                        stream.pop(); // duplicate -- remove
+                    }
+                }
+            }
+
             if last_history_count != prev {
                 needs_redraw = true;
             }
+        }
+
+        // Cap stream to prevent unbounded growth
+        if stream.len() > 100 {
+            let drain = stream.len() - 80;
+            stream.drain(..drain);
+            // Reset cache since indices shifted
+            cached_chat_stream_len = 0;
         }
 
         if auto_scroll { scroll_offset = 0; }
