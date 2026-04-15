@@ -97,8 +97,32 @@ fn main() -> anyhow::Result<()> {
     let mut live_entry_idx: Option<usize> = None;
     let mut skip_next_result = false; // prevents duplicate after stream finishes
     let mut prompt_history: Vec<String> = Vec::new();
-    let mut history_idx: Option<usize> = None; // None = not browsing, Some(i) = showing history[i]
-    let mut saved_input: String = String::new(); // saves current input when browsing history
+    let mut history_idx: Option<usize> = None;
+    let mut saved_input: String = String::new();
+
+    // Pre-load prompt history from past result files
+    if let Ok(entries) = fs::read_dir(&history_dir) {
+        let mut files: Vec<_> = entries.filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".result.md"))
+            .collect();
+        files.sort_by_key(|e| e.file_name());
+        for entry in files.iter().rev().take(50) {
+            if let Ok(content) = fs::read_to_string(entry.path()) {
+                if let Some(prompt) = extract_between(&content, "## Prompt\n```\n", "\n```") {
+                    let trimmed = prompt.trim().to_string();
+                    // Skip heartbeats, wakeups, and empty prompts
+                    if !trimmed.is_empty()
+                        && !trimmed.starts_with("# Heartbeat")
+                        && !trimmed.starts_with("# Wake Up")
+                        && !trimmed.starts_with("[EVENT]")
+                    {
+                        prompt_history.push(trimmed);
+                    }
+                }
+            }
+        }
+        prompt_history.reverse(); // oldest first, newest last (Up arrow starts from end)
+    }
     let mut fps = FpsTracker::new();
 
     // Cache: only reload state on timed intervals
