@@ -72,8 +72,10 @@ fn main() -> anyhow::Result<()> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
-    // Mouse capture OFF by default -- native text selection works
-    // Ctrl+M enables mouse capture for scroll wheel support
+    // Mouse capture ON by default for scroll wheel
+    // Shift+click for text selection in most terminals
+    // Ctrl+M toggles off if needed
+    execute!(stdout, crossterm::event::EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -88,7 +90,7 @@ fn main() -> anyhow::Result<()> {
     let mut view = View::Chat;
     let mut panel_selection: usize = 0;
     let mut show_sidebar = true;
-    let mut mouse_captured = false; // default: text selection enabled
+    let mut mouse_captured = true; // default: scroll enabled, Shift+click for text select
     let mut tick: u64 = 0;
     let mut last_history_count: usize = 0;
     let mut last_input_time = Instant::now();
@@ -645,7 +647,7 @@ fn main() -> anyhow::Result<()> {
     if mouse_captured {
         execute!(terminal.backend_mut(), LeaveAlternateScreen, crossterm::event::DisableMouseCapture)?;
     } else {
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen, crossterm::event::DisableMouseCapture)?;
     }
     Ok(())
 }

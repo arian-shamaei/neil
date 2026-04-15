@@ -208,6 +208,22 @@ static int write_file_atomic(const char *path, const char *data, size_t len) {
     return 0;
 }
 
+/* Escape single quotes for safe embedding in shell single-quoted strings.
+ * Replaces ' with '\'' (end quote, escaped quote, restart quote).
+ * Writes into dst (up to dstsz-1 bytes). Always NUL-terminates. */
+static void shell_escape_sq(char *dst, size_t dstsz, const char *src) {
+    size_t di = 0;
+    for (size_t i = 0; src[i] && di < dstsz - 4; i++) {
+        if (src[i] == '\'') {
+            dst[di++] = '\''; dst[di++] = '\\';
+            dst[di++] = '\''; dst[di++] = '\'';
+        } else {
+            dst[di++] = src[i];
+        }
+    }
+    dst[di] = '\0';
+}
+
 /* Run a shell command, capture stdout into malloc'd buffer. */
 static char *run_command(const char *cmd) {
     FILE *fp = popen(cmd, "r");
@@ -512,11 +528,17 @@ static void dispatch_notifications(const char *output) {
             p = eol; continue;
         }
 
+        /* Escape values for safe shell embedding */
+        char esc_channel[128], esc_message[4096], esc_params[2048];
+        shell_escape_sq(esc_channel, sizeof(esc_channel), channel);
+        shell_escape_sq(esc_message, sizeof(esc_message), message);
+        shell_escape_sq(esc_params, sizeof(esc_params), params_raw);
+
         /* Parse individual params as NEIL_PARAM_<key> env vars */
         char cmd[8192];
         int n = snprintf(cmd, sizeof(cmd),
             "NEIL_CHANNEL='%s' NEIL_MESSAGE='%s' NEIL_PARAMS='%s' ",
-            channel, message, params_raw);
+            esc_channel, esc_message, esc_params);
 
         /* Parse key=value into NEIL_PARAM_key=value */
         char params_copy[1024];
@@ -526,8 +548,10 @@ static void dispatch_notifications(const char *output) {
             char *eq = strchr(ptok, '=');
             if (eq) {
                 *eq = '\0';
+                char esc_val[512];
+                shell_escape_sq(esc_val, sizeof(esc_val), eq + 1);
                 n += snprintf(cmd + n, sizeof(cmd) - n,
-                    "NEIL_PARAM_%s='%s' ", ptok, eq + 1);
+                    "NEIL_PARAM_%s='%s' ", ptok, esc_val);
             }
             ptok = strtok(NULL, " ");
         }
