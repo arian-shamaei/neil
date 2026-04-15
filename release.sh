@@ -98,6 +98,9 @@ done
 # Copy the package directory if it exists
 if [ -d "$NEIL_HOME/memory/mempalace/mempalace" ]; then
     cp -r "$NEIL_HOME/memory/mempalace/mempalace" "$STAGING/memory/mempalace/"
+    # Remove Python bytecode that shouldn't ship
+    find "$STAGING/memory/mempalace" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+    find "$STAGING/memory/mempalace" -name '*.pyc' -delete 2>/dev/null || true
 fi
 ok "MemPalace package"
 
@@ -154,6 +157,8 @@ ok "Vision script"
 if [ -d "$NEIL_HOME/blueprint/src" ]; then
     mkdir -p "$STAGING/blueprint/src"
     cp -r "$NEIL_HOME/blueprint/src/"* "$STAGING/blueprint/src/"
+    # Remove backup files that shouldn't ship
+    find "$STAGING/blueprint" -name '*.bak' -delete 2>/dev/null || true
     [ -f "$NEIL_HOME/blueprint/Cargo.toml" ] && \
         cp "$NEIL_HOME/blueprint/Cargo.toml" "$STAGING/blueprint/"
     [ -f "$NEIL_HOME/blueprint/Cargo.lock" ] && \
