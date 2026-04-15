@@ -76,7 +76,7 @@ Patterns and gotchas discovered through experience. Read on every invocation.
 
 - Column E (Program Verdict) = NEVER TOUCH. Column F (Manual Status) = ok to set.
 - Row numbers shift. NEVER hardcode row numbers. Scan by name.
-- Sheet ID: 1k19sS9NfwlVfG7GCCf18LO69pr4reSOTN6v1lY2nykQ, Associates tab.
+- Sheet ID: [sheet-id], Associates tab.
 - Use Ollama direct for voice, NOT OpenClaw API (confused responses).
 - Mic Device [0] at 16kHz (Device 7 clips badly).
 - Service account cant upload to personal Gmail Drive. Use OAuth2.
