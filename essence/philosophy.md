@@ -1,0 +1,1 @@
+../self/philosophy.md
