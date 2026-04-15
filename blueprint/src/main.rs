@@ -212,7 +212,7 @@ fn main() -> anyhow::Result<()> {
 
         // Only redraw when needed or at render rate
         // Use slower animation rate (100ms/10fps) for idle, fast (33ms) when content changes
-        let anim_due = last_render.elapsed() >= Duration::from_millis(100);
+        let anim_due = last_render.elapsed() >= Duration::from_millis(33);
         if needs_redraw || anim_due {
             fps.tick();
 
@@ -279,7 +279,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         // Poll input with short timeout for responsiveness
-        if event::poll(Duration::from_millis(16))? {
+        if event::poll(Duration::from_millis(8))? {
             needs_redraw = true;
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
