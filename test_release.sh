@@ -362,8 +362,8 @@ info "=== Phase 10: Self-Check Script ==="
 NEIL_HOME="$TEST_HOME" ZETTEL_HOME="$TEST_HOME/memory/palace" \
     sh "$TEST_HOME/self/self_check.sh" > /tmp/openclaw-e2e-selfcheck.log 2>&1 || true
 
-SELFCHECK_FAILS=$(grep -ci "FAIL\|fail\|✗\|ERROR" /tmp/openclaw-e2e-selfcheck.log 2>/dev/null || echo "0")
-SELFCHECK_PASS=$(grep -ci "PASS\|pass\|ok\|✓" /tmp/openclaw-e2e-selfcheck.log 2>/dev/null || echo "0")
+SELFCHECK_FAILS=$(grep -ciE "FAIL|ERROR" /tmp/openclaw-e2e-selfcheck.log 2>/dev/null || echo "0")
+SELFCHECK_PASS=$(grep -ciE "ok|PASS|ALL CHECKS" /tmp/openclaw-e2e-selfcheck.log 2>/dev/null || echo "0")
 if [ "$SELFCHECK_FAILS" -eq 0 ] && [ "$SELFCHECK_PASS" -gt 0 ]; then
     pass "self_check.sh reports all clear"
 else

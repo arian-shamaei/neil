@@ -96,6 +96,9 @@ fn main() -> anyhow::Result<()> {
     let mut stream_active = false;
     let mut live_entry_idx: Option<usize> = None;
     let mut skip_next_result = false; // prevents duplicate after stream finishes
+    let mut prompt_history: Vec<String> = Vec::new();
+    let mut history_idx: Option<usize> = None; // None = not browsing, Some(i) = showing history[i]
+    let mut saved_input: String = String::new(); // saves current input when browsing history
     let mut fps = FpsTracker::new();
 
     // Cache: only reload state on timed intervals
@@ -328,21 +331,82 @@ fn main() -> anyhow::Result<()> {
                                 if !input.is_empty() {
                                     last_input_time = Instant::now();
                                     let msg = input.clone();
-                                    stream.push(StreamEntry::new(EntryKind::Human, msg.clone()));
-                                    input.clear();
-                                    cursor_pos = 0;
-                                    auto_scroll = true;
-                                    scroll_offset = 0;
-                                    let ts = chrono::Local::now().format("%Y%m%dT%H%M%S");
-                                    let path = queue_dir.join(format!("{}_chat.md", ts));
-                                    if msg.len() > 50_000 {
-                                        stream.push(StreamEntry::new(EntryKind::System,
-                                            format!("Message too large ({} chars, max 50000). Truncated.", msg.len())));
-                                        let _ = fs::write(&path, &msg[..50_000]);
+
+                                    // Save to prompt history
+                                    prompt_history.push(msg.clone());
+                                    history_idx = None;
+                                    saved_input.clear();
+
+                                    // Check for slash commands
+                                    let trimmed = msg.trim();
+                                    if trimmed.starts_with('/') {
+                                        let cmd = trimmed.split_whitespace().next().unwrap_or("");
+                                        match cmd {
+                                            "/clear" => {
+                                                stream.clear();
+                                                stream.push(StreamEntry::new(EntryKind::System, "Chat cleared.".into()));
+                                                cached_chat_stream_len = 0;
+                                            }
+                                            "/status" => {
+                                                let s = cached_state.as_ref().unwrap();
+                                                stream.push(StreamEntry::new(EntryKind::System, format!(
+                                                    "Notes: {} | Beats: {}/50 | Queue: {} | Failures: {} | Intents: {}",
+                                                    s.palace.total_notes, s.heartbeat.beats_today,
+                                                    s.system.queue_count,
+                                                    s.failures.iter().filter(|f| f.resolution == "pending").count(),
+                                                    s.intentions.iter().filter(|i| i.status == "pending").count(),
+                                                )));
+                                            }
+                                            "/help" => {
+                                                stream.push(StreamEntry::new(EntryKind::System,
+                                                    "/clear - Clear chat\n/status - System status\n/help - This help\n/panels - Open panel selector\n/heartbeat - Trigger a heartbeat\n/history - Show prompt history\nUp/Down arrows - Browse previous prompts\nTab - Open panels\nCtrl+S - Toggle sidebar\nCtrl+M - Toggle mouse mode".into()
+                                                ));
+                                            }
+                                            "/panels" => {
+                                                view = View::PanelSelector;
+                                            }
+                                            "/heartbeat" => {
+                                                let hb_path = neil_home.join("tools/autoPrompter/heartbeat.sh");
+                                                let _ = std::process::Command::new("sh").arg(&hb_path).output();
+                                                stream.push(StreamEntry::new(EntryKind::System, "Heartbeat queued.".into()));
+                                            }
+                                            "/history" => {
+                                                let hist: String = prompt_history.iter().rev().take(10)
+                                                    .enumerate()
+                                                    .map(|(i, h)| format!("  {}: {}", i + 1, h.chars().take(60).collect::<String>()))
+                                                    .collect::<Vec<_>>().join("\n");
+                                                stream.push(StreamEntry::new(EntryKind::System,
+                                                    if hist.is_empty() { "(no history)".into() } else { hist }
+                                                ));
+                                            }
+                                            _ => {
+                                                stream.push(StreamEntry::new(EntryKind::System,
+                                                    format!("Unknown command: {}. Type /help for commands.", cmd)
+                                                ));
+                                            }
+                                        }
+                                        input.clear();
+                                        cursor_pos = 0;
+                                        auto_scroll = true;
+                                        scroll_offset = 0;
                                     } else {
-                                        let _ = fs::write(&path, &msg);
+                                        // Normal prompt -- send to Neil
+                                        stream.push(StreamEntry::new(EntryKind::Human, msg.clone()));
+                                        input.clear();
+                                        cursor_pos = 0;
+                                        auto_scroll = true;
+                                        scroll_offset = 0;
+                                        let ts = chrono::Local::now().format("%Y%m%dT%H%M%S");
+                                        let path = queue_dir.join(format!("{}_chat.md", ts));
+                                        if msg.len() > 50_000 {
+                                            stream.push(StreamEntry::new(EntryKind::System,
+                                                format!("Message too large ({} chars, max 50000). Truncated.", msg.len())));
+                                            let _ = fs::write(&path, &msg[..50_000]);
+                                        } else {
+                                            let _ = fs::write(&path, &msg);
+                                        }
+                                        stream.push(StreamEntry::new(EntryKind::System, "⠋ sending to neil...".into()));
                                     }
-                                    stream.push(StreamEntry::new(EntryKind::System, "⠋ sending to neil...".into()));
                                 }
                             }
                             KeyCode::Tab => { view = View::PanelSelector; }
@@ -420,10 +484,42 @@ fn main() -> anyhow::Result<()> {
                                     cursor_pos = input.chars().count();
                                 }
                             }
-                            KeyCode::Up => { scroll_offset += 3; auto_scroll = false; }
+                            KeyCode::Up => {
+                                // Browse prompt history
+                                if !prompt_history.is_empty() {
+                                    match history_idx {
+                                        None => {
+                                            saved_input = input.clone();
+                                            history_idx = Some(prompt_history.len() - 1);
+                                            input = prompt_history.last().unwrap().clone();
+                                            cursor_pos = input.chars().count();
+                                        }
+                                        Some(idx) if idx > 0 => {
+                                            history_idx = Some(idx - 1);
+                                            input = prompt_history[idx - 1].clone();
+                                            cursor_pos = input.chars().count();
+                                        }
+                                        _ => {} // at oldest, do nothing
+                                    }
+                                }
+                            }
                             KeyCode::Down => {
-                                scroll_offset = (scroll_offset - 3).max(0);
-                                if scroll_offset == 0 { auto_scroll = true; }
+                                // Browse prompt history forward
+                                match history_idx {
+                                    Some(idx) if idx + 1 < prompt_history.len() => {
+                                        history_idx = Some(idx + 1);
+                                        input = prompt_history[idx + 1].clone();
+                                        cursor_pos = input.chars().count();
+                                    }
+                                    Some(_) => {
+                                        // Past newest -- restore saved input
+                                        history_idx = None;
+                                        input = saved_input.clone();
+                                        cursor_pos = input.chars().count();
+                                        saved_input.clear();
+                                    }
+                                    None => {} // not browsing history
+                                }
                             }
                             KeyCode::PageUp => { scroll_offset += 20; auto_scroll = false; }
                             KeyCode::PageDown => {
