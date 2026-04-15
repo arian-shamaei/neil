@@ -97,9 +97,26 @@ fn main() -> anyhow::Result<()> {
     let mut live_entry_idx: Option<usize> = None;
     let mut fps = FpsTracker::new();
 
-    // Cache: only reload state every 10 ticks
+    // Cache: only reload state on timed intervals
     let mut cached_state: Option<NeilState> = None;
-    let mut state_tick: u64 = 0;
+
+    // Time-gated I/O -- replaces tick-based modulo checks
+    let mut last_state_reload = Instant::now() - Duration::from_secs(10); // force first load
+    let mut last_stream_check = Instant::now();
+    let mut last_results_check = Instant::now();
+    let mut last_awareness_write = Instant::now();
+
+    // Seal rendering cache (expensive braille grid math)
+    let mut cached_seal_lines: Vec<String> = Vec::new();
+    let mut cached_seal_tick: u64 = u64::MAX; // force first render
+    let mut cached_pose = seal::SealPose::default();
+
+    // Stream line cache -- only rebuild when stream content changes
+    let mut cached_chat_lines: Vec<Line<'static>> = Vec::new();
+    let mut cached_chat_stream_len: usize = 0;
+    let mut cached_chat_content_hint: usize = 0; // tracks in-place edits (streaming)
+    let mut cached_chat_wrap_width: usize = 0;
+    // Reserved for future sidebar caching
 
     stream.push(StreamEntry::new(
         EntryKind::System,
@@ -108,35 +125,36 @@ fn main() -> anyhow::Result<()> {
     load_history(&history_dir, &mut stream, &mut last_history_count);
 
     // Target ~30 FPS for smooth rendering, but only poll files slowly
-    let render_rate = Duration::from_millis(33); // ~30 FPS
+    // render_rate removed: now using event-driven + 100ms animation timer
     let mut last_render = Instant::now();
     let mut needs_redraw = true;
 
     loop {
-        // Reload state from disk every ~5 seconds (not every frame)
-        if tick % 10 == 0 || cached_state.is_none() {
+        // Reload state from disk every 5 seconds (time-gated, not tick-gated)
+        if last_state_reload.elapsed() >= Duration::from_secs(5) || cached_state.is_none() {
             cached_state = Some(NeilState::load(&neil_home));
-            state_tick = tick;
+            cached_pose = seal::SealPose::load(&cached_state.as_ref().unwrap().neil_home);
+            last_state_reload = Instant::now();
+            needs_redraw = true;
         }
-        // Update tick on every frame for smooth animation
+        // Update tick on state for animations (tick only increments on renders)
         if let Some(ref mut s) = cached_state {
             s.tick = tick;
         }
         let state = cached_state.as_ref().unwrap();
 
-        // Tail stream file every frame for live output
-        {
+        // Tail stream file -- check every 100ms (not every frame)
+        if last_stream_check.elapsed() >= Duration::from_millis(100) {
+            last_stream_check = Instant::now();
             let stream_path = neil_home.join(".neil_stream");
             if let Ok(content) = fs::read_to_string(&stream_path) {
                 if let Some(nl) = content.find('\n') {
                     let header = &content[..nl];
                     let body = &content[nl+1..];
 
-                    // Check if stream is active
                     let is_running = header.contains("\"running\"");
                     let is_done = body.contains("{\"status\":\"done\"");
 
-                    // Strip the done marker from display
                     let display_body = if let Some(done_pos) = body.rfind("\n{\"status\":\"done\"") {
                         &body[..done_pos]
                     } else {
@@ -144,7 +162,6 @@ fn main() -> anyhow::Result<()> {
                     };
 
                     if is_running && display_body.len() > last_stream_len {
-                        // New content -- update or create live entry
                         if let Some(idx) = live_entry_idx {
                             if idx < stream.len() {
                                 stream[idx] = StreamEntry::new(
@@ -153,7 +170,6 @@ fn main() -> anyhow::Result<()> {
                                 );
                             }
                         } else {
-                            // Remove "thinking..." if present
                             if let Some(last) = stream.last() {
                                 if matches!(last.kind, EntryKind::System) {
                                     if last.blocks.first().map(|b| matches!(b, RichBlock::Text(t) if t.contains("thinking"))).unwrap_or(false) {
@@ -174,23 +190,20 @@ fn main() -> anyhow::Result<()> {
                     }
 
                     if is_done && stream_active {
-                        // Stream finished -- finalize the live entry
                         stream_active = false;
                         live_entry_idx = None;
                         last_stream_len = 0;
-                        // Result file will be picked up by check_new_results
                     }
                 }
             }
         }
 
-        // Check for new results every ~2 seconds
-        if tick % 4 == 0 && !stream_active {
+        // Check for new results every 2 seconds (time-gated)
+        if last_results_check.elapsed() >= Duration::from_secs(2) && !stream_active {
+            last_results_check = Instant::now();
             let prev = last_history_count;
             check_new_results(&history_dir, &mut stream, &mut last_history_count, &mut auto_scroll);
             if last_history_count != prev {
-                // If we had a live entry, the result replaces it
-                // (check_new_results won't add duplicate because stream already has it)
                 needs_redraw = true;
             }
         }
@@ -198,8 +211,35 @@ fn main() -> anyhow::Result<()> {
         if auto_scroll { scroll_offset = 0; }
 
         // Only redraw when needed or at render rate
-        if needs_redraw || last_render.elapsed() >= render_rate {
+        // Use slower animation rate (100ms/10fps) for idle, fast (33ms) when content changes
+        let anim_due = last_render.elapsed() >= Duration::from_millis(100);
+        if needs_redraw || anim_due {
             fps.tick();
+
+            // Cache seal rendering -- only recompute every ~500ms (every 5 anim ticks at 10fps)
+            let seal_anim_tick = tick / 5;
+            if seal_anim_tick != cached_seal_tick {
+                cached_seal_lines = seal::render_seal(&cached_pose, tick);
+                cached_seal_tick = seal_anim_tick;
+            }
+
+            // Compute wrap width based on terminal size and sidebar visibility
+            let term_w = terminal::size().unwrap_or((80, 24)).0;
+            let chat_w = if show_sidebar && term_w > 60 { term_w - 28 } else { term_w };
+            let wrap_width = (chat_w as usize).saturating_sub(4);
+
+            // Rebuild stream line cache only when content changed
+            let content_hint = stream.last().map(|e| e.total_text_len()).unwrap_or(0);
+            if stream.len() != cached_chat_stream_len
+                || content_hint != cached_chat_content_hint
+                || wrap_width != cached_chat_wrap_width
+            {
+                cached_chat_lines = build_chat_lines(&stream, wrap_width);
+                cached_chat_stream_len = stream.len();
+                cached_chat_content_hint = content_hint;
+                cached_chat_wrap_width = wrap_width;
+            }
+
             terminal.draw(|frame| {
                 let size = frame.area();
                 match &view {
@@ -209,10 +249,10 @@ fn main() -> anyhow::Result<()> {
                                 .direction(Direction::Horizontal)
                                 .constraints([Constraint::Min(40), Constraint::Length(28)])
                                 .split(size);
-                            render_stream(frame, h[0], &stream, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured);
-                            render_sidebar(frame, h[1], state);
+                            render_stream_cached(frame, h[0], &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured);
+                            render_sidebar(frame, h[1], state, &cached_seal_lines);
                         } else {
-                            render_stream(frame, size, &stream, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured);
+                            render_stream_cached(frame, size, &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured);
                         }
                     }
                     View::PanelSelector => {
@@ -221,10 +261,10 @@ fn main() -> anyhow::Result<()> {
                                 .direction(Direction::Horizontal)
                                 .constraints([Constraint::Min(40), Constraint::Length(28)])
                                 .split(size);
-                            render_stream(frame, h[0], &stream, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured);
-                            render_sidebar(frame, h[1], state);
+                            render_stream_cached(frame, h[0], &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured);
+                            render_sidebar(frame, h[1], state, &cached_seal_lines);
                         } else {
-                            render_stream(frame, size, &stream, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured);
+                            render_stream_cached(frame, size, &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured);
                         }
                         render_panel_selector(frame, size, panel_selection);
                     }
@@ -235,6 +275,7 @@ fn main() -> anyhow::Result<()> {
             })?;
             last_render = Instant::now();
             needs_redraw = false;
+            tick += 1; // only increment on actual renders for smooth animation timing
         }
 
         // Poll input with short timeout for responsiveness
@@ -389,10 +430,9 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        tick += 1;
-
-        // Write awareness state every ~2.5s
-        if tick % 5 == 0 {
+        // Write awareness state every 5 seconds (time-gated)
+        if last_awareness_write.elapsed() >= Duration::from_secs(5) {
+            last_awareness_write = Instant::now();
             let term_size = terminal::size().unwrap_or((80, 24));
             let view_str = match &view {
                 View::Chat => "chat".to_string(),
@@ -468,36 +508,11 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 
 // ── Rendering ──
 
-fn render_stream(
-    frame: &mut ratatui::Frame, area: Rect, stream: &[StreamEntry],
-    input: &str, cursor_pos: usize, scroll_offset: i32, fps: u32,
-    mouse_captured: bool,
-) {
-    let wrap_width = (area.width as usize).saturating_sub(4);
-
-    // Dynamic input box: grows with content, min 3 lines, max 8
-    let input_char_count = input.chars().count();
-    let input_lines = if input.is_empty() { 1 }
-        else if input_char_count > 200 { 2 } // collapsed summary
-        else { wrap_text(input, wrap_width.saturating_sub(2)).len() };
-    let input_height = (input_lines as u16 + 2).clamp(3, 8);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(input_height)])
-        .split(area);
-
-    // Header bar
-    let time_str = chrono::Local::now().format("%H:%M:%S").to_string();
-    let header = Line::from(vec![
-        Span::styled(" NEIL ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-        Span::styled(format!(" {} ", time_str), Style::default().fg(Color::DarkGray)),
-        Span::styled("| Tab:panels Ctrl+S:sidebar Ctrl+M:mouse Esc:quit ", Style::default().fg(Color::DarkGray)),
-    ]);
-    frame.render_widget(Paragraph::new(header), chunks[0]);
-
-    let conv_area = chunks[1];
-    let mut lines: Vec<Line> = Vec::new();
+/// Build the chat stream lines (expensive -- only call when stream changes)
+fn build_chat_lines(stream: &[StreamEntry], wrap_width: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let separator = format!("  {}", "─".repeat(wrap_width.saturating_sub(2)));
+    let sep_style = Style::default().fg(Color::Rgb(40, 40, 40));
 
     for entry in stream.iter() {
         let (prefix, color, text_color) = match entry.kind {
@@ -506,12 +521,8 @@ fn render_stream(
             EntryKind::System => (" sys", Color::DarkGray, Color::DarkGray),
         };
 
-        // Separator before each message (except first)
         if !lines.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("  {}", "─".repeat(wrap_width.saturating_sub(2))),
-                Style::default().fg(Color::Rgb(40, 40, 40)),
-            )));
+            lines.push(Line::from(Span::styled(separator.clone(), sep_style)));
         }
 
         lines.push(Line::from(vec![
@@ -602,14 +613,47 @@ fn render_stream(
         }
         lines.push(Line::from(""));
     }
+    lines
+}
 
-    // Scroll
-    let total = lines.len() as i32;
+/// Render the stream view using pre-built cached lines (cheap per frame)
+fn render_stream_cached(
+    frame: &mut ratatui::Frame, area: Rect, cached_lines: &[Line<'static>],
+    input: &str, cursor_pos: usize, scroll_offset: i32, fps: u32,
+    mouse_captured: bool,
+) {
+    let wrap_width = (area.width as usize).saturating_sub(4);
+
+    // Dynamic input box: grows with content, min 3 lines, max 8
+    let input_char_count = input.chars().count();
+    let input_lines = if input.is_empty() { 1 }
+        else if input_char_count > 200 { 2 }
+        else { wrap_text(input, wrap_width.saturating_sub(2)).len() };
+    let input_height = (input_lines as u16 + 2).clamp(3, 8);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(input_height)])
+        .split(area);
+
+    // Header bar
+    let time_str = chrono::Local::now().format("%H:%M:%S").to_string();
+    let header = Line::from(vec![
+        Span::styled(" NEIL ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Span::styled(format!(" {} ", time_str), Style::default().fg(Color::DarkGray)),
+        Span::styled("| Tab:panels Ctrl+S:sidebar Ctrl+M:mouse Esc:quit ", Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(header), chunks[0]);
+
+    let conv_area = chunks[1];
+
+    // Scroll using cached lines (no rebuild needed)
+    let total = cached_lines.len() as i32;
     let visible = conv_area.height as i32;
     let max_scroll = (total - visible).max(0);
     let offset = (max_scroll - scroll_offset).max(0) as u16;
 
-    let conversation = Paragraph::new(lines).scroll((offset, 0));
+    let conversation = Paragraph::new(cached_lines.to_vec()).scroll((offset, 0));
     frame.render_widget(conversation, conv_area);
 
     // Scroll indicator
@@ -625,12 +669,10 @@ fn render_stream(
     let input_area = chunks[2];
     let inner_w = (input_area.width as usize).saturating_sub(4);
 
-    // Build display text with cursor
     let char_count_total = input.chars().count();
     let display_input = if input.is_empty() {
         vec![Line::from(Span::styled("_", Style::default().fg(Color::Cyan).add_modifier(Modifier::SLOW_BLINK)))]
     } else if char_count_total > 200 {
-        // Large paste: show summary instead of rendering the full text
         let preview: String = input.chars().take(40).collect();
         let lines_est = input.lines().count();
         vec![
@@ -693,7 +735,7 @@ fn render_stream(
     );
 }
 
-fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState) {
+fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState, seal_lines_raw: &[String]) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -745,11 +787,9 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState) {
         chunks[2],
     );
 
-    // Seal art -- parameterized engine
-    let pose = seal::SealPose::load(&state.neil_home);
-    let seal_lines_raw = seal::render_seal(&pose, state.tick);
+    // Seal art -- uses pre-cached render (computed outside draw closure)
     let mut seal_lines: Vec<Line> = Vec::new();
-    for art_line in &seal_lines_raw {
+    for art_line in seal_lines_raw {
         seal_lines.push(Line::from(Span::styled(
             art_line.clone(),
             Style::default().fg(Color::Cyan),

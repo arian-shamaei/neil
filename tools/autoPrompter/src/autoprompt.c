@@ -1026,6 +1026,25 @@ static void timestamp_now(char *buf, size_t cap) {
     strftime(buf, cap, "%Y-%m-%dT%H-%M-%S", tm);
 }
 
+/* Set seal pose for blueprint TUI */
+static void set_seal_pose(const char *eyes, const char *mouth,
+                          const char *body, const char *indicator,
+                          const char *label) {
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s/.seal_pose.json", g_neil_home);
+    char json[512];
+    int len = snprintf(json, sizeof(json),
+        "{\"eyes\":\"%s\",\"mouth\":\"%s\",\"body\":\"%s\","
+        "\"indicator\":\"%s\",\"label\":\"%s\"}",
+        eyes, mouth, body, indicator, label);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        ssize_t w = write(fd, json, (size_t)len);
+        (void)w;
+        close(fd);
+    }
+}
+
 /* Stream file path for live output */
 static int g_stream_fd = -1;
 
@@ -1162,6 +1181,7 @@ static void process_prompt(const char *filename) {
     }
 
     printf("[autoprompt] [%s] executing: %s\n", ts, filename);
+    set_seal_pose("focused", "neutral", "swim", "thought", "thinking...");
 
     /* 2. Read prompt content */
     size_t prompt_len;
@@ -1259,6 +1279,7 @@ static void process_prompt(const char *filename) {
 
             fprintf(stderr, "[autoprompt] ReAct turn %d: CALL results received, re-invoking\n",
                     turn + 1);
+            set_seal_pose("wide", "open", "swim", "bubbles", "calling API...");
 
             /* Stream turn separator */
             {
@@ -1369,6 +1390,13 @@ static void process_prompt(const char *filename) {
     snprintf(hist, sizeof(hist), "%s/%s_%s", g_history_dir, ts, filename);
     rename(dst, hist);
 
+    /* Set seal back to idle/happy */
+    if (exit_code == 0) {
+        set_seal_pose("open", "smile", "float", "none", "~ neil ~");
+    } else {
+        set_seal_pose("stressed", "frown", "float", "alert", "error!");
+    }
+
     printf("[autoprompt] [%s] done: %s -> exit %d (%d turns)\n",
            ts, filename, exit_code, turn + 1);
 
@@ -1465,6 +1493,7 @@ int main(int argc, char **argv) {
     }
 
     printf("[autoprompt] watching %s/ for prompts...\n", g_queue_dir);
+    set_seal_pose("open", "smile", "float", "none", "~ neil ~");
     fflush(stdout);
 
     /* Event loop */

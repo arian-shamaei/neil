@@ -147,6 +147,17 @@ impl StreamEntry {
         }
     }
 
+    /// Total text length across all blocks (used for cache invalidation)
+    pub fn total_text_len(&self) -> usize {
+        self.blocks.iter().map(|b| match b {
+            RichBlock::Text(t) => t.len(),
+            RichBlock::Code { content, .. } => content.len(),
+            RichBlock::Diagram(d) => d.len(),
+            RichBlock::Table { rows, .. } => rows.len(),
+            RichBlock::Chart { data, .. } => data.len(),
+        }).sum()
+    }
+
     /// Estimate line count for scroll calculation
     pub fn line_count(&self, width: u16) -> u16 {
         let mut count: u16 = 1; // header line
