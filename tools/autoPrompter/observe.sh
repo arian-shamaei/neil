@@ -19,14 +19,27 @@ pgrep -c claude 2>/dev/null | xargs printf "claude processes: %s\n"
 
 echo ""
 echo "=== Input Watchers ==="
+# Daemon watchers: check systemd first, fall back to pgrep
 for W in "$HOME/.neil/inputs/watchers/"*.sh; do
     [ -f "$W" ] || continue
     NAME=$(basename "$W" .sh)
-    PID=$(pgrep -f "$W" 2>/dev/null | head -1)
-    if [ -n "$PID" ]; then
-        echo "$NAME: running (pid $PID)"
+    # schedule.sh is one-shot (cron), not a daemon
+    case "$NAME" in
+        schedule) echo "$NAME: cron-triggered (one-shot)"; continue ;;
+    esac
+    # Check systemd service (normalize underscores to hyphens for service name)
+    SVC_NAME="neil-$(echo "$NAME" | tr '_' '-')-watcher"
+    SVC_STATUS=$(systemctl is-active "$SVC_NAME" 2>/dev/null)
+    if [ "$SVC_STATUS" = "active" ]; then
+        echo "$NAME: running (systemd)"
     else
-        echo "$NAME: stopped"
+        # Fallback: check for manual process
+        PID=$(pgrep -f "$W" 2>/dev/null | head -1)
+        if [ -n "$PID" ]; then
+            echo "$NAME: running (pid $PID)"
+        else
+            echo "$NAME: stopped"
+        fi
     fi
 done
 

@@ -2,7 +2,7 @@
 # webhook.sh -- Listen for HTTP POST requests on a port.
 # Each POST body becomes a prompt in Neil's queue.
 # Usage: ./webhook.sh <port>
-# Requires: ncat (from nmap) or socat
+# Requires: nc (netcat) -- works with OpenBSD or nmap variants
 
 PORT="${1:-9800}"
 QUEUE="$HOME/.neil/tools/autoPrompter/queue"
@@ -13,7 +13,7 @@ while true; do
     # Use ncat to accept one connection, read the HTTP request
     RESPONSE="HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
 
-    BODY=$(ncat -l -p "$PORT" --recv-only 2>/dev/null | {
+    BODY=$(nc -l -p "$PORT" -w 86400 2>/dev/null | {
         # Read headers until blank line
         while IFS= read -r line; do
             line=$(echo "$line" | tr -d '\r')
