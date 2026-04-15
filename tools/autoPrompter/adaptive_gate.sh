@@ -138,6 +138,16 @@ if [ "$SHOULD_FIRE" -eq 1 ]; then
     echo "[adaptive] mode=$NEW_MODE firing (tick $NEW_SKIP/$FIRE_EVERY)"
     exit 0
 else
-    echo "[adaptive] mode=$NEW_MODE skipping (tick $NEW_SKIP/$FIRE_EVERY)"
+    # USWS: Unihemispheric Slow-Wave Sleep
+    # Alert hemisphere (input watchers) stays running.
+    # Sleep hemisphere (consolidation) does background maintenance.
+    # This way skipped ticks are productive without using Claude tokens.
+    USWS_SCRIPT="$NEIL_HOME/tools/autoPrompter/usws_consolidate.sh"
+    if [ -x "$USWS_SCRIPT" ]; then
+        echo "[adaptive] mode=$NEW_MODE skipping heartbeat, running USWS consolidation"
+        "$USWS_SCRIPT" 2>/dev/null &
+    else
+        echo "[adaptive] mode=$NEW_MODE skipping (tick $NEW_SKIP/$FIRE_EVERY)"
+    fi
     exit 1
 fi

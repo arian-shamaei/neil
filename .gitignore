@@ -20,3 +20,4 @@ tools/autoPrompter/history/
 *.bak
 *.swp
 memory/mempalace/
+services/vault/*.key
