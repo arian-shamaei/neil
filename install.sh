@@ -1,6 +1,6 @@
 #!/bin/sh
 # install.sh -- Install openclaw (Neil the SEAL) on a fresh Linux machine
-# Usage: curl -sL <url>/install.sh | sh
+# Usage: tar xzf openclaw-v0.1.tar.gz && cd openclaw && sh install.sh
 #    or: sh install.sh [--neil-home /path] [--no-systemd] [--no-cron] [--no-blueprint]
 #
 # Prerequisites: gcc, python3, git, claude CLI (Anthropic)
@@ -380,7 +380,7 @@ if [ "$INSTALL_BLUEPRINT" = true ]; then
         warn "Blueprint source not found in distribution"
     fi
 else
-    info "Skipping Blueprint TUI (use --no-blueprint=false or install cargo)"
+    info "Skipping Blueprint TUI (install cargo and re-run install.sh to build it)"
 fi
 
 # ── systemd service ──────────────────────────────────────────────────
@@ -453,10 +453,16 @@ if [ "$INSTALL_CRON" = true ]; then
 
     if [ "$NEEDS_HEARTBEAT" = true ] || [ "$NEEDS_SNAPSHOT" = true ]; then
         NEW_CRON="$EXISTING_CRON"
-        [ "$NEEDS_HEARTBEAT" = true ] && NEW_CRON="$NEW_CRON
-$HEARTBEAT_LINE"
-        [ "$NEEDS_SNAPSHOT" = true ] && NEW_CRON="$NEW_CRON
-$SNAPSHOT_LINE"
+        if [ "$NEEDS_HEARTBEAT" = true ]; then
+            [ -n "$NEW_CRON" ] && NEW_CRON="$NEW_CRON
+"
+            NEW_CRON="${NEW_CRON}${HEARTBEAT_LINE}"
+        fi
+        if [ "$NEEDS_SNAPSHOT" = true ]; then
+            [ -n "$NEW_CRON" ] && NEW_CRON="$NEW_CRON
+"
+            NEW_CRON="${NEW_CRON}${SNAPSHOT_LINE}"
+        fi
         echo "$NEW_CRON" | crontab -
         ok "Cron jobs installed"
     else
