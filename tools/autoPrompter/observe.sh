@@ -116,6 +116,10 @@ echo "=== Work Pattern ==="
 $HOME/.neil/self/beat_taxonomy.sh 2>/dev/null || echo "taxonomy: unavailable"
 
 echo ""
+echo "=== Question Follow-through ==="
+$HOME/.neil/self/question_tracker.sh 2>/dev/null || echo "questions: unavailable"
+
+echo ""
 echo "=== Guardrails ==="
 # Daily beat count
 TODAY=$(date +%Y-%m-%d)
