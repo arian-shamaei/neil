@@ -60,6 +60,8 @@ static char g_observe_sh[MAX_PATH];
 static char g_heartbeat_log[MAX_PATH];
 
 static volatile sig_atomic_t g_running = 1;
+static volatile sig_atomic_t g_processing = 0;  /* 1 when mid-prompt execution */
+static char g_current_prompt_name[256] = "";     /* filename of prompt being processed */
 
 /* Forward declarations */
 static void timestamp_now(char *buf, size_t cap);
@@ -157,6 +159,32 @@ static void resolve_neil_paths(void) {
 static void handle_signal(int sig) {
     (void)sig;
     g_running = 0;
+
+    /* If we're mid-prompt, log a killed heartbeat so we don't get "unknown" status */
+    if (g_processing && g_heartbeat_log[0] && g_current_prompt_name[0]) {
+        char ts[64];
+        time_t now = time(NULL);
+        struct tm *tm = localtime(&now);
+        if (tm) {
+            snprintf(ts, sizeof(ts), "%04d-%02d-%02dT%02d-%02d-%02d",
+                     tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+                     tm->tm_hour, tm->tm_min, tm->tm_sec);
+        } else {
+            snprintf(ts, sizeof(ts), "unknown");
+        }
+
+        char entry[512];
+        int elen = snprintf(entry, sizeof(entry),
+            "{\"timestamp\":\"%s\",\"prompt\":\"%s\",\"status\":\"killed\",\"summary\":\"SIGTERM received mid-execution\"}\n",
+            ts, g_current_prompt_name);
+
+        int fd = open(g_heartbeat_log, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            ssize_t w = write(fd, entry, (size_t)elen);
+            (void)w;
+            close(fd);
+        }
+    }
 }
 
 /* Read entire file into malloc'd buffer. Returns NULL on error. */
@@ -1139,7 +1167,8 @@ static int run_claude(const char *prompt, const char *system_prompt,
     }
 
     if (pid == 0) {
-        /* child */
+        /* child -- isolate into own session so parent's SIGTERM doesn't propagate */
+        setsid();
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         dup2(pipefd[1], STDERR_FILENO);
@@ -1219,10 +1248,14 @@ static int run_claude(const char *prompt, const char *system_prompt,
 
         int ret = select(pipefd[0] + 1, &rfds, NULL, NULL, &tv);
         if (ret < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                if (!g_running) break;  /* SIGTERM received, exit gracefully */
+                continue;
+            }
             break;
         }
         if (ret == 0) {
+            if (!g_running) break;  /* SIGTERM received, exit gracefully */
             /* select timed out */
             if (deadline > 0 && time(NULL) >= deadline) {
                 timed_out = 1;
@@ -1302,6 +1335,8 @@ static void process_prompt(const char *filename) {
     }
 
     printf("[autoprompt] [%s] executing: %s\n", ts, filename);
+    snprintf(g_current_prompt_name, sizeof(g_current_prompt_name), "%s", filename);
+    g_processing = 1;
     set_seal_pose("focused", "neutral", "swim", "thought", "thinking...");
 
     /* 2. Read prompt content */
@@ -1534,6 +1569,9 @@ static void process_prompt(const char *filename) {
 
     printf("[autoprompt] [%s] done: %s -> exit %d (%d turns)\n",
            ts, filename, exit_code, turn + 1);
+
+    g_processing = 0;
+    g_current_prompt_name[0] = '\0';
 
     free(prompt);
 }

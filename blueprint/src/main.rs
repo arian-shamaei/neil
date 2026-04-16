@@ -407,7 +407,7 @@ fn main() -> anyhow::Result<()> {
                                             }
                                             "/help" => {
                                                 stream.push(StreamEntry::new(EntryKind::System,
-                                                    "/clear - Clear chat\n/status - System status\n/help - This help\n/panels - Open panel selector\n/heartbeat - Trigger a heartbeat\n/history - Show prompt history\nUp/Down arrows - Browse previous prompts\nTab - Open panels\nCtrl+S - Toggle sidebar\nCtrl+M - Toggle mouse mode".into()
+                                                    "/clear - Clear chat\n/status - System status\n/help - This help\n/panels - Open panel selector\n/heartbeat - Trigger a heartbeat\n/history - Show prompt history\nUp/Down - Browse previous prompts\nTab - Open panels\nCtrl+S - Toggle sidebar\nCtrl+M - Toggle scroll/select (select = highlight to copy)".into()
                                                 ));
                                             }
                                             "/panels" => {
@@ -459,7 +459,13 @@ fn main() -> anyhow::Result<()> {
                             }
                             KeyCode::Tab => { view = View::PanelSelector; }
                             KeyCode::Char(c) => {
-                                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                // Number keys expand panels when input is empty
+                                if input.is_empty() && c.is_ascii_digit() && c != '0' {
+                                    let idx = (c as u8 - b'1') as usize;
+                                    if idx < PANEL_NAMES.len() {
+                                        view = View::Panel(idx);
+                                    }
+                                } else if key.modifiers.contains(KeyModifiers::CONTROL) {
                                     match c {
                                         'c' | 'q' => break,
                                         's' => show_sidebar = !show_sidebar,
@@ -467,10 +473,8 @@ fn main() -> anyhow::Result<()> {
                                             mouse_captured = !mouse_captured;
                                             if mouse_captured {
                                                 let _ = execute!(io::stdout(), crossterm::event::EnableMouseCapture);
-                                                stream.push(StreamEntry::new(EntryKind::System, "Mouse scroll enabled. Ctrl+M for text select.".into()));
                                             } else {
                                                 let _ = execute!(io::stdout(), crossterm::event::DisableMouseCapture);
-                                                stream.push(StreamEntry::new(EntryKind::System, "Text select enabled. Ctrl+M for mouse scroll.".into()));
                                             }
                                         }
                                         'a' => cursor_pos = 0,
@@ -871,7 +875,7 @@ fn render_stream_cached(
         Span::styled(" NEIL ", Style::default().fg(Color::Black).bg(Color::Cyan)),
         status_span,
         Span::styled(format!("{} ", time_str), Style::default().fg(Color::DarkGray)),
-        Span::styled("Tab:panels Ctrl+S:sidebar Esc:quit ", Style::default().fg(Color::Rgb(60, 60, 60))),
+        Span::styled("1-7:panels Ctrl+S:sidebar Esc:quit ", Style::default().fg(Color::Rgb(60, 60, 60))),
     ]);
     frame.render_widget(Paragraph::new(header), chunks[0]);
 
@@ -1022,7 +1026,7 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState, sea
         mem_lines.push(Line::from(Span::styled(format!("  {}: {}", wing.name, wing.count), Style::default().fg(Color::DarkGray))));
     }
     frame.render_widget(
-        Paragraph::new(mem_lines).block(Block::default().borders(Borders::ALL).title(" memory ").border_style(Style::default().fg(Color::DarkGray))),
+        Paragraph::new(mem_lines).block(Block::default().borders(Borders::ALL).title(" [1] memory ").border_style(Style::default().fg(Color::DarkGray))),
         chunks[1],
     );
 
@@ -1059,7 +1063,7 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState, sea
     }
 
     frame.render_widget(
-        Paragraph::new(inbox_lines).block(Block::default().borders(Borders::ALL).title(" activity ").border_style(Style::default().fg(Color::DarkGray))),
+        Paragraph::new(inbox_lines).block(Block::default().borders(Borders::ALL).title(" [2] activity ").border_style(Style::default().fg(Color::DarkGray))),
         chunks[2],
     );
 
