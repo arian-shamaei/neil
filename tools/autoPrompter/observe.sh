@@ -108,6 +108,10 @@ else
 fi
 
 echo ""
+echo "=== Beat Health ==="
+$HOME/.neil/self/beat_health.sh 2>/dev/null || echo "health: unknown"
+
+echo ""
 echo "=== Guardrails ==="
 # Daily beat count
 TODAY=$(date +%Y-%m-%d)

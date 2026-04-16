@@ -1331,10 +1331,24 @@ static void process_prompt(const char *filename) {
     int turn;
 
     for (turn = 0; turn < g_max_react_turns; turn++) {
-        /* Execute claude */
+        /* Execute claude (with retry on empty-output timeout) */
         char *output = NULL;
         size_t output_len = 0;
         exit_code = run_claude(current_prompt, essence, &output, &output_len);
+
+        /* Retry once if we got a timeout (124) with no meaningful output.
+         * This handles transient API failures where Claude never responds. */
+        if (exit_code == 124 && (!output || output_len == 0 ||
+            (output_len < 80 && strstr(output, "[TIMEOUT:")))) {
+            fprintf(stderr, "[autoprompt] empty timeout on turn %d, retrying once...\n",
+                    turn + 1);
+            free(output);
+            output = NULL;
+            output_len = 0;
+            set_seal_pose("wide", "open", "swim", "thought", "retrying...");
+            sleep(5);  /* brief pause before retry */
+            exit_code = run_claude(current_prompt, essence, &output, &output_len);
+        }
 
         if (exit_code != 0 || !output) {
             free(output);
