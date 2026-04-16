@@ -1595,6 +1595,25 @@ fn render_heartbeat_expanded(
                                 format!("  ~ {}", d), Style::default().fg(Color::Rgb(100, 180, 255)),
                             )));
                         }
+                        CommandLogEntry::FileWrite(d) => {
+                            right_lines.push(Line::from(vec![
+                                Span::styled("  W ", Style::default().fg(Color::Black).bg(Color::Green)),
+                                Span::styled(format!(" {}", d), Style::default().fg(Color::Green)),
+                            ]));
+                        }
+                        CommandLogEntry::FileRead(d) => {
+                            right_lines.push(Line::from(vec![
+                                Span::styled("  R ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+                                Span::styled(format!(" {}", d), Style::default().fg(Color::Cyan)),
+                            ]));
+                        }
+                        CommandLogEntry::BashAction(d) => {
+                            let display: String = d.chars().take(content_width.saturating_sub(4)).collect();
+                            right_lines.push(Line::from(vec![
+                                Span::styled("  $ ", Style::default().fg(Color::Rgb(100, 200, 100))),
+                                Span::styled(display, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                            ]));
+                        }
                     }
                 }
             }

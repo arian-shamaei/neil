@@ -260,6 +260,18 @@ static void shell_escape_sq(char *dst, size_t dstsz, const char *src) {
     dst[di] = '\0';
 }
 
+/* Expand leading ~ to HOME directory in a path.
+ * Writes into dst (up to dstsz-1 bytes). Always NUL-terminates. */
+static void expand_tilde(char *dst, size_t dstsz, const char *src) {
+    if (src[0] == '~' && (src[1] == '/' || src[1] == '\0')) {
+        const char *home = getenv("HOME");
+        if (!home) home = "/tmp";
+        snprintf(dst, dstsz, "%s%s", home, src + 1);
+    } else {
+        snprintf(dst, dstsz, "%s", src);
+    }
+}
+
 /* Run a shell command, capture stdout into malloc'd buffer. */
 static char *run_command(const char *cmd) {
     FILE *fp = popen(cmd, "r");
@@ -1343,11 +1355,15 @@ static char *execute_tool_actions(const char *output) {
             while (pl > 0 && (path[pl-1] == ' ' || path[pl-1] == '\r'))
                 path[--pl] = '\0';
 
-            fprintf(stderr, "[autoprompt] READ: %s\n", path);
-            stream_action("READ", path, NULL, NULL);
+            /* Expand ~ to HOME */
+            char expanded[MAX_PATH];
+            expand_tilde(expanded, sizeof(expanded), path);
+
+            fprintf(stderr, "[autoprompt] READ: %s\n", expanded);
+            stream_action("READ", expanded, NULL, NULL);
 
             size_t flen;
-            char *content = read_file(path, &flen);
+            char *content = read_file(expanded, &flen);
             if (content) {
                 /* Cap at 50KB to avoid blowing up context */
                 if (flen > 50000) {
@@ -1355,13 +1371,13 @@ static char *execute_tool_actions(const char *output) {
                     flen = 50000;
                 }
                 results_len += snprintf(results + results_len, results_cap - results_len,
-                    "[READ %s]\n%s\n[/READ]\n\n", path, content);
-                stream_action(NULL, NULL, path, content);
+                    "[READ %s]\n%s\n[/READ]\n\n", expanded, content);
+                stream_action(NULL, NULL, expanded, content);
                 free(content);
             } else {
                 results_len += snprintf(results + results_len, results_cap - results_len,
-                    "[READ ERROR] %s: file not found or unreadable\n\n", path);
-                stream_action("READ", path, NULL, "ERROR: file not found");
+                    "[READ ERROR] %s: file not found or unreadable\n\n", expanded);
+                stream_action("READ", expanded, NULL, "ERROR: file not found");
             }
             p = eol;
 
@@ -1428,6 +1444,10 @@ static char *execute_tool_actions(const char *output) {
 
             if (!path[0]) { continue; }
 
+            /* Expand ~ to HOME */
+            char wpath[MAX_PATH];
+            expand_tilde(wpath, sizeof(wpath), path);
+
             /* Find code block content */
             /* Skip to opening ``` */
             while (*p && strncmp(p, "```", 3) != 0) p++;
@@ -1447,23 +1467,23 @@ static char *execute_tool_actions(const char *output) {
             if (*p == '\n') p++;
             if (strncmp(p, "```", 3) == 0) p += 3;
 
-            fprintf(stderr, "[autoprompt] WRITE: %s (%zu bytes)\n", path, content_len);
+            fprintf(stderr, "[autoprompt] WRITE: %s (%zu bytes)\n", wpath, content_len);
 
             /* Write the file */
-            int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            int fd = open(wpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (fd >= 0) {
                 ssize_t w = write(fd, content_start, content_len);
                 close(fd);
                 results_len += snprintf(results + results_len, results_cap - results_len,
-                    "[WRITE %s] %zu bytes written\n\n", path, content_len);
+                    "[WRITE %s] %zu bytes written\n\n", wpath, content_len);
 
                 char detail[512];
-                snprintf(detail, sizeof(detail), "%s (%zu bytes)", path, content_len);
+                snprintf(detail, sizeof(detail), "%s (%zu bytes)", wpath, content_len);
                 stream_action("WRITE", detail, NULL, NULL);
             } else {
                 results_len += snprintf(results + results_len, results_cap - results_len,
-                    "[WRITE ERROR] %s: %s\n\n", path, strerror(errno));
-                stream_action("WRITE", path, NULL, "ERROR: write failed");
+                    "[WRITE ERROR] %s: %s\n\n", wpath, strerror(errno));
+                stream_action("WRITE", wpath, NULL, "ERROR: write failed");
             }
         } else {
             p++;
@@ -2075,15 +2095,23 @@ static void process_prompt(const char *filename) {
             }
 
             /* Build follow-up prompt with call results */
-            size_t followup_cap = output_len + cr_len + 256;
+            size_t followup_cap = output_len + cr_len + 2048;
             char *followup = malloc(followup_cap);
             if (followup) {
                 snprintf(followup, followup_cap,
                     "[PREVIOUS RESPONSE]\n%s\n\n"
-                    "[CALL RESULTS]\n%s\n\n"
-                    "[INSTRUCTION]\nYour actions above have been executed. The results are shown. "
-                    "Continue your work based on these results. "
-                    "You may use READ:/WRITE:/BASH:/CALL:/MEMORY:/PROMPT: as needed.",
+                    "[ACTION RESULTS]\n%s\n\n"
+                    "[INSTRUCTION]\n"
+                    "Your action lines above were executed. The results are shown.\n"
+                    "IMPORTANT: You can ONLY affect the system through action lines.\n"
+                    "- To read a file: READ: /path\n"
+                    "- To write a file: WRITE: path=/path followed by a code block\n"
+                    "- To run a command: BASH: command\n"
+                    "- To store knowledge: MEMORY: wing=x room=y | text\n"
+                    "Describing work in prose does NOT execute it. If you say\n"
+                    "\"I edited the file\" without a WRITE: line, nothing changed.\n"
+                    "If you need to do more work, output action lines now.\n"
+                    "When all work is done, end with HEARTBEAT: (if heartbeat) or just your summary.",
                     output, call_results);
 
                 /* Free old prompt if it's not the original */

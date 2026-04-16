@@ -276,6 +276,12 @@ pub enum CommandLogEntry {
     Memory(String),
     /// A service call (CALL: line)
     ServiceCall(String),
+    /// A file read (READ: line)
+    FileRead(String),
+    /// A file write (WRITE: line)
+    FileWrite(String),
+    /// A bash action (BASH: line)
+    BashAction(String),
     /// A mempalace operation
     Mempalace(String),
 }
@@ -346,7 +352,19 @@ pub fn load_command_log(neil_home: &PathBuf, prompt_name: &str) -> Vec<CommandLo
                 entries.push(CommandLogEntry::Command { cmd, output: cmd_output });
             }
         }
-        // MEMORY: lines (from Claude's output, not inside code blocks)
+        // WRITE: confirmation lines (from stream_action)
+        else if trimmed.starts_with("WRITE:") && trimmed.contains("bytes") {
+            entries.push(CommandLogEntry::FileWrite(trimmed[6..].trim().to_string()));
+        }
+        // READ: action lines
+        else if trimmed.starts_with("READ:") {
+            entries.push(CommandLogEntry::FileRead(trimmed[5..].trim().to_string()));
+        }
+        // BASH: action lines (Neil's output, not stream_action $ blocks)
+        else if trimmed.starts_with("BASH:") {
+            entries.push(CommandLogEntry::BashAction(trimmed[5..].trim().to_string()));
+        }
+        // MEMORY: lines
         else if trimmed.starts_with("MEMORY:") {
             entries.push(CommandLogEntry::Memory(trimmed[7..].trim().to_string()));
         }
