@@ -35,6 +35,8 @@
 #define MAX_LINE    4096
 #define MAX_PROMPT  (1024 * 1024)  /* 1 MB max prompt */
 #define READ_BUF    (1024 * 64)
+#define DEDUP_WINDOW_SEC  300     /* 5 min dedup window */
+#define DEDUP_LOG_MAX     50      /* keep last N dedup entries */
 
 #define AI_CMD_DEFAULT "claude"
 #define NEIL_HOME_DEFAULT ".neil"
@@ -44,7 +46,8 @@ static char g_ai_args[MAX_PATH];
 static char g_ai_system_flag[64];
 static char g_ai_prompt_flag[16];
 static int g_max_react_turns = 3;
-static int g_claude_timeout = 300;  /* seconds, 0 = no timeout */
+static int g_claude_timeout = 300;
+static int g_agent_manages_stream = 0;  /* 1 = external agent writes .neil_stream */  /* seconds, 0 = no timeout */
 
 /* Resolved paths -- set once at startup from NEIL_HOME env var */
 static char g_neil_home[MAX_PATH];
@@ -69,6 +72,9 @@ static void timestamp_now(char *buf, size_t cap);
 static void stream_action(const char *prefix, const char *detail, const char *cmd, const char *output);
 static void set_seal_pose(const char *eyes, const char *mouth, const char *body, const char *indicator, const char *label);static void stream_write(const char *data, size_t len);static int run_claude(const char *prompt, const char *system_prompt, char **out, size_t *out_len);static void extract_memories(const char *output);
 static char *execute_tool_actions(const char *output);
+static unsigned long djb2_hash(const char *str, size_t len);
+static int dedup_check(unsigned long hash);
+static void dedup_record(unsigned long hash, const char *filename);
 
 /*
  * Resolve all paths from NEIL_HOME environment variable.
@@ -137,6 +143,11 @@ static void resolve_neil_paths(void) {
             char *val = eq + 1;
             /* trim whitespace and quotes */
             while (*key == ' ' || *key == '\t') key++;
+            {
+                size_t klen = strlen(key);
+                while (klen > 0 && (key[klen-1] == ' ' || key[klen-1] == '\t'))
+                    key[--klen] = '\0';
+            }
             while (*val == ' ' || *val == '"' || *val == '\'') val++;
             size_t vlen = strlen(val);
             while (vlen > 0 && (val[vlen-1] == '\n' || val[vlen-1] == '"' ||
@@ -145,12 +156,16 @@ static void resolve_neil_paths(void) {
 
             if (strcmp(key, "command") == 0)
                 snprintf(g_ai_command, sizeof(g_ai_command), "%s", val);
+            else if (strcmp(key, "args") == 0)
+                snprintf(g_ai_args, sizeof(g_ai_args), "%s", val);
             else if (strcmp(key, "system_prompt_flag") == 0)
                 snprintf(g_ai_system_flag, sizeof(g_ai_system_flag), "%s", val);
             else if (strcmp(key, "prompt_flag") == 0)
                 snprintf(g_ai_prompt_flag, sizeof(g_ai_prompt_flag), "%s", val);
             else if (strcmp(key, "max_react_turns") == 0)
                 g_max_react_turns = atoi(val);
+            else if (strcmp(key, "agent_manages_stream") == 0)
+                g_agent_manages_stream = atoi(val);
             else if (strcmp(key, "claude_timeout") == 0)
                 g_claude_timeout = atoi(val);
         }
@@ -1683,6 +1698,7 @@ static size_t *g_all_output_len_ptr = NULL;
 static size_t *g_all_output_cap_ptr = NULL;
 
 static void stream_open(const char *prompt_name) {
+    if (g_agent_manages_stream) return;  /* external agent owns the stream */
     char path[MAX_PATH];
     snprintf(path, sizeof(path), "%s/.neil_stream", g_neil_home);
     g_stream_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -1692,6 +1708,7 @@ static void stream_open(const char *prompt_name) {
 }
 
 static void stream_write(const char *data, size_t len) {
+    if (g_agent_manages_stream) return;  /* external agent owns the stream */
     if (g_stream_fd >= 0) {
         ssize_t w = write(g_stream_fd, data, len);
         (void)w;
@@ -1699,6 +1716,7 @@ static void stream_write(const char *data, size_t len) {
 }
 
 static void stream_close(int exit_code) {
+    if (g_agent_manages_stream) return;  /* external agent owns the stream */
     if (g_stream_fd >= 0) {
         dprintf(g_stream_fd, "\n{\"status\":\"done\",\"exit_code\":%d}\n", exit_code);
         close(g_stream_fd);
@@ -1789,6 +1807,8 @@ static int run_claude(const char *prompt, const char *system_prompt,
                  getenv("HOME") ? getenv("HOME") : "/tmp",
                  oldpath ? oldpath : "/usr/bin");
         setenv("PATH", newpath, 1);
+        if (g_current_prompt_name[0]) setenv("NEIL_PROMPT_NAME", g_current_prompt_name, 1);
+        setenv("NEIL_HOME", g_neil_home, 1);
 
         /* Build argument array from config */
         const char *argv[32];
@@ -1967,6 +1987,31 @@ static void process_prompt(const char *filename) {
         rename(dst, hist);
         return;
     }
+
+    /* 2b. Content-hash dedup: skip if identical prompt processed recently */
+    unsigned long prompt_hash = djb2_hash(prompt, prompt_len);
+    if (dedup_check(prompt_hash)) {
+        printf("[autoprompt] dedup: skipping duplicate prompt %s (hash %lu)\n",
+               filename, prompt_hash);
+        free(prompt);
+        /* Move to history as skipped */
+        char hist[MAX_PATH];
+        snprintf(hist, sizeof(hist), "%s/%s_%s", g_history_dir, ts, filename);
+        rename(dst, hist);
+        /* Write a minimal result noting the skip */
+        char skip_result[MAX_PATH];
+        snprintf(skip_result, sizeof(skip_result), "%s.result.md", hist);
+        FILE *sf = fopen(skip_result, "w");
+        if (sf) {
+            fprintf(sf, "[dedup] Skipped: identical content processed within %d seconds.\n",
+                    DEDUP_WINDOW_SEC);
+            fclose(sf);
+        }
+        g_processing = 0;
+        set_seal_pose("neutral", "neutral", "idle", "none", "");
+        return;
+    }
+    dedup_record(prompt_hash, filename);
 
     /* 3. Open stream for live output */
     stream_open(filename);
@@ -2282,6 +2327,82 @@ static int last_heartbeat_recent(int threshold_sec) {
         return 1;
     }
     return 0;
+}
+
+/* ── Prompt deduplication ──────────────────────────────────────────────
+ * Content-hash based dedup. Prevents processing identical prompts
+ * within a short window (e.g., cron overlap, accidental double-drop).
+ * Uses djb2 hash stored in a flat log file.
+ */
+
+
+static unsigned long djb2_hash(const char *str, size_t len) {
+    unsigned long hash = 5381;
+    for (size_t i = 0; i < len; i++)
+        hash = ((hash << 5) + hash) + (unsigned char)str[i];
+    return hash;
+}
+
+/* Check if content hash was processed recently. Returns 1 if duplicate. */
+static int dedup_check(unsigned long hash) {
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s/tools/autoPrompter/dedup.log", g_neil_home);
+
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;  /* no log yet = not a duplicate */
+
+    time_t now = time(NULL);
+    char line[256];
+    int found = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long stored_hash;
+        long stored_time;
+        if (sscanf(line, "%lu %ld", &stored_hash, &stored_time) != 2)
+            continue;
+        if (stored_hash == hash && (now - stored_time) < DEDUP_WINDOW_SEC) {
+            found = 1;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+/* Record a processed hash. Trims log to DEDUP_LOG_MAX entries. */
+static void dedup_record(unsigned long hash, const char *filename) {
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s/tools/autoPrompter/dedup.log", g_neil_home);
+
+    /* Read existing entries */
+    char entries[DEDUP_LOG_MAX][256];
+    int count = 0;
+
+    FILE *f = fopen(path, "r");
+    if (f) {
+        while (count < DEDUP_LOG_MAX && fgets(entries[count], sizeof(entries[0]), f))
+            count++;
+        fclose(f);
+    }
+
+    /* Shift if full */
+    if (count >= DEDUP_LOG_MAX) {
+        memmove(entries[0], entries[1], sizeof(entries[0]) * (DEDUP_LOG_MAX - 1));
+        count = DEDUP_LOG_MAX - 1;
+    }
+
+    /* Append new entry */
+    snprintf(entries[count], sizeof(entries[0]), "%lu %ld %s\n",
+             hash, (long)time(NULL), filename);
+    count++;
+
+    /* Write back */
+    f = fopen(path, "w");
+    if (f) {
+        for (int i = 0; i < count; i++)
+            fputs(entries[i], f);
+        fclose(f);
+    }
 }
 
 /* Drain any .md files already in queue/ on startup. */

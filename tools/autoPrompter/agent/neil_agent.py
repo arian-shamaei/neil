@@ -134,65 +134,71 @@ async def call_service(args: dict) -> dict:
 # ─── Stream writer ─────────────────────────────────────────────────────
 
 class Streamer:
-    """Writes to .neil_stream in the format the blueprint TUI expects."""
+    """Writes to .neil_stream (for TUI) AND accumulates a transcript (for result file).
+
+    The transcript is returned via get_transcript() and printed to stdout so the
+    C daemon captures it into the result file. Both outputs use the same format
+    so the command log parser works consistently.
+    """
 
     def __init__(self, neil_home: Path, prompt_name: str):
         self.path = neil_home / ".neil_stream"
         self.fd = open(self.path, "w", encoding="utf-8")
         self.fd.write(f'{{"status":"running","prompt":"{prompt_name}"}}\n')
         self.fd.flush()
-        # Track tool names by use_id so tool_result knows which tool fired
         self._tool_names: dict[str, str] = {}
+        self._transcript: list[str] = []
 
-    def text(self, s: str) -> None:
+    def _write(self, s: str) -> None:
         self.fd.write(s)
         self.fd.flush()
+        self._transcript.append(s)
+
+    def text(self, s: str) -> None:
+        self._write(s)
 
     def tool_call(self, use_id: str, name: str, args: dict) -> None:
-        """Render a tool call as a user-visible action line."""
         self._tool_names[use_id] = name
         short_name = name.replace("mcp__neil__", "")
         if short_name == "read_file":
-            self.fd.write(f"\nREAD: {args.get('path', '')}\n")
+            self._write(f"\nREAD: {args.get('path', '')}\n")
         elif short_name == "write_file":
             content = args.get("content", "")
-            self.fd.write(f"\nWRITE: path={args.get('path', '')} ({len(content)} bytes)\n")
+            self._write(f"\nWRITE: path={args.get('path', '')} ({len(content)} bytes)\n")
         elif short_name == "bash":
-            self.fd.write(f"\n```bash\n$ {args.get('command', '')}\n")
+            self._write(f"\n```bash\n$ {args.get('command', '')}\n")
         elif short_name == "call_service":
             detail = f"service={args.get('service','')} action={args.get('action','')} {args.get('params','')}"
-            self.fd.write(f"\nCALL: {detail}\n")
-        self.fd.flush()
+            self._write(f"\nCALL: {detail}\n")
 
     def tool_result(self, use_id: str, content: str) -> None:
-        """Render the result depending on which tool it came from."""
         name = self._tool_names.get(use_id, "")
         short_name = name.replace("mcp__neil__", "")
         if short_name == "bash":
-            # Strip the echoed "$ cmd" line from tool output -- we already wrote it
             body = content
             if body.startswith("$ "):
                 nl = body.find("\n")
                 if nl != -1:
                     body = body[nl + 1:]
-            # Strip trailing [exit N] marker
-            if body.endswith("]\n") or body.endswith("]"):
+            if body.rstrip().endswith("]"):
                 lines = body.rstrip().split("\n")
                 if lines and lines[-1].startswith("[exit"):
                     body = "\n".join(lines[:-1]) + "\n"
-            self.fd.write(body if body.endswith("\n") else body + "\n")
-            self.fd.write("```\n")
+            self._write(body if body.endswith("\n") else body + "\n")
+            self._write("```\n")
         elif short_name == "read_file":
             preview = content[:400]
-            self.fd.write(f"{preview}\n")
+            self._write(f"{preview}\n")
             if len(content) > 400:
-                self.fd.write(f"... ({len(content) - 400} more bytes)\n")
+                self._write(f"... ({len(content) - 400} more bytes)\n")
         elif short_name == "write_file":
-            self.fd.write(f"{content}\n")
+            self._write(f"{content}\n")
         elif short_name == "call_service":
             preview = content[:400]
-            self.fd.write(f"{preview}\n")
-        self.fd.flush()
+            self._write(f"{preview}\n")
+
+    def get_transcript(self) -> str:
+        return "".join(self._transcript)
 
     def close(self, exit_code: int) -> None:
         self.fd.write(f'\n{{"status":"done","exit_code":{exit_code}}}\n')
@@ -233,6 +239,7 @@ async def run_agent(prompt: str, system_prompt: str, streamer: Streamer) -> str:
         system_prompt=system_prompt,
         mcp_servers={"neil": mcp_server},
         allowed_tools=allowed,
+        tools=[],  # disable built-in Claude Code tools; only mcp__neil__* available
         max_turns=int(os.environ.get("NEIL_MAX_TURNS", "10")),
         permission_mode="bypassPermissions",
     )
@@ -290,10 +297,10 @@ async def main() -> int:
     finally:
         streamer.close(exit_code)
 
-    # Print final text to stdout for autoprompt.c to capture.
-    # This contains Neil's declarative lines (MEMORY:, HEARTBEAT:, INTEND:, etc.)
-    # which the C daemon still post-processes for logging.
-    print(final_text, end="")
+    # Print full transcript (tool activity + text) to stdout so the C daemon
+    # captures it into the result file. This is what makes the command log
+    # work -- the result file sees exactly what the stream file saw.
+    print(streamer.get_transcript(), end="")
     return exit_code
 
 
