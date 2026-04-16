@@ -103,6 +103,9 @@ fn main() -> anyhow::Result<()> {
     let mut prompt_history: Vec<String> = Vec::new();
     let mut history_idx: Option<usize> = None;
     let mut saved_input: String = String::new();
+    let mut hb_selection: usize = 0; // selected heartbeat in panel
+    let mut hb_expanded: bool = false; // whether detail view is open
+    let mut hb_scroll: usize = 0; // scroll offset in detail view
 
     // Pre-load prompt history from past result files
     if let Ok(entries) = fs::read_dir(&history_dir) {
@@ -368,7 +371,7 @@ fn main() -> anyhow::Result<()> {
                         render_panel_selector(frame, size, panel_selection);
                     }
                     View::Panel(idx) => {
-                        render_panel_view(frame, size, *idx, state, fps.fps);
+                        render_panel_view(frame, size, *idx, state, fps.fps, hb_selection, hb_expanded, hb_scroll);
                     }
                 }
             })?;
@@ -472,11 +475,13 @@ fn main() -> anyhow::Result<()> {
                             }
                             KeyCode::Tab => { view = View::PanelSelector; }
                             KeyCode::Char(c) => {
-                                // Number keys expand panels when input is empty
-                                if input.is_empty() && c.is_ascii_digit() && c != '0' {
-                                    let idx = (c as u8 - b'1') as usize;
-                                    if idx < PANEL_NAMES.len() {
-                                        view = View::Panel(idx);
+                                if key.modifiers.contains(KeyModifiers::ALT) {
+                                    // Alt+1-7 expand panels
+                                    if c.is_ascii_digit() && c != '0' {
+                                        let idx = (c as u8 - b'1') as usize;
+                                        if idx < PANEL_NAMES.len() {
+                                            view = View::Panel(idx);
+                                        }
                                     }
                                 } else if key.modifiers.contains(KeyModifiers::CONTROL) {
                                     match c {
@@ -607,11 +612,41 @@ fn main() -> anyhow::Result<()> {
                             }
                             _ => {}
                         },
-                        View::Panel(_) => match key.code {
-                            KeyCode::Esc | KeyCode::Tab => { view = View::Chat; }
+                        View::Panel(pidx) => match key.code {
+                            KeyCode::Esc | KeyCode::Tab => {
+                                if hb_expanded && *pidx == 1 {
+                                    hb_expanded = false; // back to list
+                                } else {
+                                    view = View::Chat;
+                                }
+                            }
                             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                                 let idx = (c as u8 - b'1') as usize;
-                                if idx < PANEL_NAMES.len() { view = View::Panel(idx); }
+                                if idx < PANEL_NAMES.len() {
+                                    view = View::Panel(idx);
+                                    hb_expanded = false;
+                                    hb_scroll = 0;
+                                }
+                            }
+                            KeyCode::Up if *pidx == 1 => {
+                                if hb_expanded {
+                                    if hb_scroll > 0 { hb_scroll -= 1; }
+                                } else if hb_selection > 0 {
+                                    hb_selection -= 1;
+                                }
+                            }
+                            KeyCode::Down if *pidx == 1 => {
+                                if hb_expanded {
+                                    hb_scroll += 1;
+                                } else if let Some(ref st) = cached_state {
+                                    if hb_selection + 1 < st.heartbeat.entries.len() {
+                                        hb_selection += 1;
+                                    }
+                                }
+                            }
+                            KeyCode::Enter if *pidx == 1 => {
+                                hb_expanded = !hb_expanded;
+                                hb_scroll = 0;
                             }
                             _ => {}
                         },
@@ -961,7 +996,7 @@ fn render_stream_cached(
         Span::styled(" NEIL ", Style::default().fg(Color::Black).bg(Color::Cyan)),
         status_span,
         Span::styled(format!("{} ", time_str), Style::default().fg(Color::DarkGray)),
-        Span::styled("1-7:panels Ctrl+S:sidebar Esc:quit ", Style::default().fg(Color::Rgb(60, 60, 60))),
+        Span::styled("Alt+1-7:panels Ctrl+S:sidebar Esc:quit ", Style::default().fg(Color::Rgb(60, 60, 60))),
     ]);
     frame.render_widget(Paragraph::new(header), chunks[0]);
 
@@ -1225,16 +1260,23 @@ fn render_panel_selector(frame: &mut ratatui::Frame, area: Rect, selected: usize
     );
 }
 
-fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: &NeilState, fps: u32) {
+fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: &NeilState, fps: u32,
+                     hb_sel: usize, hb_expanded: bool, hb_scroll: usize) {
     let (name, _) = PANEL_NAMES.get(idx).unwrap_or(&("?", ""));
-    let title = format!(" {} | Esc:close 1-7:switch ", name);
+    let title = if idx == 1 && hb_expanded {
+        format!(" {} | Esc:back Up/Down:scroll ", name)
+    } else if idx == 1 {
+        format!(" {} | Up/Down:select Enter:expand Esc:close ", name)
+    } else {
+        format!(" {} | Esc:close 1-7:switch ", name)
+    };
     let block = Block::default().borders(Borders::ALL).title(title).border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let lines: Vec<Line> = match idx {
         0 => render_memory_panel(state),
-        1 => render_heartbeat_panel(state),
+        1 => render_heartbeat_panel(state, hb_sel, hb_expanded, hb_scroll, inner.height as usize),
         2 => render_intentions_panel(state),
         3 => render_system_panel(state),
         4 => render_services_panel(state),
@@ -1266,20 +1308,156 @@ fn render_memory_panel(s: &NeilState) -> Vec<Line<'static>> {
     l
 }
 
-fn render_heartbeat_panel(s: &NeilState) -> Vec<Line<'static>> {
+fn render_heartbeat_panel(s: &NeilState, selected: usize, expanded: bool, scroll: usize, height: usize) -> Vec<Line<'static>> {
+    let cap_str = s.max_daily_beats.map(|n| format!("/{}", n)).unwrap_or_default();
     let mut l = vec![
-        Line::from(Span::styled(format!("Beats today: {}/50 | Last: {}", s.heartbeat.beats_today, s.heartbeat.last_beat), Style::default().fg(Color::Cyan))),
+        Line::from(Span::styled(
+            format!("Beats today: {}{} | Last: {}", s.heartbeat.beats_today, cap_str, s.heartbeat.last_beat),
+            Style::default().fg(Color::Cyan),
+        )),
         Line::from(""),
     ];
-    for e in &s.heartbeat.entries {
-        let c = match e.status.as_str() { "ok" => Color::Green, "acted" => Color::Cyan, "error" => Color::Red, _ => Color::DarkGray };
-        l.push(Line::from(vec![
-            Span::styled(format!("  {} ", e.timestamp), Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("[{}] ", e.status), Style::default().fg(c)),
-            Span::styled(e.summary.clone(), Style::default().fg(Color::White)),
-        ]));
+
+    if expanded {
+        // Detail view for selected heartbeat
+        if let Some(e) = s.heartbeat.entries.get(selected) {
+            let status_color = match e.status.as_str() {
+                "ok" => Color::Green, "acted" => Color::Cyan, "error" => Color::Red, _ => Color::DarkGray
+            };
+
+            let mut detail: Vec<Line<'static>> = Vec::new();
+
+            // Header
+            detail.push(Line::from(vec![
+                Span::styled("  HEARTBEAT REPORT ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+                Span::styled(format!("  {} ", e.timestamp), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("[{}]", e.status), Style::default().fg(status_color)),
+            ]));
+            detail.push(Line::from(""));
+
+            // Action section
+            detail.push(Line::from(Span::styled(
+                "  ACTION",
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )));
+            let action_text = if e.action.is_empty() { &e.summary } else { &e.action };
+            for line in textwrap_simple(action_text, 70) {
+                detail.push(Line::from(Span::styled(format!("    {}", line), Style::default().fg(Color::White))));
+            }
+            detail.push(Line::from(""));
+
+            // Question section
+            detail.push(Line::from(Span::styled(
+                "  QUESTION",
+                Style::default().fg(Color::Rgb(255, 200, 100)).add_modifier(Modifier::BOLD),
+            )));
+            if e.question.is_empty() {
+                detail.push(Line::from(Span::styled("    (no question recorded)", Style::default().fg(Color::DarkGray))));
+            } else {
+                for line in textwrap_simple(&e.question, 70) {
+                    detail.push(Line::from(Span::styled(format!("    {}", line), Style::default().fg(Color::Rgb(255, 200, 100)))));
+                }
+            }
+            detail.push(Line::from(""));
+
+            // Improvement section
+            detail.push(Line::from(Span::styled(
+                "  IMPROVEMENT",
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            )));
+            if e.improvement.is_empty() {
+                detail.push(Line::from(Span::styled("    (none recorded)", Style::default().fg(Color::DarkGray))));
+            } else {
+                for line in textwrap_simple(&e.improvement, 70) {
+                    detail.push(Line::from(Span::styled(format!("    {}", line), Style::default().fg(Color::Green))));
+                }
+            }
+            detail.push(Line::from(""));
+
+            // Contribution section
+            detail.push(Line::from(Span::styled(
+                "  CONTRIBUTION",
+                Style::default().fg(Color::Rgb(180, 130, 255)).add_modifier(Modifier::BOLD),
+            )));
+            if e.contribution.is_empty() {
+                detail.push(Line::from(Span::styled("    (none recorded)", Style::default().fg(Color::DarkGray))));
+            } else {
+                for line in textwrap_simple(&e.contribution, 70) {
+                    detail.push(Line::from(Span::styled(format!("    {}", line), Style::default().fg(Color::Rgb(180, 130, 255)))));
+                }
+            }
+            detail.push(Line::from(""));
+
+            // Prompt source
+            detail.push(Line::from(Span::styled(
+                format!("  source: {}", e.prompt),
+                Style::default().fg(Color::DarkGray),
+            )));
+
+            // Apply scroll
+            let skip = scroll.min(detail.len().saturating_sub(1));
+            l.extend(detail.into_iter().skip(skip));
+        }
+    } else {
+        // List view -- show all entries, highlight selected
+        for (i, e) in s.heartbeat.entries.iter().enumerate() {
+            let is_sel = i == selected;
+            let status_color = match e.status.as_str() {
+                "ok" => Color::Green, "acted" => Color::Cyan, "error" => Color::Red, _ => Color::DarkGray
+            };
+
+            let summary_text: String = if !e.action.is_empty() {
+                e.action.chars().take(60).collect()
+            } else {
+                e.summary.chars().take(60).collect()
+            };
+
+            let has_report = !e.question.is_empty() || !e.contribution.is_empty();
+            let indicator = if has_report { "+" } else { " " };
+
+            if is_sel {
+                l.push(Line::from(vec![
+                    Span::styled(" > ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("{} ", e.timestamp), Style::default().fg(Color::White)),
+                    Span::styled(format!("[{}] ", e.status), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("{} ", indicator), Style::default().fg(Color::Yellow)),
+                    Span::styled(summary_text, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                ]));
+            } else {
+                l.push(Line::from(vec![
+                    Span::styled("   ", Style::default()),
+                    Span::styled(format!("{} ", e.timestamp), Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("[{}] ", e.status), Style::default().fg(status_color)),
+                    Span::styled(format!("{} ", indicator), Style::default().fg(Color::DarkGray)),
+                    Span::styled(summary_text, Style::default().fg(Color::White)),
+                ]));
+            }
+        }
+
+        if s.heartbeat.entries.is_empty() {
+            l.push(Line::from(Span::styled("  No heartbeats recorded yet", Style::default().fg(Color::DarkGray))));
+        }
     }
     l
+}
+
+/// Simple word wrap for panel text
+fn textwrap_simple(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for paragraph in text.split('\n') {
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            if line.len() + word.len() + 1 > width && !line.is_empty() {
+                lines.push(line);
+                line = String::new();
+            }
+            if !line.is_empty() { line.push(' '); }
+            line.push_str(word);
+        }
+        if !line.is_empty() { lines.push(line); }
+    }
+    if lines.is_empty() { lines.push(text.to_string()); }
+    lines
 }
 
 fn render_intentions_panel(s: &NeilState) -> Vec<Line<'static>> {

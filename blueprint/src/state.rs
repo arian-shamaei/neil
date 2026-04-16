@@ -31,6 +31,14 @@ pub struct HeartbeatEntry {
     pub status: String,
     #[serde(default)]
     pub summary: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub question: String,
+    #[serde(default)]
+    pub improvement: String,
+    #[serde(default)]
+    pub contribution: String,
 }
 
 #[derive(Debug, Clone, Default)]

@@ -66,6 +66,7 @@ static char g_current_prompt_name[256] = "";     /* filename of prompt being pro
 /* Forward declarations */
 static void timestamp_now(char *buf, size_t cap);
 static void stream_action(const char *prefix, const char *detail, const char *cmd, const char *output);
+static void set_seal_pose(const char *eyes, const char *mouth, const char *body, const char *indicator, const char *label);static void stream_write(const char *data, size_t len);static int run_claude(const char *prompt, const char *system_prompt, char **out, size_t *out_len);static void extract_memories(const char *output);
 
 /*
  * Resolve all paths from NEIL_HOME environment variable.
@@ -906,6 +907,222 @@ static void queue_self_prompt(const char *output) {
 }
 
 /* Log heartbeat status to ~/.neil/heartbeat_log.json */
+static void extract_report_field(const char *output, const char *prefix,
+                                 char *dst, size_t dstsz) {
+    dst[0] = '\0';
+    const char *p = strstr(output, prefix);
+    if (!p) return;
+    p += strlen(prefix);
+    while (*p == ' ') p++;
+    const char *eol = strchr(p, '\n');
+    if (!eol) eol = p + strlen(p);
+    size_t ll = (size_t)(eol - p);
+    if (ll >= dstsz) ll = dstsz - 1;
+    /* Copy, escaping quotes for JSON */
+    size_t di = 0;
+    for (size_t i = 0; i < ll && di < dstsz - 2; i++) {
+        if (p[i] == '"' || p[i] == '\\') dst[di++] = '\\';
+        dst[di++] = p[i];
+    }
+    dst[di] = '\0';
+}
+
+
+/*
+ * Load required heartbeat report fields from config.toml [heartbeat.report] section.
+ * Returns number of fields loaded. Each field stored as name[i] and desc[i].
+ * Format in config.toml:
+ *   [heartbeat.report]
+ *   ACTION = "what you did this beat"
+ *   QUESTION = "a genuine question you have"
+ */
+#define MAX_REPORT_FIELDS 16
+
+static int load_report_fields(char names[][64], char descs[][256], int max) {
+    char config_path[MAX_PATH];
+    snprintf(config_path, sizeof(config_path), "%s/config.toml", g_neil_home);
+
+    FILE *fp = fopen(config_path, "r");
+    if (!fp) return 0;
+
+    char line[512];
+    int in_section = 0;
+    int count = 0;
+
+    while (fgets(line, sizeof(line), fp) && count < max) {
+        /* Trim trailing newline */
+        size_t len = strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+            line[--len] = '\0';
+
+        /* Skip comments and empty */
+        char *trimmed = line;
+        while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+        if (*trimmed == '#' || *trimmed == '\0') continue;
+
+        /* Check for section headers */
+        if (*trimmed == '[') {
+            in_section = (strstr(trimmed, "[heartbeat.report]") != NULL) ? 1 : 0;
+            continue;
+        }
+
+        if (!in_section) continue;
+
+        /* Parse: FIELDNAME = "description" */
+        char *eq = strchr(trimmed, '=');
+        if (!eq) continue;
+
+        /* Extract field name */
+        size_t nlen = (size_t)(eq - trimmed);
+        while (nlen > 0 && (trimmed[nlen-1] == ' ' || trimmed[nlen-1] == '\t'))
+            nlen--;
+        if (nlen == 0 || nlen >= 64) continue;
+        memcpy(names[count], trimmed, nlen);
+        names[count][nlen] = '\0';
+
+        /* Extract description (strip quotes) */
+        char *val = eq + 1;
+        while (*val == ' ' || *val == '\t') val++;
+        if (*val == '"') val++;
+        size_t vlen = strlen(val);
+        if (vlen > 0 && val[vlen-1] == '"') vlen--;
+        if (vlen >= 256) vlen = 255;
+        memcpy(descs[count], val, vlen);
+        descs[count][vlen] = '\0';
+
+        count++;
+    }
+    fclose(fp);
+    return count;
+}
+
+/*
+ * Load the re-prompt template from essence/heartbeat_reprompt.md.
+ * Returns malloc'd string or NULL. Caller must free.
+ * Template uses {previous_output} and {missing_fields} placeholders.
+ */
+static char *load_reprompt_template(void) {
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s/essence/heartbeat_reprompt.md", g_neil_home);
+    size_t len;
+    return read_file(path, &len);
+}
+
+/*
+ * Build re-prompt string from template, substituting placeholders.
+ * Returns malloc'd string. Caller must free.
+ */
+static char *build_reprompt(const char *tmpl, const char *prev_output, const char *missing) {
+    /* Estimate size */
+    size_t cap = strlen(tmpl) + strlen(prev_output) + strlen(missing) + 256;
+    char *result = malloc(cap);
+    if (!result) return NULL;
+
+    size_t ri = 0;
+    const char *p = tmpl;
+    while (*p && ri < cap - 1) {
+        if (strncmp(p, "{previous_output}", 17) == 0) {
+            size_t plen = strlen(prev_output);
+            if (ri + plen < cap) { memcpy(result + ri, prev_output, plen); ri += plen; }
+            p += 17;
+        } else if (strncmp(p, "{missing_fields}", 16) == 0) {
+            size_t mlen = strlen(missing);
+            if (ri + mlen < cap) { memcpy(result + ri, missing, mlen); ri += mlen; }
+            p += 16;
+        } else {
+            result[ri++] = *p++;
+        }
+    }
+    result[ri] = '\0';
+    return result;
+}
+
+/*
+ * Validate heartbeat report: check all required fields from config.toml are present.
+ * If missing, load re-prompt template and do one more Claude turn.
+ * Modifies all_output in place (realloc'd if needed).
+ */
+static void validate_heartbeat_report(const char *output,
+                                       char **all_output_ptr, size_t *all_output_len_ptr,
+                                       size_t *all_output_cap_ptr,
+                                       const char *essence, int *turn_ptr) {
+    char names[MAX_REPORT_FIELDS][64];
+    char descs[MAX_REPORT_FIELDS][256];
+    int nfields = load_report_fields(names, descs, MAX_REPORT_FIELDS);
+
+    if (nfields == 0) return; /* no fields configured */
+
+    /* Check which fields are present */
+    char missing[2048];
+    int mi = 0;
+    int nmissing = 0;
+    for (int i = 0; i < nfields; i++) {
+        char needle[68];
+        snprintf(needle, sizeof(needle), "%s:", names[i]);
+        if (strstr(*all_output_ptr, needle) == NULL) {
+            mi += snprintf(missing + mi, sizeof(missing) - mi,
+                "- %s: (%s)\n", names[i], descs[i]);
+            nmissing++;
+        }
+    }
+
+    if (nmissing == 0) return; /* all fields present */
+
+    fprintf(stderr, "[autoprompt] heartbeat report missing %d/%d fields, re-prompting\n",
+            nmissing, nfields);
+    set_seal_pose("normal", "open", "swim", "thought", "completing report...");
+
+    /* Load template */
+    char *tmpl = load_reprompt_template();
+    char *followup = NULL;
+    if (tmpl) {
+        followup = build_reprompt(tmpl, *all_output_ptr, missing);
+        free(tmpl);
+    }
+    if (!followup) {
+        /* Fallback if template missing */
+        size_t flen = strlen(*all_output_ptr) + sizeof(missing) + 512;
+        followup = malloc(flen);
+        if (!followup) return;
+        snprintf(followup, flen,
+            "[YOUR PREVIOUS OUTPUT]\n%s\n\n"
+            "[INCOMPLETE REPORT]\nMissing fields:\n%s\n"
+            "Output ONLY the missing fields now.",
+            *all_output_ptr, missing);
+    }
+
+    /* Stream separator */
+    {
+        char sep[64];
+        int sl = snprintf(sep, sizeof(sep), "\n--- completing report ---\n");
+        stream_write(sep, (size_t)sl);
+    }
+
+    /* Run one more turn */
+    char *extra_output = NULL;
+    size_t extra_len = 0;
+    int extra_exit = run_claude(followup, essence, &extra_output, &extra_len);
+
+    if (extra_exit == 0 && extra_output && extra_len > 0) {
+        /* Append to all_output */
+        while (*all_output_len_ptr + extra_len + 64 > *all_output_cap_ptr) {
+            *all_output_cap_ptr *= 2;
+            char *tmp = realloc(*all_output_ptr, *all_output_cap_ptr);
+            if (tmp) *all_output_ptr = tmp; else break;
+        }
+        *all_output_len_ptr += snprintf(*all_output_ptr + *all_output_len_ptr,
+            *all_output_cap_ptr - *all_output_len_ptr, "\n--- report completion ---\n");
+        memcpy(*all_output_ptr + *all_output_len_ptr, extra_output, extra_len);
+        *all_output_len_ptr += extra_len;
+        (*all_output_ptr)[*all_output_len_ptr] = '\0';
+
+        extract_memories(extra_output);
+    }
+    free(extra_output);
+    free(followup);
+    (*turn_ptr)++;
+}
+
 static void log_heartbeat(const char *output, const char *filename) {
     if (!output) return;
 
@@ -943,13 +1160,30 @@ static void log_heartbeat(const char *output, const char *filename) {
         }
     }
 
+    /* Parse structured report fields */
+    char action[512] = "";
+    char question[512] = "";
+    char improvement[512] = "";
+    char contribution[1024] = "";
+    extract_report_field(output, "ACTION:", action, sizeof(action));
+    extract_report_field(output, "QUESTION:", question, sizeof(question));
+    extract_report_field(output, "IMPROVEMENT:", improvement, sizeof(improvement));
+    extract_report_field(output, "CONTRIBUTION:", contribution, sizeof(contribution));
+
+    /* Build summary from action if empty (backward compat) */
+    if (!summary[0] && action[0]) {
+        snprintf(summary, sizeof(summary), "%s", action);
+    }
+
     char ts[64];
     timestamp_now(ts, sizeof(ts));
 
-    char log_entry[1024];
+    char log_entry[4096];
     int log_len = snprintf(log_entry, sizeof(log_entry),
-        "{\"timestamp\":\"%s\",\"prompt\":\"%s\",\"status\":\"%s\",\"summary\":\"%s\"}\n",
-        ts, filename, status, summary);
+        "{\"timestamp\":\"%s\",\"prompt\":\"%s\",\"status\":\"%s\","
+        "\"summary\":\"%s\",\"action\":\"%s\",\"question\":\"%s\","
+        "\"improvement\":\"%s\",\"contribution\":\"%s\"}\n",
+        ts, filename, status, summary, action, question, improvement, contribution);
 
     /* Append to log file and trim to last 10 entries */
     const char *log_path = g_heartbeat_log;
@@ -1549,7 +1783,15 @@ static void process_prompt(const char *filename) {
             continue; /* next turn */
         }
 
-        /* No CALL: lines -- loop is done */
+        /* No CALL: lines -- check if heartbeat needs report completion */
+        int is_heartbeat = (strstr(filename, "heartbeat") != NULL
+                         || strstr(filename, "wakeup") != NULL);
+
+        if (is_heartbeat && exit_code == 0 && all_output && turn < g_max_react_turns - 1) {
+            validate_heartbeat_report(all_output, &all_output, &all_output_len,
+                                       &all_output_cap, essence, &turn);
+        }
+
         free(output);
         break;
     }
