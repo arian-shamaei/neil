@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/select.h>
+#include <sys/file.h>
 #include <fcntl.h>
 #include <ctype.h>
 
@@ -1975,9 +1976,58 @@ static void recover_active(void) {
     closedir(d);
 }
 
+/*
+ * Singleton lock: ensures only one autoprompt instance runs at a time.
+ * Uses flock() on a lock file -- automatically released on process exit/crash.
+ * Returns the lock fd (kept open for process lifetime) or -1 on failure.
+ */
+static int acquire_singleton_lock(void) {
+    char lockpath[MAX_PATH];
+    snprintf(lockpath, sizeof(lockpath), "/tmp/autoprompt.lock");
+
+    int fd = open(lockpath, O_CREAT | O_RDWR, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "[autoprompt] WARNING: cannot open lock file %s: %s\n",
+                lockpath, strerror(errno));
+        return -1;  /* proceed without lock rather than refusing to start */
+    }
+
+    if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+        if (errno == EWOULDBLOCK) {
+            /* Another instance holds the lock -- read its PID for diagnostics */
+            char pidbuf[32] = {0};
+            lseek(fd, 0, SEEK_SET);
+            read(fd, pidbuf, sizeof(pidbuf) - 1);
+            fprintf(stderr, "[autoprompt] ABORT: another instance is already running (PID %s)\n",
+                    pidbuf[0] ? pidbuf : "unknown");
+        } else {
+            fprintf(stderr, "[autoprompt] WARNING: flock failed: %s\n", strerror(errno));
+        }
+        close(fd);
+        return -1;
+    }
+
+    /* Write our PID to the lock file for diagnostics */
+    if (ftruncate(fd, 0) == 0) {
+        char pidbuf[32];
+        int n = snprintf(pidbuf, sizeof(pidbuf), "%d\n", (int)getpid());
+        lseek(fd, 0, SEEK_SET);
+        if (write(fd, pidbuf, n) < 0) { /* ignore write errors on lock file */ }
+    }
+
+    return fd;  /* keep open -- flock released on close/exit */
+}
+
 int main(int argc, char **argv) {
     /* Resolve all paths and load config */
     resolve_neil_paths();
+
+    /* Singleton guard: only one autoprompt instance at a time */
+    int lockfd = acquire_singleton_lock();
+    if (lockfd < 0) {
+        fprintf(stderr, "[autoprompt] exiting (singleton lock failed)\n");
+        return 1;
+    }
 
     /* CLI override for AI command */
     if (argc > 1)
