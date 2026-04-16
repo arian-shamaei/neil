@@ -1186,7 +1186,13 @@ fn render_memory_panel(s: &NeilState) -> Vec<Line<'static>> {
 
 fn render_heartbeat_panel(s: &NeilState) -> Vec<Line<'static>> {
     let mut l = vec![
-        Line::from(Span::styled(format!("Beats today: {}/50 | Last: {}", s.heartbeat.beats_today, s.heartbeat.last_beat), Style::default().fg(Color::Cyan))),
+        Line::from(Span::styled(
+            match s.max_daily_beats {
+                Some(cap) => format!("Beats today: {}/{} | Last: {}", s.heartbeat.beats_today, cap, s.heartbeat.last_beat),
+                None => format!("Beats today: {} | Last: {}", s.heartbeat.beats_today, s.heartbeat.last_beat),
+            },
+            Style::default().fg(Color::Cyan),
+        )),
         Line::from(""),
     ];
     for e in &s.heartbeat.entries {

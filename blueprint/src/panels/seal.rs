@@ -160,16 +160,29 @@ impl Panel for SealPanel {
             Style::default().fg(Color::DarkGray),
         )));
 
-        // Beat budget bar
-        let bar = beat_bar(state.heartbeat.beats_today, 50, 14);
-        lines.push(Line::from(vec![
-            Span::styled("  beats: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(bar, Style::default().fg(
-                if state.heartbeat.beats_today > 40 { Color::Red }
-                else if state.heartbeat.beats_today > 25 { Color::Yellow }
-                else { Color::Green }
-            )),
-        ]));
+        // Beat count (with budget bar only if a cap is set)
+        match state.max_daily_beats {
+            Some(cap) => {
+                let bar = beat_bar(state.heartbeat.beats_today, cap, 14);
+                lines.push(Line::from(vec![
+                    Span::styled("  beats: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(bar, Style::default().fg(
+                        if state.heartbeat.beats_today > cap * 4 / 5 { Color::Red }
+                        else if state.heartbeat.beats_today > cap / 2 { Color::Yellow }
+                        else { Color::Green }
+                    )),
+                ]));
+            }
+            None => {
+                lines.push(Line::from(vec![
+                    Span::styled("  beats: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{} today", state.heartbeat.beats_today),
+                        Style::default().fg(Color::Green),
+                    ),
+                ]));
+            }
+        }
 
         // Memory
         lines.push(Line::from(vec![

@@ -28,12 +28,17 @@ impl Panel for HeaderPanel {
             Style::default().fg(Color::DarkGray),
         );
         let beat_info = Span::styled(
-            format!(" | beats: {}/50", state.heartbeat.beats_today),
-            Style::default().fg(if state.heartbeat.beats_today > 40 {
-                Color::Red
-            } else {
-                Color::DarkGray
-            }),
+            match state.max_daily_beats {
+                Some(cap) => format!(" | beats: {}/{}", state.heartbeat.beats_today, cap),
+                None => format!(" | beats: {}", state.heartbeat.beats_today),
+            },
+            Style::default().fg(
+                if state.max_daily_beats.map(|c| state.heartbeat.beats_today > c * 4 / 5).unwrap_or(false) {
+                    Color::Red
+                } else {
+                    Color::DarkGray
+                }
+            ),
         );
         let queue = if state.system.queue_count > 0 {
             Span::styled(
