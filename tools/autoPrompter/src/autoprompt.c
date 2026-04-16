@@ -283,13 +283,65 @@ static char *run_command(const char *cmd) {
     return buf;
 }
 
-/* Extract first 80 chars of the prompt body for use as search query. */
+/* Extract a meaningful search query from the prompt for mempalace lookup.
+ *
+ * For heartbeat prompts: reads the last heartbeat_log.json entry and pulls
+ * the "question" field (or "summary" as fallback) -- so each heartbeat
+ * retrieves contextually relevant memories instead of always "# Heartbeat".
+ *
+ * For other prompts: extracts the first meaningful line (skipping markdown
+ * headers that start with #) up to cap-1 chars.
+ */
 static void extract_query(const char *prompt, char *query, size_t cap) {
     /* skip whitespace */
-    while (*prompt && isspace((unsigned char)*prompt)) prompt++;
+    const char *p = prompt;
+    while (*p && isspace((unsigned char)*p)) p++;
+
+    /* Detect heartbeat prompts */
+    if (strncmp(p, "# Heartbeat", 11) == 0) {
+        /* Try to extract last question/summary from heartbeat log */
+        char cmd[MAX_PATH + 64];
+        snprintf(cmd, sizeof(cmd),
+            "tail -1 %s 2>/dev/null", g_heartbeat_log);
+        FILE *fp = popen(cmd, "r");
+        if (fp) {
+            char line[2048];
+            if (fgets(line, sizeof(line), fp)) {
+                /* Try "question" field first, then "summary" */
+                const char *field = NULL;
+                const char *qstart = strstr(line, "\"question\":\"");
+                if (qstart) {
+                    field = qstart + 12;
+                } else {
+                    qstart = strstr(line, "\"summary\":\"");
+                    if (qstart) field = qstart + 11;
+                }
+                if (field) {
+                    size_t i;
+                    for (i = 0; i < cap - 1 && field[i] && field[i] != '"'; i++)
+                        query[i] = field[i];
+                    query[i] = '\0';
+                    pclose(fp);
+                    return;
+                }
+            }
+            pclose(fp);
+        }
+    }
+
+    /* Default: skip markdown header lines (# ...) to find content */
+    while (*p == '#') {
+        while (*p && *p != '\n') p++;
+        while (*p && isspace((unsigned char)*p)) p++;
+    }
+
+    /* If we skipped everything, fall back to original prompt */
+    if (!*p) p = prompt;
+    while (*p && isspace((unsigned char)*p)) p++;
+
     size_t i;
-    for (i = 0; i < cap - 1 && prompt[i] && prompt[i] != '\n'; i++)
-        query[i] = prompt[i];
+    for (i = 0; i < cap - 1 && p[i] && p[i] != '\n'; i++)
+        query[i] = p[i];
     query[i] = '\0';
 }
 
