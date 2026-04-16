@@ -112,6 +112,10 @@ echo "=== Beat Health ==="
 $HOME/.neil/self/beat_health.sh 2>/dev/null || echo "health: unknown"
 
 echo ""
+echo "=== Work Pattern ==="
+$HOME/.neil/self/beat_taxonomy.sh 2>/dev/null || echo "taxonomy: unavailable"
+
+echo ""
 echo "=== Guardrails ==="
 # Daily beat count
 TODAY=$(date +%Y-%m-%d)

@@ -126,14 +126,10 @@ impl NeilState {
         let today = Local::now().format("%Y-%m-%d").to_string();
 
         let mut entries = Vec::new();
-        let mut beats_today = 0;
 
         for line in content.lines() {
             if line.trim().is_empty() { continue; }
             if let Ok(entry) = serde_json::from_str::<HeartbeatEntry>(line) {
-                if entry.timestamp.contains(&today) {
-                    beats_today += 1;
-                }
                 entries.push(entry);
             }
         }
@@ -141,6 +137,17 @@ impl NeilState {
         let last_beat = entries.last()
             .map(|e| e.timestamp.clone())
             .unwrap_or_default();
+
+        // Count beats today from result files (log is capped at 10)
+        let history_dir = home.join("tools/autoPrompter/history");
+        let beats_today = fs::read_dir(&history_dir)
+            .map(|dir| dir.filter_map(|e| e.ok())
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    n.contains(&today) && n.ends_with(".result.md")
+                })
+                .count())
+            .unwrap_or(0);
 
         HeartbeatState { entries, beats_today, last_beat }
     }
