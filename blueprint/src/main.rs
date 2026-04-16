@@ -105,7 +105,8 @@ fn main() -> anyhow::Result<()> {
     let mut saved_input: String = String::new();
     let mut hb_selection: usize = 0; // selected heartbeat in panel
     let mut hb_expanded: bool = false; // whether detail view is open
-    let mut hb_scroll: usize = 0; // scroll offset in detail view
+    let mut hb_scroll: usize = 0; // scroll offset in content pane
+    let mut hb_section: usize = 0; // selected section in expanded view
 
     // Pre-load prompt history from past result files
     if let Ok(entries) = fs::read_dir(&history_dir) {
@@ -371,7 +372,7 @@ fn main() -> anyhow::Result<()> {
                         render_panel_selector(frame, size, panel_selection);
                     }
                     View::Panel(idx) => {
-                        render_panel_view(frame, size, *idx, state, fps.fps, hb_selection, hb_expanded, hb_scroll);
+                        render_panel_view(frame, size, *idx, state, fps.fps, hb_selection, hb_expanded, hb_scroll, hb_section);
                     }
                 }
             })?;
@@ -473,7 +474,41 @@ fn main() -> anyhow::Result<()> {
                                     }
                                 }
                             }
-                            KeyCode::Tab => { view = View::PanelSelector; }
+                            KeyCode::Tab => {
+                                if input.starts_with('/') {
+                                    // Autocomplete slash command
+                                    const SLASH_CMDS: &[&str] = &[
+                                        "/clear", "/status", "/help", "/panels",
+                                        "/heartbeat", "/history",
+                                    ];
+                                    let partial: &str = &input;
+                                    let matches: Vec<&&str> = SLASH_CMDS.iter()
+                                        .filter(|c| c.starts_with(partial) && **c != partial)
+                                        .collect();
+                                    if matches.len() == 1 {
+                                        // Exact single match -- complete it
+                                        input = matches[0].to_string();
+                                        cursor_pos = input.chars().count();
+                                    } else if matches.len() > 1 {
+                                        // Multiple matches -- complete common prefix
+                                        let first = matches[0].as_bytes();
+                                        let mut common = first.len();
+                                        for m in &matches[1..] {
+                                            let mb = m.as_bytes();
+                                            common = common.min(mb.len());
+                                            for i in 0..common {
+                                                if first[i] != mb[i] { common = i; break; }
+                                            }
+                                        }
+                                        if common > input.len() {
+                                            input = first[..common].iter().map(|&b| b as char).collect();
+                                            cursor_pos = input.chars().count();
+                                        }
+                                    }
+                                } else {
+                                    view = View::PanelSelector;
+                                }
+                            }
                             KeyCode::Char(c) => {
                                 if key.modifiers.contains(KeyModifiers::ALT) {
                                     // Alt+1-7 expand panels
@@ -630,14 +665,14 @@ fn main() -> anyhow::Result<()> {
                             }
                             KeyCode::Up if *pidx == 1 => {
                                 if hb_expanded {
-                                    if hb_scroll > 0 { hb_scroll -= 1; }
+                                    if hb_section > 0 { hb_section -= 1; hb_scroll = 0; }
                                 } else if hb_selection > 0 {
                                     hb_selection -= 1;
                                 }
                             }
                             KeyCode::Down if *pidx == 1 => {
                                 if hb_expanded {
-                                    hb_scroll += 1;
+                                    if hb_section < 4 { hb_section += 1; hb_scroll = 0; }
                                 } else if let Some(ref st) = cached_state {
                                     if hb_selection + 1 < st.heartbeat.entries.len() {
                                         hb_selection += 1;
@@ -645,8 +680,11 @@ fn main() -> anyhow::Result<()> {
                                 }
                             }
                             KeyCode::Enter if *pidx == 1 => {
-                                hb_expanded = !hb_expanded;
-                                hb_scroll = 0;
+                                if !hb_expanded {
+                                    hb_expanded = true;
+                                    hb_section = 0;
+                                    hb_scroll = 0;
+                                }
                             }
                             _ => {}
                         },
@@ -1070,6 +1108,21 @@ fn render_stream_cached(
             ]),
         ]
     } else {
+        // Compute slash command suggestion if input starts with /
+        let slash_hint: String = if input.starts_with('/') && !input.contains(' ') {
+            const SLASH_CMDS: &[&str] = &[
+                "/clear", "/status", "/help", "/panels",
+                "/heartbeat", "/history",
+            ];
+            let partial: &str = &input;
+            SLASH_CMDS.iter()
+                .find(|c| c.starts_with(partial) && **c != partial)
+                .map(|c| c[partial.len()..].to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
         let wrapped = wrap_text(input, inner_w);
         let mut result: Vec<Line> = Vec::new();
         let mut cc: usize = 0;
@@ -1085,11 +1138,17 @@ fn render_stream_cached(
                     .unwrap_or(wl.len());
                 let before = &wl[..byte_pos];
                 let after = &wl[byte_pos..];
-                result.push(Line::from(vec![
+                let mut spans = vec![
                     Span::styled(before.to_string(), Style::default().fg(Color::White)),
-                    Span::styled("_", Style::default().fg(Color::Cyan).add_modifier(Modifier::SLOW_BLINK)),
-                    Span::styled(after.to_string(), Style::default().fg(Color::White)),
-                ]));
+                ];
+                // Show autocomplete hint flowing directly from typed text (no cursor break)
+                if !slash_hint.is_empty() && after.is_empty() && cc + line_char_count >= input.chars().count() {
+                    spans.push(Span::styled(slash_hint.clone(), Style::default().fg(Color::DarkGray)));
+                } else {
+                    spans.push(Span::styled("_", Style::default().fg(Color::Cyan).add_modifier(Modifier::SLOW_BLINK)));
+                    spans.push(Span::styled(after.to_string(), Style::default().fg(Color::White)));
+                }
+                result.push(Line::from(spans));
             } else {
                 result.push(Line::from(Span::styled(wl.clone(), Style::default().fg(Color::White))));
             }
@@ -1261,11 +1320,16 @@ fn render_panel_selector(frame: &mut ratatui::Frame, area: Rect, selected: usize
 }
 
 fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: &NeilState, fps: u32,
-                     hb_sel: usize, hb_expanded: bool, hb_scroll: usize) {
+                     hb_sel: usize, hb_expanded: bool, hb_scroll: usize, hb_section: usize) {
     let (name, _) = PANEL_NAMES.get(idx).unwrap_or(&("?", ""));
-    let title = if idx == 1 && hb_expanded {
-        format!(" {} | Esc:back Up/Down:scroll ", name)
-    } else if idx == 1 {
+
+    // Heartbeat expanded: two-pane layout rendered directly
+    if idx == 1 && hb_expanded {
+        render_heartbeat_expanded(frame, area, state, hb_sel, hb_section, hb_scroll, fps);
+        return;
+    }
+
+    let title = if idx == 1 {
         format!(" {} | Up/Down:select Enter:expand Esc:close ", name)
     } else {
         format!(" {} | Esc:close 1-7:switch ", name)
@@ -1276,7 +1340,7 @@ fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: 
 
     let lines: Vec<Line> = match idx {
         0 => render_memory_panel(state),
-        1 => render_heartbeat_panel(state, hb_sel, hb_expanded, hb_scroll, inner.height as usize),
+        1 => render_heartbeat_panel(state, hb_sel),
         2 => render_intentions_panel(state),
         3 => render_system_panel(state),
         4 => render_services_panel(state),
@@ -1308,7 +1372,7 @@ fn render_memory_panel(s: &NeilState) -> Vec<Line<'static>> {
     l
 }
 
-fn render_heartbeat_panel(s: &NeilState, selected: usize, expanded: bool, scroll: usize, height: usize) -> Vec<Line<'static>> {
+fn render_heartbeat_panel(s: &NeilState, selected: usize) -> Vec<Line<'static>> {
     let cap_str = s.max_daily_beats.map(|n| format!("/{}", n)).unwrap_or_default();
     let mut l = vec![
         Line::from(Span::styled(
@@ -1318,148 +1382,7 @@ fn render_heartbeat_panel(s: &NeilState, selected: usize, expanded: bool, scroll
         Line::from(""),
     ];
 
-    if expanded {
-        // Detail view for selected heartbeat
-        if let Some(e) = s.heartbeat.entries.get(selected) {
-            let status_color = match e.status.as_str() {
-                "ok" => Color::Green, "acted" => Color::Cyan, "error" => Color::Red, _ => Color::DarkGray
-            };
-
-            let mut detail: Vec<Line<'static>> = Vec::new();
-
-            // Header
-            detail.push(Line::from(vec![
-                Span::styled("  HEARTBEAT REPORT ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-                Span::styled(format!("  {} ", e.timestamp), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("[{}]", e.status), Style::default().fg(status_color)),
-            ]));
-            detail.push(Line::from(""));
-
-            // Action section
-            detail.push(Line::from(Span::styled(
-                "  ACTION",
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            )));
-            let action_text = if e.action.is_empty() { &e.summary } else { &e.action };
-            for line in textwrap_simple(action_text, 70) {
-                detail.push(Line::from(Span::styled(format!("    {}", line), Style::default().fg(Color::White))));
-            }
-            detail.push(Line::from(""));
-
-            // Question section
-            detail.push(Line::from(Span::styled(
-                "  QUESTION",
-                Style::default().fg(Color::Rgb(255, 200, 100)).add_modifier(Modifier::BOLD),
-            )));
-            if e.question.is_empty() {
-                detail.push(Line::from(Span::styled("    (no question recorded)", Style::default().fg(Color::DarkGray))));
-            } else {
-                for line in textwrap_simple(&e.question, 70) {
-                    detail.push(Line::from(Span::styled(format!("    {}", line), Style::default().fg(Color::Rgb(255, 200, 100)))));
-                }
-            }
-            detail.push(Line::from(""));
-
-            // Improvement section
-            detail.push(Line::from(Span::styled(
-                "  IMPROVEMENT",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            )));
-            if e.improvement.is_empty() {
-                detail.push(Line::from(Span::styled("    (none recorded)", Style::default().fg(Color::DarkGray))));
-            } else {
-                for line in textwrap_simple(&e.improvement, 70) {
-                    detail.push(Line::from(Span::styled(format!("    {}", line), Style::default().fg(Color::Green))));
-                }
-            }
-            detail.push(Line::from(""));
-
-            // Contribution section
-            detail.push(Line::from(Span::styled(
-                "  CONTRIBUTION",
-                Style::default().fg(Color::Rgb(180, 130, 255)).add_modifier(Modifier::BOLD),
-            )));
-            if e.contribution.is_empty() {
-                detail.push(Line::from(Span::styled("    (none recorded)", Style::default().fg(Color::DarkGray))));
-            } else {
-                for line in textwrap_simple(&e.contribution, 70) {
-                    detail.push(Line::from(Span::styled(format!("    {}", line), Style::default().fg(Color::Rgb(180, 130, 255)))));
-                }
-            }
-            detail.push(Line::from(""));
-
-            // Prompt source
-            detail.push(Line::from(Span::styled(
-                format!("  source: {}", e.prompt),
-                Style::default().fg(Color::DarkGray),
-            )));
-            detail.push(Line::from(""));
-
-            // Command log -- extracted from the result file
-            let cmd_log = load_command_log(&s.neil_home, &e.prompt);
-            if !cmd_log.is_empty() {
-                detail.push(Line::from(Span::styled(
-                    "  COMMAND LOG",
-                    Style::default().fg(Color::Rgb(100, 200, 255)).add_modifier(Modifier::BOLD),
-                )));
-                detail.push(Line::from(""));
-
-                for entry in &cmd_log {
-                    match entry {
-                        CommandLogEntry::Command { cmd, output } => {
-                            // Truncate long commands for display
-                            let display_cmd: String = cmd.chars().take(90).collect();
-                            detail.push(Line::from(vec![
-                                Span::styled("    $ ", Style::default().fg(Color::Rgb(100, 200, 100))),
-                                Span::styled(display_cmd, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                            ]));
-                            if !output.is_empty() {
-                                for ol in output.lines().take(5) {
-                                    detail.push(Line::from(Span::styled(
-                                        format!("      {}", ol),
-                                        Style::default().fg(Color::Rgb(120, 120, 120)),
-                                    )));
-                                }
-                                let total_lines = output.lines().count();
-                                if total_lines > 5 {
-                                    detail.push(Line::from(Span::styled(
-                                        format!("      ... ({} more lines)", total_lines - 5),
-                                        Style::default().fg(Color::DarkGray),
-                                    )));
-                                }
-                            }
-                            detail.push(Line::from(""));
-                        }
-                        CommandLogEntry::Memory(detail_text) => {
-                            let display: String = detail_text.chars().take(80).collect();
-                            detail.push(Line::from(vec![
-                                Span::styled("    >> ", Style::default().fg(Color::Rgb(180, 130, 255))),
-                                Span::styled(format!("MEMORY: {}", display), Style::default().fg(Color::Rgb(180, 130, 255))),
-                            ]));
-                        }
-                        CommandLogEntry::ServiceCall(detail_text) => {
-                            let display: String = detail_text.chars().take(80).collect();
-                            detail.push(Line::from(vec![
-                                Span::styled("    -> ", Style::default().fg(Color::Rgb(100, 200, 255))),
-                                Span::styled(format!("CALL: {}", display), Style::default().fg(Color::Rgb(100, 200, 255))),
-                            ]));
-                        }
-                        CommandLogEntry::Mempalace(detail_text) => {
-                            let display: String = detail_text.chars().take(80).collect();
-                            detail.push(Line::from(Span::styled(
-                                format!("    ~ {}", display),
-                                Style::default().fg(Color::Rgb(100, 180, 255)),
-                            )));
-                        }
-                    }
-                }
-            }
-
-            // Apply scroll
-            let skip = scroll.min(detail.len().saturating_sub(1));
-            l.extend(detail.into_iter().skip(skip));
-        }
-    } else {
+    {
         // List view -- show all entries, highlight selected
         for (i, e) in s.heartbeat.entries.iter().enumerate() {
             let is_sel = i == selected;
@@ -1519,6 +1442,187 @@ fn textwrap_simple(text: &str, width: usize) -> Vec<String> {
     }
     if lines.is_empty() { lines.push(text.to_string()); }
     lines
+}
+
+const HB_SECTIONS: &[(&str, Color)] = &[
+    ("ACTION",       Color::White),
+    ("QUESTION",     Color::Rgb(255, 200, 100)),
+    ("IMPROVEMENT",  Color::Green),
+    ("CONTRIBUTION", Color::Rgb(180, 130, 255)),
+    ("COMMAND LOG",  Color::Rgb(100, 200, 255)),
+];
+
+fn render_heartbeat_expanded(
+    frame: &mut ratatui::Frame, area: Rect, state: &NeilState,
+    hb_sel: usize, section: usize, scroll: usize, fps: u32,
+) {
+    let e = match state.heartbeat.entries.get(hb_sel) {
+        Some(e) => e,
+        None => return,
+    };
+
+    let status_color = match e.status.as_str() {
+        "ok" => Color::Green, "acted" => Color::Cyan, "error" => Color::Red, _ => Color::DarkGray
+    };
+
+    // Outer border
+    let title = format!(" {} [{}] | Esc:back Up/Down:sections ", e.timestamp, e.status);
+    let outer = Block::default().borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(status_color));
+    let outer_inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    // Split: left sidebar (22 cols) | right content
+    let h_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(22), Constraint::Min(20)])
+        .split(outer_inner);
+
+    let left_area = h_chunks[0];
+    let right_area = h_chunks[1];
+
+    // ── Left: section list ──
+    let mut left_lines: Vec<Line<'static>> = Vec::new();
+    left_lines.push(Line::from(""));
+    for (i, (name, color)) in HB_SECTIONS.iter().enumerate() {
+        let is_sel = i == section;
+        if is_sel {
+            left_lines.push(Line::from(vec![
+                Span::styled(" > ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(*name, Style::default().fg(*color).add_modifier(Modifier::BOLD)),
+            ]));
+        } else {
+            left_lines.push(Line::from(vec![
+                Span::styled("   ", Style::default()),
+                Span::styled(*name, Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+        left_lines.push(Line::from(""));
+    }
+
+    let left_block = Block::default().borders(Borders::RIGHT).border_style(Style::default().fg(Color::Rgb(50, 50, 50)));
+    let left_inner = left_block.inner(left_area);
+    frame.render_widget(left_block, left_area);
+    frame.render_widget(Paragraph::new(left_lines), left_inner);
+
+    // ── Right: content for selected section ──
+    let content_width = right_area.width.saturating_sub(4) as usize;
+    let mut right_lines: Vec<Line<'static>> = Vec::new();
+    right_lines.push(Line::from(""));
+
+    let (_, sec_color) = HB_SECTIONS[section.min(HB_SECTIONS.len() - 1)];
+
+    match section {
+        0 => {
+            // ACTION
+            let text = if e.action.is_empty() { &e.summary } else { &e.action };
+            for line in textwrap_simple(text, content_width) {
+                right_lines.push(Line::from(Span::styled(format!("  {}", line), Style::default().fg(sec_color))));
+            }
+        }
+        1 => {
+            // QUESTION
+            if e.question.is_empty() {
+                right_lines.push(Line::from(Span::styled("  (no question recorded)", Style::default().fg(Color::DarkGray))));
+            } else {
+                for line in textwrap_simple(&e.question, content_width) {
+                    right_lines.push(Line::from(Span::styled(format!("  {}", line), Style::default().fg(sec_color))));
+                }
+            }
+        }
+        2 => {
+            // IMPROVEMENT
+            if e.improvement.is_empty() {
+                right_lines.push(Line::from(Span::styled("  (none recorded)", Style::default().fg(Color::DarkGray))));
+            } else {
+                for line in textwrap_simple(&e.improvement, content_width) {
+                    right_lines.push(Line::from(Span::styled(format!("  {}", line), Style::default().fg(sec_color))));
+                }
+            }
+        }
+        3 => {
+            // CONTRIBUTION
+            if e.contribution.is_empty() {
+                right_lines.push(Line::from(Span::styled("  (none recorded)", Style::default().fg(Color::DarkGray))));
+            } else {
+                for line in textwrap_simple(&e.contribution, content_width) {
+                    right_lines.push(Line::from(Span::styled(format!("  {}", line), Style::default().fg(sec_color))));
+                }
+            }
+        }
+        4 => {
+            // COMMAND LOG
+            let cmd_log = load_command_log(&state.neil_home, &e.prompt);
+            if cmd_log.is_empty() {
+                right_lines.push(Line::from(Span::styled("  (no commands recorded)", Style::default().fg(Color::DarkGray))));
+            } else {
+                for entry in &cmd_log {
+                    match entry {
+                        CommandLogEntry::Command { cmd, output } => {
+                            let display_cmd: String = cmd.chars().take(content_width.saturating_sub(4)).collect();
+                            right_lines.push(Line::from(vec![
+                                Span::styled("  $ ", Style::default().fg(Color::Rgb(100, 200, 100))),
+                                Span::styled(display_cmd, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                            ]));
+                            for ol in output.lines().take(8) {
+                                right_lines.push(Line::from(Span::styled(
+                                    format!("    {}", ol), Style::default().fg(Color::Rgb(120, 120, 120)),
+                                )));
+                            }
+                            let total = output.lines().count();
+                            if total > 8 {
+                                right_lines.push(Line::from(Span::styled(
+                                    format!("    ... ({} more)", total - 8), Style::default().fg(Color::DarkGray),
+                                )));
+                            }
+                            right_lines.push(Line::from(""));
+                        }
+                        CommandLogEntry::Memory(d) => {
+                            right_lines.push(Line::from(vec![
+                                Span::styled("  >> ", Style::default().fg(Color::Rgb(180, 130, 255))),
+                                Span::styled(format!("MEMORY: {}", d), Style::default().fg(Color::Rgb(180, 130, 255))),
+                            ]));
+                        }
+                        CommandLogEntry::ServiceCall(d) => {
+                            right_lines.push(Line::from(vec![
+                                Span::styled("  -> ", Style::default().fg(Color::Rgb(100, 200, 255))),
+                                Span::styled(format!("CALL: {}", d), Style::default().fg(Color::Rgb(100, 200, 255))),
+                            ]));
+                        }
+                        CommandLogEntry::Mempalace(d) => {
+                            right_lines.push(Line::from(Span::styled(
+                                format!("  ~ {}", d), Style::default().fg(Color::Rgb(100, 180, 255)),
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // Source footer
+    right_lines.push(Line::from(""));
+    right_lines.push(Line::from(Span::styled(
+        format!("  source: {}", e.prompt), Style::default().fg(Color::Rgb(60, 60, 60)),
+    )));
+
+    // Apply scroll
+    let skip = scroll.min(right_lines.len().saturating_sub(1));
+    let visible: Vec<Line> = right_lines.into_iter().skip(skip).collect();
+
+    frame.render_widget(Paragraph::new(visible), right_area);
+
+    // FPS
+    let fps_text = format!(" {}fps ", fps);
+    let fl = fps_text.len() as u16;
+    let fx = area.x + area.width.saturating_sub(fl + 1);
+    let fy = area.y + area.height - 1;
+    frame.render_widget(
+        Paragraph::new(Span::styled(fps_text, Style::default().fg(Color::DarkGray))),
+        Rect::new(fx, fy, fl, 1),
+    );
 }
 
 fn render_intentions_panel(s: &NeilState) -> Vec<Line<'static>> {

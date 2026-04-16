@@ -68,6 +68,7 @@ static char g_current_prompt_name[256] = "";     /* filename of prompt being pro
 static void timestamp_now(char *buf, size_t cap);
 static void stream_action(const char *prefix, const char *detail, const char *cmd, const char *output);
 static void set_seal_pose(const char *eyes, const char *mouth, const char *body, const char *indicator, const char *label);static void stream_write(const char *data, size_t len);static int run_claude(const char *prompt, const char *system_prompt, char **out, size_t *out_len);static void extract_memories(const char *output);
+static char *execute_tool_actions(const char *output);
 
 /*
  * Resolve all paths from NEIL_HOME environment variable.
@@ -1277,6 +1278,203 @@ static void log_heartbeat(const char *output, const char *filename) {
 }
 
 /*
+ * Parse READ:, WRITE:, BASH: lines from Claude output and execute them.
+ * Returns accumulated results (malloc'd) or NULL if no tool actions found.
+ *
+ * READ: /path/to/file
+ *   -> reads file, returns content
+ *
+ * BASH: command to run
+ *   -> executes via popen, returns stdout+stderr
+ *
+ * WRITE: path=/path/to/file
+ * ```
+ * file content here
+ * ```
+ *   -> writes content to file
+ */
+static char *execute_tool_actions(const char *output) {
+    if (!output) return NULL;
+
+    size_t results_cap = 8192, results_len = 0;
+    char *results = malloc(results_cap);
+    if (!results) return NULL;
+    results[0] = '\0';
+
+    const char *p = output;
+
+    while (*p) {
+        /* Find next action line */
+        const char *line_start = p;
+
+        /* Skip to a line that starts with READ:, WRITE:, or BASH: */
+        int found = 0;
+        while (*p) {
+            if (p == output || *(p-1) == '\n') {
+                if (strncmp(p, "READ:", 5) == 0 || strncmp(p, "BASH:", 5) == 0 ||
+                    strncmp(p, "WRITE:", 6) == 0) {
+                    found = 1;
+                    break;
+                }
+            }
+            p++;
+        }
+        if (!found) break;
+
+        /* Ensure enough space in results */
+        if (results_len + 4096 > results_cap) {
+            results_cap *= 2;
+            char *tmp = realloc(results, results_cap);
+            if (tmp) results = tmp; else break;
+        }
+
+        if (strncmp(p, "READ:", 5) == 0) {
+            p += 5;
+            while (*p == ' ') p++;
+            const char *eol = strchr(p, '\n');
+            if (!eol) eol = p + strlen(p);
+
+            char path[MAX_PATH];
+            size_t pl = (size_t)(eol - p);
+            if (pl >= sizeof(path)) pl = sizeof(path) - 1;
+            memcpy(path, p, pl);
+            path[pl] = '\0';
+            /* Trim trailing whitespace */
+            while (pl > 0 && (path[pl-1] == ' ' || path[pl-1] == '\r'))
+                path[--pl] = '\0';
+
+            fprintf(stderr, "[autoprompt] READ: %s\n", path);
+            stream_action("READ", path, NULL, NULL);
+
+            size_t flen;
+            char *content = read_file(path, &flen);
+            if (content) {
+                /* Cap at 50KB to avoid blowing up context */
+                if (flen > 50000) {
+                    content[50000] = '\0';
+                    flen = 50000;
+                }
+                results_len += snprintf(results + results_len, results_cap - results_len,
+                    "[READ %s]\n%s\n[/READ]\n\n", path, content);
+                stream_action(NULL, NULL, path, content);
+                free(content);
+            } else {
+                results_len += snprintf(results + results_len, results_cap - results_len,
+                    "[READ ERROR] %s: file not found or unreadable\n\n", path);
+                stream_action("READ", path, NULL, "ERROR: file not found");
+            }
+            p = eol;
+
+        } else if (strncmp(p, "BASH:", 5) == 0) {
+            p += 5;
+            while (*p == ' ') p++;
+            const char *eol = strchr(p, '\n');
+            if (!eol) eol = p + strlen(p);
+
+            char cmd[4096];
+            size_t cl = (size_t)(eol - p);
+            if (cl >= sizeof(cmd)) cl = sizeof(cmd) - 1;
+            memcpy(cmd, p, cl);
+            cmd[cl] = '\0';
+
+            fprintf(stderr, "[autoprompt] BASH: %s\n", cmd);
+
+            /* Execute with timeout (60s) and capture output */
+            char wrapped[4200];
+            snprintf(wrapped, sizeof(wrapped), "timeout 60 sh -c '%s' 2>&1", cmd);
+            char *bash_result = run_command(wrapped);
+
+            if (bash_result) {
+                /* Cap output at 20KB */
+                size_t blen = strlen(bash_result);
+                if (blen > 20000) {
+                    bash_result[20000] = '\0';
+                    blen = 20000;
+                }
+                while (results_len + blen + 256 > results_cap) {
+                    results_cap *= 2;
+                    char *tmp = realloc(results, results_cap);
+                    if (tmp) results = tmp; else break;
+                }
+                results_len += snprintf(results + results_len, results_cap - results_len,
+                    "[BASH %s]\n%s\n[/BASH]\n\n", cmd, bash_result);
+                stream_action("BASH", cmd, cmd, bash_result);
+                free(bash_result);
+            } else {
+                results_len += snprintf(results + results_len, results_cap - results_len,
+                    "[BASH ERROR] %s: execution failed\n\n", cmd);
+                stream_action("BASH", cmd, cmd, "ERROR: execution failed");
+            }
+            p = eol;
+
+        } else if (strncmp(p, "WRITE:", 6) == 0) {
+            p += 6;
+            while (*p == ' ') p++;
+
+            /* Parse path= parameter */
+            char path[MAX_PATH] = "";
+            if (strncmp(p, "path=", 5) == 0) {
+                p += 5;
+                const char *eol = strchr(p, '\n');
+                if (!eol) eol = p + strlen(p);
+                size_t pl = (size_t)(eol - p);
+                if (pl >= sizeof(path)) pl = sizeof(path) - 1;
+                memcpy(path, p, pl);
+                path[pl] = '\0';
+                while (pl > 0 && (path[pl-1] == ' ' || path[pl-1] == '\r'))
+                    path[--pl] = '\0';
+                p = (*eol) ? eol + 1 : eol;
+            }
+
+            if (!path[0]) { continue; }
+
+            /* Find code block content */
+            /* Skip to opening ``` */
+            while (*p && strncmp(p, "```", 3) != 0) p++;
+            if (*p) {
+                p += 3;
+                /* Skip optional language tag */
+                while (*p && *p != '\n') p++;
+                if (*p == '\n') p++;
+            }
+
+            /* Collect content until closing ``` */
+            const char *content_start = p;
+            while (*p && strncmp(p, "\n```", 4) != 0 && strncmp(p, "```", 3) != 0) p++;
+            size_t content_len = (size_t)(p - content_start);
+
+            /* Skip closing ``` */
+            if (*p == '\n') p++;
+            if (strncmp(p, "```", 3) == 0) p += 3;
+
+            fprintf(stderr, "[autoprompt] WRITE: %s (%zu bytes)\n", path, content_len);
+
+            /* Write the file */
+            int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0) {
+                ssize_t w = write(fd, content_start, content_len);
+                close(fd);
+                results_len += snprintf(results + results_len, results_cap - results_len,
+                    "[WRITE %s] %zu bytes written\n\n", path, content_len);
+
+                char detail[512];
+                snprintf(detail, sizeof(detail), "%s (%zu bytes)", path, content_len);
+                stream_action("WRITE", detail, NULL, NULL);
+            } else {
+                results_len += snprintf(results + results_len, results_cap - results_len,
+                    "[WRITE ERROR] %s: %s\n\n", path, strerror(errno));
+                stream_action("WRITE", path, NULL, "ERROR: write failed");
+            }
+        } else {
+            p++;
+        }
+    }
+
+    if (results_len == 0) { free(results); return NULL; }
+    return results;
+}
+
+/*
  * Parse CALL: lines from Claude output and execute API calls via vault.
  * Format: CALL: service=<name> action=<action> [param=value ...]
  * Returns a malloc'd string of all call results concatenated, or NULL.
@@ -1461,6 +1659,12 @@ static void set_seal_pose(const char *eyes, const char *mouth,
 /* Stream file path for live output */
 static int g_stream_fd = -1;
 
+/* Global pointer to all_output buffer so stream_action can append to it.
+ * Set by process_prompt before calling action handlers, cleared after. */
+static char **g_all_output_ptr = NULL;
+static size_t *g_all_output_len_ptr = NULL;
+static size_t *g_all_output_cap_ptr = NULL;
+
 static void stream_open(const char *prompt_name) {
     char path[MAX_PATH];
     snprintf(path, sizeof(path), "%s/.neil_stream", g_neil_home);
@@ -1524,6 +1728,18 @@ static void stream_action(const char *prefix, const char *detail,
     }
     if (n > 0) {
         stream_write(buf, (size_t)n);
+
+        /* Also append to all_output so result files capture this */
+        if (g_all_output_ptr && *g_all_output_ptr && g_all_output_len_ptr && g_all_output_cap_ptr) {
+            while (*g_all_output_len_ptr + (size_t)n + 1 > *g_all_output_cap_ptr) {
+                *g_all_output_cap_ptr *= 2;
+                char *tmp = realloc(*g_all_output_ptr, *g_all_output_cap_ptr);
+                if (tmp) *g_all_output_ptr = tmp; else break;
+            }
+            memcpy(*g_all_output_ptr + *g_all_output_len_ptr, buf, (size_t)n);
+            *g_all_output_len_ptr += (size_t)n;
+            (*g_all_output_ptr)[*g_all_output_len_ptr] = '\0';
+        }
     }
 }
 
@@ -1802,11 +2018,36 @@ static void process_prompt(const char *filename) {
             all_output[all_output_len] = '\0';
         }
 
+        /* Wire up global all_output pointer for stream_action */
+        g_all_output_ptr = &all_output;
+        g_all_output_len_ptr = &all_output_len;
+        g_all_output_cap_ptr = &all_output_cap;
+
         /* Extract and store MEMORY: lines */
         extract_memories(output);
 
-        /* Execute CALL: lines */
+        /* Execute CALL: lines and tool actions (READ/WRITE/BASH) */
         char *call_results = execute_service_calls(output);
+        char *tool_results = execute_tool_actions(output);
+
+        /* Merge results */
+        if (tool_results && call_results) {
+            size_t cl = strlen(call_results);
+            size_t tl = strlen(tool_results);
+            char *merged = malloc(cl + tl + 4);
+            if (merged) {
+                memcpy(merged, call_results, cl);
+                memcpy(merged + cl, tool_results, tl);
+                merged[cl + tl] = '\0';
+                free(call_results);
+                free(tool_results);
+                call_results = merged;
+                tool_results = NULL;
+            }
+        } else if (tool_results && !call_results) {
+            call_results = tool_results;
+            tool_results = NULL;
+        }
 
         if (call_results) {
             /* Accumulate call results */
@@ -1840,9 +2081,9 @@ static void process_prompt(const char *filename) {
                 snprintf(followup, followup_cap,
                     "[PREVIOUS RESPONSE]\n%s\n\n"
                     "[CALL RESULTS]\n%s\n\n"
-                    "[INSTRUCTION]\nYou made API calls above. The results are shown. "
+                    "[INSTRUCTION]\nYour actions above have been executed. The results are shown. "
                     "Continue your work based on these results. "
-                    "You may make more CALL/MEMORY/PROMPT lines as needed.",
+                    "You may use READ:/WRITE:/BASH:/CALL:/MEMORY:/PROMPT: as needed.",
                     output, call_results);
 
                 /* Free old prompt if it's not the original */
@@ -1867,6 +2108,11 @@ static void process_prompt(const char *filename) {
         free(output);
         break;
     }
+
+    /* Clear global all_output pointer */
+    g_all_output_ptr = NULL;
+    g_all_output_len_ptr = NULL;
+    g_all_output_cap_ptr = NULL;
 
     /* Close stream */
     stream_close(exit_code);

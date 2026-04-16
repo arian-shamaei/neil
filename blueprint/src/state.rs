@@ -306,10 +306,14 @@ pub fn load_command_log(neil_home: &PathBuf, prompt_name: &str) -> Vec<CommandLo
     let content = fs::read_to_string(&path).unwrap_or_default();
 
     // Extract the ## Output section content (between ```...```)
+    // The output is wrapped in a code fence. Inner code fences (from stream_action)
+    // also use ```, so we find the LAST ``` before the next ## section or EOF.
     let output = match content.find("## Output\n```\n") {
         Some(start) => {
             let body_start = start + "## Output\n```\n".len();
-            let body_end = content[body_start..].find("\n```")
+            let rest = &content[body_start..];
+            // Find closing: last \n``` before next ## section or end of file
+            let body_end = rest.rfind("\n```")
                 .map(|i| body_start + i)
                 .unwrap_or(content.len());
             &content[body_start..body_end]

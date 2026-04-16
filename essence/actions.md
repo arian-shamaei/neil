@@ -2,83 +2,109 @@
 
 Structured output lines parsed by autoPrompter.
 
-## MEMORY: -- store knowledge
-```
-MEMORY: wing=<domain> room=<topic> tags=<t1,t2> | <what to remember>
-```
+## READ: -- read a file
+````
+READ: /path/to/file
+````
+Returns file content in the next ReAct turn. Max 50KB.
 
-## CALL: -- API call (ReAct loop, max 3 turns)
-```
+## WRITE: -- write/create a file
+````
+WRITE: path=/path/to/file
+\```
+file content here
+\```
+````
+Overwrites or creates the file with the content in the code block.
+
+## BASH: -- run a shell command
+````
+BASH: ls -la ~/.neil/memory/palace/notes/
+BASH: grep -r "pattern" ~/.neil/essence/
+BASH: python3 script.py
+````
+Runs via sh, captures stdout+stderr, returns in next ReAct turn. 60s timeout.
+
+## MEMORY: -- store knowledge
+````
+MEMORY: wing=<domain> room=<topic> tags=<t1,t2> | <what to remember>
+````
+
+## CALL: -- API call (ReAct loop, max turns from config)
+````
 CALL: service=<name> action=<action> [param=value ...]
-```
+````
 
 ## NOTIFY: -- send outbound message (fire-and-forget)
-```
+````
 NOTIFY: channel=<terminal|file|email|slack> [param=value ...] | <message>
-```
+````
 
 ## PROMPT: -- self-prompt (max 1 per cycle)
-```
+````
 PROMPT: <next task or question>
-```
+````
 
 ## INTEND: -- defer a task for later
-```
+````
 INTEND: priority=<low|medium|high> [after=<30m|2h|1d>] [tag=<label>] | <what to do>
-```
+````
 
 ## DONE: -- complete an intention
-```
+````
 DONE: <keyword from intention description>
-```
+````
 
 ## FAIL: -- log a failure for review
-```
+````
 FAIL: source=<component> severity=<low|medium|high|critical> [context=<where>] | <what went wrong>
-```
-
-Failures surface in [OBSERVATIONS] on every heartbeat. Fix during idle beats.
+````
 
 ## HEARTBEAT: -- log beat status
-```
-HEARTBEAT: status=<ok|acted|error> summary="<what you did>"
-```
+````
+HEARTBEAT: status=<ok|acted|error>
+ACTION: <what you did>
+QUESTION: <a question you have>
+IMPROVEMENT: <small improvement>
+CONTRIBUTION: <larger creative thought>
+````
 
 ## Rules
+- READ before WRITE. Know what you are changing.
+- BASH for inspection and testing. WRITE for file changes.
 - One MEMORY per fact. Always assign wing and room.
 - Only CALL registered services. NOTIFY for fire-and-forget.
 - PROMPT only for genuine follow-up. INTEND for deferred work.
-- Always FAIL when something goes wrong. Review and fix during idle beats.
+- Always FAIL when something goes wrong.
 - Check memory before API calls. Check lessons.md before debugging.
 
-## Show rich content to the user (inline in chat)
+## Workflow example
 
-
-
-These render as rich widgets in the blueprint TUI. Use them to show
-the human code, diagrams, tables, and charts inline in conversation.
-
-Alternatively, use standard markdown code fences (```lang ... ```)
-which are also rendered as code blocks.
+````
+READ: /home/seal/.neil/self_check.sh
+````
+(autoPrompter returns file content)
+````
+The check on line 15 is wrong. Fixing it.
+WRITE: path=/home/seal/.neil/self_check.sh
+\```sh
+#!/bin/bash
+# ... corrected content ...
+\```
+BASH: bash /home/seal/.neil/self_check.sh
+````
+(autoPrompter returns script output)
+````
+All checks pass.
+MEMORY: wing=openclaw room=status | Fixed self_check.sh
+HEARTBEAT: status=acted
+ACTION: Fixed self_check.sh
+...
+````
 
 ## See something (visual capture via CALL)
 
-Use the vision service to see your surroundings:
-```
+````
 CALL: service=vision action=look
-CALL: service=vision action=pane target=main:0.0
-CALL: service=vision action=screenshot
 CALL: service=vision action=inbox
-CALL: service=vision action=list
-```
-
-Images and text captures come back through the ReAct loop.
-Users can drop images in vision/inbox/ for you to see.
-
-## Snapshots (before self-modification)
-
-Before editing any source file, run:
-
-
-To see recent snapshots: 
-To restore if something breaks: 
+````

@@ -48,8 +48,9 @@ check "handler.sh" "test -x $NEIL_HOME/services/handler.sh"
 check "observe.sh" "test -x $NEIL_HOME/tools/autoPrompter/observe.sh"
 check "heartbeat.sh" "test -x $NEIL_HOME/tools/autoPrompter/heartbeat.sh"
 
-# systemd
-check "autoprompt service" "systemctl is-active autoprompt"
+# Autoprompt invocation (cron-based)
+check "autoprompt cron" "crontab -l 2>/dev/null | grep -q heartbeat.sh"
+check "sentinel cron" "crontab -l 2>/dev/null | grep -q sentinel.sh"
 
 # Queue dirs
 check "queue dir" "test -d $NEIL_HOME/tools/autoPrompter/queue"
