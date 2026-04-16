@@ -22,7 +22,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap, Clear};
 use ratatui::Terminal;
 
 use state::NeilState;
-use stream::{StreamEntry, EntryKind, RichBlock};
+use stream::{StreamEntry, EntryKind, RichBlock, DiffLine};
 
 #[derive(Debug, Clone, PartialEq)]
 enum View {
@@ -199,7 +199,12 @@ fn main() -> anyhow::Result<()> {
                         .unwrap_or("");
                     let is_system_stream = is_system_prompt(stream_prompt_name);
 
-                    // Mark as active as soon as stream shows "running"
+                    // Detect new stream -- reset tracker when a new prompt appears
+                    if is_running && !stream_active && !is_done && display_body.is_empty() {
+                        last_stream_len = 0;
+                    }
+
+                    // Mark as active as soon as stream shows "running" (not yet done)
                     if is_running && !stream_active && !is_done {
                         stream_active = true;
                         prompt_pending = false;
@@ -215,7 +220,8 @@ fn main() -> anyhow::Result<()> {
                                     display_body.to_string(),
                                 );
                             }
-                        } else {
+                        } else if !is_done || !stream_active {
+                            // Create new entry only if not in a stale done state
                             if let Some(last) = stream.last() {
                                 if matches!(last.kind, EntryKind::System) {
                                     if last.blocks.first().map(|b| matches!(b, RichBlock::Text(t) if t.contains("sending to neil") || t.contains("thinking") || t.contains("queued"))).unwrap_or(false) {
@@ -235,15 +241,24 @@ fn main() -> anyhow::Result<()> {
                         needs_redraw = true;
                     }
 
+                    // On done: final flush -- re-parse entry with complete content
+                    // (catches stream_action output appended after Claude's text)
                     if is_done && stream_active {
+                        if !is_system_stream && !display_body.is_empty() {
+                            if let Some(idx) = live_entry_idx {
+                                if idx < stream.len() {
+                                    stream[idx] = StreamEntry::new(
+                                        EntryKind::Neil,
+                                        display_body.to_string(),
+                                    );
+                                    needs_redraw = true;
+                                }
+                            }
+                        }
                         stream_active = false;
                         live_entry_idx = None;
-                        skip_next_result = true; // result file will have same content
-                    }
-
-                    // Detect new stream (different prompt) -- reset len tracker
-                    if is_running && !stream_active && display_body.is_empty() {
-                        last_stream_len = 0;
+                        // Keep last_stream_len so we don't re-read this same stream
+                        skip_next_result = true;
                     }
                 }
             }
@@ -267,16 +282,10 @@ fn main() -> anyhow::Result<()> {
                 check_new_results(&history_dir, &mut stream, &mut activity, &mut last_history_count, &mut auto_scroll);
                 // Dedup: if the new entry matches ANY recent Neil entry, remove it
                 if stream.len() > prev_len {
-                    let new_text = stream.last().and_then(|e| e.blocks.first().map(|b| match b {
-                        RichBlock::Text(t) => t.clone(), _ => String::new()
-                    })).unwrap_or_default();
-                    if !new_text.is_empty() {
+                    let new_hint = stream.last().map(|e| e.total_text_len()).unwrap_or(0);
+                    if new_hint > 0 {
                         let is_dup = stream.iter().rev().skip(1).take(5).any(|e| {
-                            matches!(e.kind, EntryKind::Neil) &&
-                            e.blocks.first().map(|b| match b {
-                                RichBlock::Text(t) => t == &new_text,
-                                _ => false,
-                            }).unwrap_or(false)
+                            matches!(e.kind, EntryKind::Neil) && e.total_text_len() == new_hint
                         });
                         if is_dup {
                             stream.pop();
@@ -726,49 +735,108 @@ fn build_chat_lines(stream: &[StreamEntry], wrap_width: usize) -> Vec<Line<'stat
                 RichBlock::Text(t) => {
                     for wrapped in wrap_text(t, wrap_width) {
                         let trimmed = wrapped.trim_start();
-                        let style = if trimmed.starts_with("MEMORY:") || trimmed.starts_with("CALL:")
-                            || trimmed.starts_with("NOTIFY:") || trimmed.starts_with("HEARTBEAT:")
-                            || trimmed.starts_with("INTEND:") || trimmed.starts_with("DONE:")
-                            || trimmed.starts_with("FAIL:") || trimmed.starts_with("SHOW:")
-                        {
-                            // Action lines: magenta with arrow prefix
-                            Style::default().fg(Color::Magenta)
-                        } else if trimmed.starts_with("$ ") || trimmed.starts_with("❯ ") {
-                            // Shell commands
+                        let style = if trimmed.starts_with("$ ") || trimmed.starts_with("> ") {
                             Style::default().fg(Color::Yellow)
-                        } else if trimmed.starts_with("✓ ") || trimmed.starts_with("✔ ") {
-                            // Success
-                            Style::default().fg(Color::Green)
-                        } else if trimmed.starts_with("✗ ") || trimmed.starts_with("✘ ") || trimmed.starts_with("ERROR") {
-                            // Error
-                            Style::default().fg(Color::Red)
-                        } else if trimmed.starts_with("→ ") || trimmed.starts_with("- ") {
-                            // List items / steps
-                            Style::default().fg(Color::Cyan)
-                        } else if trimmed.starts_with("**") || trimmed.starts_with("##") {
-                            // Bold headers
+                        } else if trimmed.starts_with("##") {
                             Style::default().fg(text_color).add_modifier(Modifier::BOLD)
+                        } else if trimmed.starts_with("**") && trimmed.ends_with("**") {
+                            Style::default().fg(text_color).add_modifier(Modifier::BOLD)
+                        } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+                            Style::default().fg(Color::Cyan)
                         } else if trimmed.contains("~/") || trimmed.contains("/.neil/")
-                            || trimmed.contains("/home/") || trimmed.contains(".md")
-                            || trimmed.contains(".rs") || trimmed.contains(".py")
-                            || trimmed.contains(".json") || trimmed.contains(".sh")
+                            || trimmed.contains("/home/")
                         {
-                            // File paths
                             Style::default().fg(Color::Rgb(180, 180, 220))
                         } else {
                             Style::default().fg(text_color)
                         };
+                        lines.push(Line::from(Span::styled(format!("  {}", wrapped), style)));
+                    }
+                }
+                RichBlock::ToolCall { action, detail } => {
+                    let border_w = wrap_width.saturating_sub(4);
+                    let (icon, action_color) = match action.as_str() {
+                        "MEMORY" => (">>", Color::Rgb(180, 130, 255)),  // purple
+                        "CALL"   => ("->", Color::Rgb(100, 200, 255)),  // blue
+                        "INTEND" => ("++", Color::Rgb(255, 200, 100)),  // amber
+                        "DONE"   => ("OK", Color::Green),
+                        "FAIL"   => ("!!", Color::Red),
+                        "NOTIFY" => ("<>", Color::Rgb(255, 180, 100)),  // orange
+                        "HEARTBEAT" => ("~~", Color::Rgb(100, 180, 255)), // light blue
+                        "PROMPT" => ("?>", Color::Rgb(200, 200, 100)),  // yellow-ish
+                        _ => ("--", Color::Magenta),
+                    };
+                    // Render as a compact action card
+                    let header = format!("  {} {}: {}", icon, action, truncate_str(detail, border_w.saturating_sub(action.len() + 6)));
+                    lines.push(Line::from(Span::styled(header, Style::default().fg(action_color))));
+                }
+                RichBlock::FileEdit { path, lang, lines: diff_lines } => {
+                    let border_w = wrap_width.saturating_sub(4);
+                    let added = diff_lines.iter().filter(|l| matches!(l, DiffLine::Added(_))).count();
+                    let removed = diff_lines.iter().filter(|l| matches!(l, DiffLine::Removed(_))).count();
 
-                        // Prefix action lines with arrow
-                        let display = if trimmed.starts_with("MEMORY:") || trimmed.starts_with("CALL:")
-                            || trimmed.starts_with("NOTIFY:") || trimmed.starts_with("INTEND:")
-                            || trimmed.starts_with("FAIL:")
-                        {
-                            format!("  ▸ {}", wrapped)
-                        } else {
-                            format!("  {}", wrapped)
+                    // Header: file path with change summary
+                    let path_display = if path.is_empty() { "file".to_string() } else { path.clone() };
+                    let change_summary = if added > 0 || removed > 0 {
+                        let mut parts = Vec::new();
+                        if added > 0 { parts.push(format!("+{}", added)); }
+                        if removed > 0 { parts.push(format!("-{}", removed)); }
+                        format!(" ({})", parts.join(", "))
+                    } else {
+                        String::new()
+                    };
+
+                    let label = format!(" {} {}{} ", lang, path_display, change_summary);
+                    let pad = border_w.saturating_sub(label.len());
+                    lines.push(Line::from(vec![
+                        Span::styled("  ┌─".to_string(), Style::default().fg(Color::Rgb(80, 80, 80))),
+                        Span::styled(label, Style::default().fg(Color::Rgb(180, 180, 220)).add_modifier(Modifier::BOLD)),
+                        Span::styled("─".repeat(pad), Style::default().fg(Color::Rgb(80, 80, 80))),
+                    ]));
+
+                    // Diff lines with coloring
+                    for dl in diff_lines {
+                        let (prefix_char, text, style) = match dl {
+                            DiffLine::Added(t) => ("+", t.as_str(), Style::default().fg(Color::Green)),
+                            DiffLine::Removed(t) => ("-", t.as_str(), Style::default().fg(Color::Red)),
+                            DiffLine::Context(t) => {
+                                if t.starts_with("@@") {
+                                    ("@", t.as_str(), Style::default().fg(Color::Rgb(100, 100, 200)))
+                                } else {
+                                    (" ", t.as_str(), Style::default().fg(Color::Rgb(140, 140, 140)))
+                                }
+                            }
                         };
-                        lines.push(Line::from(Span::styled(display, style)));
+                        let display = format!("  {} {} {}", "|", prefix_char, text);
+                        let truncated = truncate_str(&display, wrap_width);
+                        lines.push(Line::from(Span::styled(truncated.to_string(), style)));
+                    }
+
+                    lines.push(Line::from(Span::styled(
+                        format!("  └{}", "─".repeat(border_w)),
+                        Style::default().fg(Color::Rgb(80, 80, 80)),
+                    )));
+                }
+                RichBlock::Command { cmd, output } => {
+                    let border_w = wrap_width.saturating_sub(4);
+                    // Command header
+                    lines.push(Line::from(vec![
+                        Span::styled("  $ ".to_string(), Style::default().fg(Color::Rgb(100, 200, 100))),
+                        Span::styled(
+                            truncate_str(cmd, border_w.saturating_sub(2)).to_string(),
+                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                    // Output (dimmed, indented)
+                    if !output.is_empty() {
+                        for ol in output.lines() {
+                            let display = format!("    {}", ol);
+                            let truncated = truncate_str(&display, wrap_width);
+                            lines.push(Line::from(Span::styled(
+                                truncated.to_string(),
+                                Style::default().fg(Color::Rgb(140, 140, 140)),
+                            )));
+                        }
                     }
                 }
                 RichBlock::Code { lang, content } => {
@@ -779,7 +847,7 @@ fn build_chat_lines(stream: &[StreamEntry], wrap_width: usize) -> Vec<Line<'stat
                     )));
                     for cl in content.lines() {
                         lines.push(Line::from(Span::styled(
-                            format!("  │ {}", cl), Style::default().fg(Color::Yellow),
+                            format!("  | {}", cl), Style::default().fg(Color::Yellow),
                         )));
                     }
                     lines.push(Line::from(Span::styled(
@@ -794,7 +862,7 @@ fn build_chat_lines(stream: &[StreamEntry], wrap_width: usize) -> Vec<Line<'stat
                     )));
                     for dl in d.lines() {
                         lines.push(Line::from(Span::styled(
-                            format!("  │ {}", dl), Style::default().fg(Color::Cyan),
+                            format!("  | {}", dl), Style::default().fg(Color::Cyan),
                         )));
                     }
                     lines.push(Line::from(Span::styled(
@@ -827,7 +895,7 @@ fn build_chat_lines(stream: &[StreamEntry], wrap_width: usize) -> Vec<Line<'stat
                         let label = labels.get(i).map(|s| s.as_str()).unwrap_or("?");
                         let bw = if max > 0.0 { (val / max * bar_max as f64) as usize } else { 0 };
                         lines.push(Line::from(Span::styled(
-                            format!("  {:<5} {}{} {}", label, "█".repeat(bw), "░".repeat(bar_max - bw), val),
+                            format!("  {:<5} {}{} {}", label, "=".repeat(bw), ".".repeat(bar_max - bw), val),
                             Style::default().fg(Color::Cyan),
                         )));
                     }
@@ -837,6 +905,20 @@ fn build_chat_lines(stream: &[StreamEntry], wrap_width: usize) -> Vec<Line<'stat
         lines.push(Line::from(""));
     }
     lines
+}
+
+/// Truncate a string to fit within max_width characters
+fn truncate_str(s: &str, max_width: usize) -> &str {
+    if s.len() <= max_width {
+        s
+    } else {
+        // Find a safe char boundary
+        let mut end = max_width;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
+    }
 }
 
 /// Render the stream view using pre-built cached lines (cheap per frame)
@@ -1186,13 +1268,7 @@ fn render_memory_panel(s: &NeilState) -> Vec<Line<'static>> {
 
 fn render_heartbeat_panel(s: &NeilState) -> Vec<Line<'static>> {
     let mut l = vec![
-        Line::from(Span::styled(
-            match s.max_daily_beats {
-                Some(cap) => format!("Beats today: {}/{} | Last: {}", s.heartbeat.beats_today, cap, s.heartbeat.last_beat),
-                None => format!("Beats today: {} | Last: {}", s.heartbeat.beats_today, s.heartbeat.last_beat),
-            },
-            Style::default().fg(Color::Cyan),
-        )),
+        Line::from(Span::styled(format!("Beats today: {}/50 | Last: {}", s.heartbeat.beats_today, s.heartbeat.last_beat), Style::default().fg(Color::Cyan))),
         Line::from(""),
     ];
     for e in &s.heartbeat.entries {

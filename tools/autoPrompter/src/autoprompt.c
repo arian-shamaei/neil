@@ -65,6 +65,7 @@ static char g_current_prompt_name[256] = "";     /* filename of prompt being pro
 
 /* Forward declarations */
 static void timestamp_now(char *buf, size_t cap);
+static void stream_action(const char *prefix, const char *detail, const char *cmd, const char *output);
 
 /*
  * Resolve all paths from NEIL_HOME environment variable.
@@ -507,6 +508,14 @@ static void extract_memories(const char *output) {
             char *result = run_command(cmd);
             if (result) {
                 fprintf(stderr, "[autoprompt] stored memory: %s", result);
+                /* Stream the memory write so TUI shows it */
+                {
+                    char mem_detail[512];
+                    snprintf(mem_detail, sizeof(mem_detail), "wing=%s room=%s | %.200s",
+                             wing[0] ? wing : "default", room[0] ? room : "inbox",
+                             body);
+                    stream_action("MEMORY", mem_detail, cmd, result);
+                }
                 free(result);
             }
         }
@@ -523,6 +532,7 @@ static void reindex_mempalace(void) {
     char *result = run_command(cmd);
     if (result) {
         fprintf(stderr, "[autoprompt] mempalace reindexed\n");
+        stream_action(NULL, NULL, "mempalace mine", result);
         free(result);
     }
 }
@@ -716,6 +726,15 @@ static void record_intentions(const char *output) {
 
         fprintf(stderr, "[autoprompt] INTEND: %s [%s] due:%s\n",
                 esc_desc, priority, due[0] ? due : "now");
+
+        /* Stream intention so TUI shows it */
+        {
+            char intend_detail[512];
+            snprintf(intend_detail, sizeof(intend_detail),
+                     "priority=%s due=%s | %s", priority,
+                     due[0] ? due : "now", esc_desc);
+            stream_action("INTEND", intend_detail, NULL, NULL);
+        }
 
         p = eol;
     }
@@ -1074,6 +1093,14 @@ static char *execute_service_calls(const char *output) {
         fprintf(stderr, "[autoprompt] CALL: service=%s action=%s\n", service, action);
         char *call_result = run_command(handler_cmd);
 
+        /* Stream the service call so TUI shows it */
+        {
+            char call_detail[256];
+            snprintf(call_detail, sizeof(call_detail), "service=%s action=%s %s",
+                     service, action, params);
+            stream_action("CALL", call_detail, handler_cmd, call_result);
+        }
+
         /* Clear credential from memory */
         memset(cred, 0, cred_len);
         free(cred);
@@ -1149,6 +1176,48 @@ static void stream_close(int exit_code) {
         dprintf(g_stream_fd, "\n{\"status\":\"done\",\"exit_code\":%d}\n", exit_code);
         close(g_stream_fd);
         g_stream_fd = -1;
+    }
+}
+
+/* Write a structured action block to the stream so the TUI can render it.
+ * Emits a bash code fence for commands, or an action prefix line. */
+static void stream_action(const char *prefix, const char *detail,
+                           const char *cmd, const char *output) {
+    if (g_stream_fd < 0) return;
+    char buf[8192];
+    int n = 0;
+    if (cmd && cmd[0]) {
+        /* Command block: renders as Command in TUI */
+        n = snprintf(buf, sizeof(buf), "\n```bash\n$ %s\n", cmd);
+        if (output && output[0]) {
+            /* Truncate output to first 20 lines */
+            const char *p = output;
+            int lines = 0;
+            while (*p && lines < 20) {
+                const char *nl = strchr(p, '\n');
+                if (!nl) nl = p + strlen(p);
+                size_t ll = (size_t)(nl - p);
+                if (n + (int)ll + 2 < (int)sizeof(buf)) {
+                    memcpy(buf + n, p, ll);
+                    n += (int)ll;
+                    buf[n++] = '\n';
+                }
+                p = (*nl) ? nl + 1 : nl;
+                lines++;
+            }
+            if (*p) {
+                n += snprintf(buf + n, sizeof(buf) - n, "... (truncated)\n");
+            }
+        }
+        n += snprintf(buf + n, sizeof(buf) - n, "```\n");
+    }
+    /* Always write the action prefix line if given */
+    if (prefix && prefix[0]) {
+        n += snprintf(buf + n, sizeof(buf) - n, "%s: %s\n",
+                      prefix, detail ? detail : "");
+    }
+    if (n > 0) {
+        stream_write(buf, (size_t)n);
     }
 }
 
