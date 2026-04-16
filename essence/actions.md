@@ -1,6 +1,26 @@
 # Action Formats
 
-Structured output lines parsed by autoPrompter.
+These are the ONLY way you can affect the system. Prose descriptions
+of work do NOT execute anything. If you write "I edited the file",
+nothing changed. You must use the action lines below.
+
+## CRITICAL PARSING RULES
+
+Action lines are parsed by a C program using exact string matching.
+They MUST appear at the start of a line with NO formatting:
+
+  CORRECT:  BASH: ls -la /tmp
+  WRONG:    **BASH: ls -la /tmp**
+  WRONG:    `BASH: ls -la /tmp`
+  WRONG:    - BASH: ls -la /tmp
+  WRONG:    > BASH: ls -la /tmp
+
+No bold, no backticks, no bullets, no quotes, no indentation.
+The parser does strncmp(line, "BASH:", 5) -- if the line does
+not start with the exact action prefix, it is ignored silently.
+
+Output action lines FIRST, then your commentary AFTER.
+Do not mix prose and action lines on the same line.
 
 ## READ: -- read a file
 ````

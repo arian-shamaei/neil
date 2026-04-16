@@ -1469,11 +1469,8 @@ static char *execute_tool_actions(const char *output) {
 
             fprintf(stderr, "[autoprompt] WRITE: %s (%zu bytes)\n", wpath, content_len);
 
-            /* Write the file */
-            int fd = open(wpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd >= 0) {
-                ssize_t w = write(fd, content_start, content_len);
-                close(fd);
+            /* Write the file atomically (handles partial writes, fsync, rename) */
+            if (write_file_atomic(wpath, content_start, content_len) == 0) {
                 results_len += snprintf(results + results_len, results_cap - results_len,
                     "[WRITE %s] %zu bytes written\n\n", wpath, content_len);
 

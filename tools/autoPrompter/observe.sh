@@ -116,6 +116,17 @@ echo "=== Work Pattern ==="
 $HOME/.neil/self/beat_taxonomy.sh 2>/dev/null || echo "taxonomy: unavailable"
 
 echo ""
+echo "=== Retrospective ==="
+# Quick 3C cycle + recommendation from beat_retrospective
+RETRO=$($HOME/.neil/tools/beat_retrospective.sh 2>/dev/null)
+if [ -n "$RETRO" ]; then
+    echo "$RETRO" | sed -n '/## 3C Cycle Phase/,/^$/p' | grep -v '^##' | grep -v '^$' | head -4
+    echo "$RETRO" | sed -n '/## Recommendations/,/^$/p' | grep -v '^##' | grep -v '^$' | head -3
+else
+    echo "retrospective: unavailable"
+fi
+
+echo ""
 echo "=== Question Follow-through ==="
 $HOME/.neil/self/question_tracker.sh 2>/dev/null || echo "questions: unavailable"
 
