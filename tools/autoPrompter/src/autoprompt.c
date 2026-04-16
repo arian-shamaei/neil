@@ -1887,6 +1887,60 @@ static void process_prompt(const char *filename) {
     free(prompt);
 }
 
+/* Check if the last heartbeat was recent (within threshold_sec).
+ * Reads the last "timestamp" field from heartbeat_log.json.
+ * Returns 1 if recent, 0 if stale or unreadable.
+ * Format expected: "timestamp":"2026-04-16T00-23-24" */
+static int last_heartbeat_recent(int threshold_sec) {
+    char hb_path[MAX_PATH];
+    snprintf(hb_path, sizeof(hb_path), "%s/heartbeat_log.json", g_neil_home);
+
+    size_t hlen;
+    char *hdata = read_file(hb_path, &hlen);
+    if (!hdata) return 0;
+
+    /* Find the LAST "timestamp":" in the file */
+    const char *needle = "\"timestamp\":\"";
+    char *last_ts = NULL;
+    char *p = hdata;
+    while ((p = strstr(p, needle)) != NULL) {
+        last_ts = p + strlen(needle);
+        p = last_ts;
+    }
+
+    if (!last_ts) { free(hdata); return 0; }
+
+    /* Parse: 2026-04-16T00-23-24 */
+    int yr, mo, dy, hr, mn, sc;
+    if (sscanf(last_ts, "%d-%d-%dT%d-%d-%d", &yr, &mo, &dy, &hr, &mn, &sc) != 6) {
+        free(hdata);
+        return 0;
+    }
+    free(hdata);
+
+    struct tm beat_tm = {0};
+    beat_tm.tm_year = yr - 1900;
+    beat_tm.tm_mon = mo - 1;
+    beat_tm.tm_mday = dy;
+    beat_tm.tm_hour = hr;
+    beat_tm.tm_min = mn;
+    beat_tm.tm_sec = sc;
+    beat_tm.tm_isdst = -1;
+
+    time_t beat_time = mktime(&beat_tm);
+    time_t now = time(NULL);
+
+    if (beat_time == (time_t)-1) return 0;
+
+    int diff = (int)difftime(now, beat_time);
+    if (diff < threshold_sec) {
+        printf("[autoprompt] wakeup dedup: last heartbeat %ds ago (threshold %ds), skipping wakeup\n",
+               diff, threshold_sec);
+        return 1;
+    }
+    return 0;
+}
+
 /* Drain any .md files already in queue/ on startup. */
 static void drain_existing(void) {
     DIR *d = opendir(g_queue_dir);
@@ -1940,21 +1994,26 @@ int main(int argc, char **argv) {
     /* Crash recovery: move any active/ files back to queue/ */
     recover_active();
 
-    /* Queue wake-up prompt on startup */
+    /* Queue wake-up prompt on startup (with dedup guard) */
     {
         char wakeup_src[MAX_PATH], wakeup_dst[MAX_PATH];
         snprintf(wakeup_src, sizeof(wakeup_src), "%s/essence/wakeup.md", g_neil_home);
         if (access(wakeup_src, F_OK) == 0) {
-            char ts[64];
-            timestamp_now(ts, sizeof(ts));
-            snprintf(wakeup_dst, sizeof(wakeup_dst), "%s/%s_wakeup.md", g_queue_dir, ts);
+            /* Skip wakeup if last heartbeat was < 10 minutes ago */
+            if (last_heartbeat_recent(600)) {
+                printf("[autoprompt] wake-up skipped (recent heartbeat)\n");
+            } else {
+                char ts[64];
+                timestamp_now(ts, sizeof(ts));
+                snprintf(wakeup_dst, sizeof(wakeup_dst), "%s/%s_wakeup.md", g_queue_dir, ts);
 
-            size_t wlen;
-            char *wdata = read_file(wakeup_src, &wlen);
-            if (wdata) {
-                write_file_atomic(wakeup_dst, wdata, wlen);
-                free(wdata);
-                printf("[autoprompt] wake-up prompt queued\n");
+                size_t wlen;
+                char *wdata = read_file(wakeup_src, &wlen);
+                if (wdata) {
+                    write_file_atomic(wakeup_dst, wdata, wlen);
+                    free(wdata);
+                    printf("[autoprompt] wake-up prompt queued\n");
+                }
             }
         }
     }
