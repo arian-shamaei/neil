@@ -344,6 +344,27 @@ static char *build_augmented_prompt(const char *raw_prompt, char **out_essence) 
         g_mempalace_venv, g_mempalace_palace, escaped);
     char *memories = run_command(search_cmd);
 
+    /* 4b. Reinforce found memories (memory decay system) */
+    if (memories && memories[0]) {
+        char reinforce_cmd[2048];
+        snprintf(reinforce_cmd, sizeof(reinforce_cmd),
+            "echo '%s' | %s/self/reinforce_from_search.sh 2>/dev/null",
+            "$(echo \"$MEMORIES\" | head -20)", g_neil_home);
+        /* Write memories to temp file for safe parsing (avoids shell escaping) */
+        char tmpfile[MAX_PATH];
+        snprintf(tmpfile, sizeof(tmpfile), "/tmp/neil_memresults_%d", getpid());
+        FILE *tf = fopen(tmpfile, "w");
+        if (tf) {
+            fputs(memories, tf);
+            fclose(tf);
+            snprintf(reinforce_cmd, sizeof(reinforce_cmd),
+                "%s/self/reinforce_from_search.sh < %s 2>/dev/null; rm -f %s",
+                g_neil_home, tmpfile, tmpfile);
+            char *r = run_command(reinforce_cmd);
+            if (r) free(r);
+        }
+    }
+
     /* 5. Build augmented prompt */
     size_t raw_len = strlen(raw_prompt);
     size_t obs_len = observations ? strlen(observations) : 0;

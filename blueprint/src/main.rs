@@ -83,6 +83,7 @@ fn main() -> anyhow::Result<()> {
     let history_dir = neil_home.join("tools/autoPrompter/history");
 
     let mut stream: Vec<StreamEntry> = Vec::new();
+    let mut activity: Vec<String> = Vec::new(); // heartbeat/system activity (shown in sidebar)
     let mut input = String::new();
     let mut cursor_pos: usize = 0;
     let mut scroll_offset: i32 = 0;
@@ -153,7 +154,7 @@ fn main() -> anyhow::Result<()> {
         EntryKind::System,
         "Neil is online. Type a message and press Enter. Tab for panels.".into(),
     ));
-    load_history(&history_dir, &mut stream, &mut last_history_count);
+    load_history(&history_dir, &mut stream, &mut activity, &mut last_history_count);
 
     // Target ~30 FPS for smooth rendering, but only poll files slowly
     // render_rate removed: now using event-driven + 100ms animation timer
@@ -192,6 +193,12 @@ fn main() -> anyhow::Result<()> {
                         body
                     };
 
+                    // Extract prompt name from header
+                    let stream_prompt_name = header.split("\"prompt\":\"").nth(1)
+                        .and_then(|s| s.split('"').next())
+                        .unwrap_or("");
+                    let is_system_stream = is_system_prompt(stream_prompt_name);
+
                     // Mark as active as soon as stream shows "running"
                     if is_running && !stream_active && !is_done {
                         stream_active = true;
@@ -199,7 +206,8 @@ fn main() -> anyhow::Result<()> {
                         needs_redraw = true;
                     }
 
-                    if is_running && display_body.len() > last_stream_len {
+                    // Only show in chat if it's a user prompt, not heartbeat/system
+                    if is_running && !is_system_stream && display_body.len() > last_stream_len {
                         if let Some(idx) = live_entry_idx {
                             if idx < stream.len() {
                                 stream[idx] = StreamEntry::new(
@@ -256,7 +264,7 @@ fn main() -> anyhow::Result<()> {
                 skip_next_result = false;
             } else {
                 let prev_len = stream.len();
-                check_new_results(&history_dir, &mut stream, &mut last_history_count, &mut auto_scroll);
+                check_new_results(&history_dir, &mut stream, &mut activity, &mut last_history_count, &mut auto_scroll);
                 // Dedup: if the new entry matches ANY recent Neil entry, remove it
                 if stream.len() > prev_len {
                     let new_text = stream.last().and_then(|e| e.blocks.first().map(|b| match b {
@@ -332,7 +340,7 @@ fn main() -> anyhow::Result<()> {
                                 .constraints([Constraint::Min(40), Constraint::Length(28)])
                                 .split(size);
                             render_stream_cached(frame, h[0], &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured, stream_active, prompt_pending, tick);
-                            render_sidebar(frame, h[1], state, &cached_seal_lines, stream_active, tick);
+                            render_sidebar(frame, h[1], state, &cached_seal_lines, stream_active, tick, &activity);
                         } else {
                             render_stream_cached(frame, size, &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured, stream_active, prompt_pending, tick);
                         }
@@ -344,7 +352,7 @@ fn main() -> anyhow::Result<()> {
                                 .constraints([Constraint::Min(40), Constraint::Length(28)])
                                 .split(size);
                             render_stream_cached(frame, h[0], &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured, stream_active, prompt_pending, tick);
-                            render_sidebar(frame, h[1], state, &cached_seal_lines, stream_active, tick);
+                            render_sidebar(frame, h[1], state, &cached_seal_lines, stream_active, tick, &activity);
                         } else {
                             render_stream_cached(frame, size, &cached_chat_lines, &input, cursor_pos, scroll_offset, fps.fps, mouse_captured, stream_active, prompt_pending, tick);
                         }
@@ -984,7 +992,7 @@ fn render_stream_cached(
     );
 }
 
-fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState, seal_lines_raw: &[String], stream_active: bool, tick: u64) {
+fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState, seal_lines_raw: &[String], stream_active: bool, tick: u64, activity: &[String]) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1018,21 +1026,40 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState, sea
         chunks[1],
     );
 
+    // Activity panel -- recent heartbeat summaries + pending intents
+    let mut inbox_lines = Vec::new();
+
+    // Show recent activity (heartbeat summaries)
+    if !activity.is_empty() {
+        for act in activity.iter().rev().take(4) {
+            inbox_lines.push(Line::from(Span::styled(
+                format!(" {}", act.chars().take(24).collect::<String>()),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    // Show pending intents below activity
     let pending: Vec<_> = state.intentions.iter().filter(|i| i.status == "pending").collect();
-    let mut intent_lines = Vec::new();
-    if pending.is_empty() {
-        intent_lines.push(Line::from(Span::styled(" (none)", Style::default().fg(Color::DarkGray))));
-    } else {
-        for i in pending.iter().take(5) {
+    if !pending.is_empty() {
+        if !inbox_lines.is_empty() {
+            inbox_lines.push(Line::from(Span::styled(" ───", Style::default().fg(Color::Rgb(40, 40, 40)))));
+        }
+        for i in pending.iter().take(3) {
             let color = match i.priority.as_str() { "high" => Color::Red, "medium" => Color::Yellow, _ => Color::Green };
-            intent_lines.push(Line::from(vec![
+            inbox_lines.push(Line::from(vec![
                 Span::styled(format!(" [{}] ", i.priority.chars().next().unwrap_or('?')), Style::default().fg(color)),
                 Span::styled(i.description.chars().take(18).collect::<String>(), Style::default().fg(Color::DarkGray)),
             ]));
         }
     }
+
+    if inbox_lines.is_empty() {
+        inbox_lines.push(Line::from(Span::styled(" (quiet)", Style::default().fg(Color::DarkGray))));
+    }
+
     frame.render_widget(
-        Paragraph::new(intent_lines).block(Block::default().borders(Borders::ALL).title(" intents ").border_style(Style::default().fg(Color::DarkGray))),
+        Paragraph::new(inbox_lines).block(Block::default().borders(Borders::ALL).title(" activity ").border_style(Style::default().fg(Color::DarkGray))),
         chunks[2],
     );
 
@@ -1224,25 +1251,49 @@ fn render_logs_panel() -> Vec<Line<'static>> {
 
 // ── Helpers ──
 
-fn load_history(hd: &PathBuf, stream: &mut Vec<StreamEntry>, count: &mut usize) {
+fn load_history(hd: &PathBuf, stream: &mut Vec<StreamEntry>, activity: &mut Vec<String>, count: &mut usize) {
     if let Ok(entries) = fs::read_dir(hd) {
         let mut rf: Vec<_> = entries.filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().ends_with(".result.md")).collect();
         rf.sort_by_key(|e| e.file_name());
-        let recent = if rf.len() > 5 { &rf[rf.len()-5..] } else { &rf[..] };
+        let recent = if rf.len() > 10 { &rf[rf.len()-10..] } else { &rf[..] };
         for entry in recent {
+            let fname = entry.file_name().to_string_lossy().to_string();
             if let Ok(c) = fs::read_to_string(entry.path()) {
                 let p = extract_between(&c, "## Prompt\n```\n", "\n```");
                 let o = extract_between(&c, "## Output\n```\n", "\n```");
-                if let Some(p) = p { if !p.starts_with("# Heartbeat") && !p.starts_with("# Wake Up") { stream.push(StreamEntry::new(EntryKind::Human, p)); } }
-                if let Some(o) = o { if !o.is_empty() { stream.push(StreamEntry::new(EntryKind::Neil, o)); } }
+
+                if is_system_prompt(&fname) {
+                    // System prompt -> activity panel
+                    if let Some(o) = o {
+                        // Extract just the HEARTBEAT summary line
+                        for line in o.lines() {
+                            if line.starts_with("HEARTBEAT:") {
+                                if let Some(sum) = line.split("summary=\"").nth(1) {
+                                    let sum = sum.trim_end_matches('"');
+                                    activity.push(sum.chars().take(60).collect());
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // User prompt -> chat stream
+                    if let Some(p) = p {
+                        stream.push(StreamEntry::new(EntryKind::Human, p));
+                    }
+                    if let Some(o) = o {
+                        if !o.is_empty() {
+                            stream.push(StreamEntry::new(EntryKind::Neil, o));
+                        }
+                    }
+                }
             }
         }
         *count = rf.len();
     }
 }
 
-fn check_new_results(hd: &PathBuf, stream: &mut Vec<StreamEntry>, count: &mut usize, auto_scroll: &mut bool) {
+fn check_new_results(hd: &PathBuf, stream: &mut Vec<StreamEntry>, activity: &mut Vec<String>, count: &mut usize, auto_scroll: &mut bool) {
     if let Ok(entries) = fs::read_dir(hd) {
         let rf: Vec<_> = entries.filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().ends_with(".result.md")).collect();
@@ -1250,18 +1301,33 @@ fn check_new_results(hd: &PathBuf, stream: &mut Vec<StreamEntry>, count: &mut us
             let mut sorted: Vec<_> = rf.iter().collect();
             sorted.sort_by_key(|e| e.file_name());
             if let Some(latest) = sorted.last() {
+                let fname = latest.file_name().to_string_lossy().to_string();
                 if let Ok(c) = fs::read_to_string(latest.path()) {
                     if let Some(o) = extract_between(&c, "## Output\n```\n", "\n```") {
                         if !o.is_empty() {
-                            if let Some(last) = stream.last() {
-                                if matches!(last.kind, EntryKind::System) {
-                                    if last.blocks.first().map(|b| matches!(b, RichBlock::Text(t) if t.contains("sending to neil") || t.contains("thinking") || t.contains("queued"))).unwrap_or(false) {
-                                        stream.pop();
+                            if is_system_prompt(&fname) {
+                                // System -> activity panel only
+                                for line in o.lines() {
+                                    if line.starts_with("HEARTBEAT:") {
+                                        if let Some(sum) = line.split("summary=\"").nth(1) {
+                                            let sum = sum.trim_end_matches('"');
+                                            activity.push(sum.chars().take(60).collect());
+                                            if activity.len() > 20 { activity.drain(..10); }
+                                        }
                                     }
                                 }
+                            } else {
+                                // User chat -> stream
+                                if let Some(last) = stream.last() {
+                                    if matches!(last.kind, EntryKind::System) {
+                                        if last.blocks.first().map(|b| matches!(b, RichBlock::Text(t) if t.contains("sending to neil") || t.contains("thinking") || t.contains("queued"))).unwrap_or(false) {
+                                            stream.pop();
+                                        }
+                                    }
+                                }
+                                stream.push(StreamEntry::new(EntryKind::Neil, o));
+                                *auto_scroll = true;
                             }
-                            stream.push(StreamEntry::new(EntryKind::Neil, o));
-                            *auto_scroll = true;
                         }
                     }
                 }
@@ -1269,6 +1335,13 @@ fn check_new_results(hd: &PathBuf, stream: &mut Vec<StreamEntry>, count: &mut us
             *count = rf.len();
         }
     }
+}
+
+fn is_system_prompt(filename: &str) -> bool {
+    filename.contains("heartbeat") || filename.contains("wakeup")
+        || filename.contains("_sched_") || filename.contains("_fs_")
+        || filename.contains("_webhook") || filename.contains("_mirror_")
+        || filename.contains("_vision")
 }
 
 fn extract_between(c: &str, start: &str, end: &str) -> Option<String> {

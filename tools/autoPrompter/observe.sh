@@ -204,6 +204,10 @@ if [ "$INBOX_COUNT" -gt 0 ]; then
 fi
 
 echo ""
+echo "=== Memory Decay ==="
+$HOME/.neil/self/memory_decay.sh decaying 2>/dev/null || echo "decay: unavailable"
+
+echo ""
 echo "=== Stream ==="
 if [ -f "\$HOME/.neil/.neil_stream" ]; then
     HEAD=\$(head -1 "\$HOME/.neil/.neil_stream" 2>/dev/null)
