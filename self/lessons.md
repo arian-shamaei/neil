@@ -81,3 +81,12 @@ Patterns and gotchas discovered through experience. Read on every invocation.
 - Mic Device [0] at 16kHz (Device 7 clips badly).
 - Service account cant upload to personal Gmail Drive. Use OAuth2.
 - Speech bubble shows actual RESPONSES, not status/activity text.
+
+## Architecture Patterns
+
+- System 1/System 2 dual-process: use lightweight sentinel (sentinel.sh, 5 min)
+  for fast event detection, only escalate to expensive Claude beat when something
+  actionable is detected. Reduces latency from 30 min to 5 min at zero API cost.
+- "Contract audit" pattern: when you discover a library constraint (e.g., ChromaDB
+  n_results <= count), grep for EVERY call site and fix them all, not just the
+  one that crashed.
