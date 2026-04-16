@@ -26,6 +26,7 @@
 #include <sys/inotify.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/select.h>
 #include <fcntl.h>
 #include <ctype.h>
 
@@ -42,6 +43,7 @@ static char g_ai_args[MAX_PATH];
 static char g_ai_system_flag[64];
 static char g_ai_prompt_flag[16];
 static int g_max_react_turns = 3;
+static int g_claude_timeout = 300;  /* seconds, 0 = no timeout */
 
 /* Resolved paths -- set once at startup from NEIL_HOME env var */
 static char g_neil_home[MAX_PATH];
@@ -143,6 +145,8 @@ static void resolve_neil_paths(void) {
                 snprintf(g_ai_prompt_flag, sizeof(g_ai_prompt_flag), "%s", val);
             else if (strcmp(key, "max_react_turns") == 0)
                 g_max_react_turns = atoi(val);
+            else if (strcmp(key, "claude_timeout") == 0)
+                g_claude_timeout = atoi(val);
         }
         fclose(cfg);
         fprintf(stderr, "[autoprompt] config: ai=%s prompt=%s system=%s\n",
@@ -778,7 +782,10 @@ static void complete_intentions(const char *output) {
         size_t ei = 0;
         for (size_t i = 0; keyword[i] && ei < sizeof(esc_kw) - 3; i++) {
             if (keyword[i] == '/' || keyword[i] == '.' || keyword[i] == '[' ||
-                keyword[i] == ']' || keyword[i] == '*') {
+                keyword[i] == ']' || keyword[i] == '*' || keyword[i] == '+' ||
+                keyword[i] == '?' || keyword[i] == '(' || keyword[i] == ')' ||
+                keyword[i] == '{' || keyword[i] == '}' || keyword[i] == '|' ||
+                keyword[i] == '^' || keyword[i] == '$' || keyword[i] == '\\') {
                 esc_kw[ei++] = '\\';
             }
             esc_kw[ei++] = keyword[i];
@@ -1097,7 +1104,8 @@ static void stream_close(int exit_code) {
 }
 
 /* Execute AI command with prompt and optional system prompt.
- * Streams output to ~/.neil/.neil_stream in real-time. */
+ * Streams output to ~/.neil/.neil_stream in real-time.
+ * Respects g_claude_timeout (seconds). Kills child on timeout. */
 static int run_claude(const char *prompt, const char *system_prompt,
                       char **out, size_t *out_len) {
     int pipefd[2];
@@ -1160,10 +1168,51 @@ static int run_claude(const char *prompt, const char *system_prompt,
 
     size_t cap = READ_BUF, len = 0;
     char *buf = malloc(cap);
-    if (!buf) { close(pipefd[0]); return -1; }
+    if (!buf) { close(pipefd[0]); kill(pid, SIGKILL); waitpid(pid, NULL, 0); return -1; }
 
-    ssize_t n;
-    while ((n = read(pipefd[0], buf + len, cap - len - 1)) > 0) {
+    time_t deadline = 0;
+    if (g_claude_timeout > 0)
+        deadline = time(NULL) + g_claude_timeout;
+
+    /* Use select() with timeout to read output without blocking forever */
+    int timed_out = 0;
+    for (;;) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(pipefd[0], &rfds);
+
+        struct timeval tv;
+        if (deadline > 0) {
+            time_t remaining = deadline - time(NULL);
+            if (remaining <= 0) {
+                timed_out = 1;
+                break;
+            }
+            tv.tv_sec = remaining;
+            tv.tv_usec = 0;
+        } else {
+            /* No timeout -- 60s select chunks (still interruptible) */
+            tv.tv_sec = 60;
+            tv.tv_usec = 0;
+        }
+
+        int ret = select(pipefd[0] + 1, &rfds, NULL, NULL, &tv);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (ret == 0) {
+            /* select timed out */
+            if (deadline > 0 && time(NULL) >= deadline) {
+                timed_out = 1;
+                break;
+            }
+            continue;  /* no-timeout mode: just loop */
+        }
+
+        ssize_t n = read(pipefd[0], buf + len, cap - len - 1);
+        if (n <= 0) break;  /* EOF or error */
+
         /* Stream to file in real-time */
         stream_write(buf + len, (size_t)n);
 
@@ -1171,12 +1220,39 @@ static int run_claude(const char *prompt, const char *system_prompt,
         if (len >= cap - 1) {
             cap *= 2;
             char *tmp = realloc(buf, cap);
-            if (!tmp) { free(buf); close(pipefd[0]); return -1; }
+            if (!tmp) break;  /* keep what we have */
             buf = tmp;
         }
     }
     close(pipefd[0]);
     buf[len] = '\0';
+
+    if (timed_out) {
+        fprintf(stderr, "[autoprompt] TIMEOUT: claude exceeded %ds limit, killing pid %d\n",
+                g_claude_timeout, (int)pid);
+        kill(pid, SIGTERM);
+        /* Give it 5 seconds to clean up, then force kill */
+        int grace = 5;
+        while (grace-- > 0) {
+            int wr = waitpid(pid, NULL, WNOHANG);
+            if (wr > 0) break;
+            sleep(1);
+        }
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+
+        /* Append timeout marker to output so it's visible */
+        const char *marker = "\n[TIMEOUT: Claude execution exceeded time limit]\n";
+        size_t mlen = strlen(marker);
+        if (len + mlen + 1 < cap) {
+            memcpy(buf + len, marker, mlen + 1);
+            len += mlen;
+        }
+
+        *out = buf;
+        if (out_len) *out_len = len;
+        return 124;  /* same as timeout(1) exit code */
+    }
 
     int status;
     waitpid(pid, &status, 0);
