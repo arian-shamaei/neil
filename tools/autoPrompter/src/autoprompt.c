@@ -409,7 +409,7 @@ static char *load_essence(void) {
 
 /* Build augmented prompt with zettel context + mempalace results.
  * Essence is returned separately via out_essence for --system-prompt. */
-static char *build_augmented_prompt(const char *raw_prompt, char **out_essence) {
+static char *build_augmented_prompt(const char *raw_prompt, char **out_essence, const char *prompt_file) {
     /* 1. Load essence (returned separately for --system-prompt) */
     *out_essence = load_essence();
 
@@ -441,8 +441,9 @@ static char *build_augmented_prompt(const char *raw_prompt, char **out_essence) 
 
     char search_cmd[2048];
     snprintf(search_cmd, sizeof(search_cmd),
-        ". %s && mempalace --palace %s search '%s' --results 3 2>/dev/null",
-        g_mempalace_venv, g_mempalace_palace, escaped);
+        "%s/tools/autoPrompter/multi_search.sh '%s' '%s' '%s' '%s' 2>/dev/null",
+        g_neil_home, g_mempalace_palace, g_mempalace_venv, escaped,
+        prompt_file ? prompt_file : "");
     char *memories = run_command(search_cmd);
 
     /* 4b. Reinforce found memories (memory decay system) */
@@ -1739,7 +1740,7 @@ static void process_prompt(const char *filename) {
 
     /* 4. Build augmented prompt with context + memories */
     char *essence = NULL;
-    char *aug_prompt = build_augmented_prompt(prompt, &essence);
+    char *aug_prompt = build_augmented_prompt(prompt, &essence, dst);
 
     /*
      * ReAct loop: reason -> act -> observe -> repeat
