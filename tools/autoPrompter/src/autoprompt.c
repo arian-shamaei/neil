@@ -321,8 +321,26 @@ static void extract_query(const char *prompt, char *query, size_t cap) {
                     for (i = 0; i < cap - 1 && field[i] && field[i] != '"'; i++)
                         query[i] = field[i];
                     query[i] = '\0';
-                    pclose(fp);
-                    return;
+                    /* If extracted field is empty (e.g. after SIGTERM kill),
+                       fall back to summary field instead of returning empty */
+                    if (query[0] != '\0') {
+                        pclose(fp);
+                        return;
+                    }
+                    /* Try summary as fallback if question was empty */
+                    if (qstart != strstr(line, "\"summary\":\"")) {
+                        const char *sstart = strstr(line, "\"summary\":\"");
+                        if (sstart) {
+                            const char *sf = sstart + 11;
+                            for (i = 0; i < cap - 1 && sf[i] && sf[i] != '"'; i++)
+                                query[i] = sf[i];
+                            query[i] = '\0';
+                            if (query[0] != '\0') {
+                                pclose(fp);
+                                return;
+                            }
+                        }
+                    }
                 }
             }
             pclose(fp);
