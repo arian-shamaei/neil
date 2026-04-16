@@ -266,3 +266,97 @@ impl NeilState {
             .unwrap_or_default()
     }
 }
+
+/// A single entry in the command log extracted from a heartbeat result file.
+#[derive(Debug, Clone)]
+pub enum CommandLogEntry {
+    /// A shell command and its output
+    Command { cmd: String, output: String },
+    /// A memory write (MEMORY: line)
+    Memory(String),
+    /// A service call (CALL: line)
+    ServiceCall(String),
+    /// A mempalace operation
+    Mempalace(String),
+}
+
+/// Load command log from a heartbeat's result file.
+/// Finds the result file by matching the prompt name in history/.
+pub fn load_command_log(neil_home: &PathBuf, prompt_name: &str) -> Vec<CommandLogEntry> {
+    let history_dir = neil_home.join("tools/autoPrompter/history");
+    let mut entries = Vec::new();
+
+    // Find the result file matching this prompt
+    let result_file = fs::read_dir(&history_dir)
+        .ok()
+        .and_then(|dir| {
+            dir.filter_map(|e| e.ok())
+                .find(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    name.ends_with(".result.md") && name.contains(prompt_name)
+                })
+                .map(|e| e.path())
+        });
+
+    let path = match result_file {
+        Some(p) => p,
+        None => return entries,
+    };
+
+    let content = fs::read_to_string(&path).unwrap_or_default();
+
+    // Extract the ## Output section content (between ```...```)
+    let output = match content.find("## Output\n```\n") {
+        Some(start) => {
+            let body_start = start + "## Output\n```\n".len();
+            let body_end = content[body_start..].find("\n```")
+                .map(|i| body_start + i)
+                .unwrap_or(content.len());
+            &content[body_start..body_end]
+        }
+        None => return entries,
+    };
+
+    // Parse the output for command log entries
+    let mut lines = output.lines().peekable();
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+
+        // Bash code blocks (from stream_action)
+        if trimmed.starts_with("```bash") || trimmed.starts_with("```sh") {
+            let mut cmd = String::new();
+            let mut cmd_output = String::new();
+            let mut past_cmd = false;
+            while let Some(code_line) = lines.next() {
+                if code_line.trim().starts_with("```") { break; }
+                if !past_cmd && code_line.starts_with("$ ") {
+                    if !cmd.is_empty() { cmd.push('\n'); }
+                    cmd.push_str(&code_line[2..]);
+                } else {
+                    past_cmd = true;
+                    if !cmd_output.is_empty() { cmd_output.push('\n'); }
+                    cmd_output.push_str(code_line);
+                }
+            }
+            if !cmd.is_empty() {
+                entries.push(CommandLogEntry::Command { cmd, output: cmd_output });
+            }
+        }
+        // MEMORY: lines (from Claude's output, not inside code blocks)
+        else if trimmed.starts_with("MEMORY:") {
+            entries.push(CommandLogEntry::Memory(trimmed[7..].trim().to_string()));
+        }
+        // CALL: lines
+        else if trimmed.starts_with("CALL:") {
+            entries.push(CommandLogEntry::ServiceCall(trimmed[5..].trim().to_string()));
+        }
+        // mempalace commands (only actual command lines, not prose mentioning it)
+        else if (trimmed.starts_with("$ ") || trimmed.starts_with("mempalace "))
+            && (trimmed.contains("mempalace mine") || trimmed.contains("mempalace search"))
+        {
+            entries.push(CommandLogEntry::Mempalace(trimmed.to_string()));
+        }
+    }
+
+    entries
+}

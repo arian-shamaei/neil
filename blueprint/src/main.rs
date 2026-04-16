@@ -21,7 +21,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap, Clear};
 use ratatui::Terminal;
 
-use state::NeilState;
+use state::{NeilState, CommandLogEntry, load_command_log};
 use stream::{StreamEntry, EntryKind, RichBlock, DiffLine};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1393,6 +1393,67 @@ fn render_heartbeat_panel(s: &NeilState, selected: usize, expanded: bool, scroll
                 format!("  source: {}", e.prompt),
                 Style::default().fg(Color::DarkGray),
             )));
+            detail.push(Line::from(""));
+
+            // Command log -- extracted from the result file
+            let cmd_log = load_command_log(&s.neil_home, &e.prompt);
+            if !cmd_log.is_empty() {
+                detail.push(Line::from(Span::styled(
+                    "  COMMAND LOG",
+                    Style::default().fg(Color::Rgb(100, 200, 255)).add_modifier(Modifier::BOLD),
+                )));
+                detail.push(Line::from(""));
+
+                for entry in &cmd_log {
+                    match entry {
+                        CommandLogEntry::Command { cmd, output } => {
+                            // Truncate long commands for display
+                            let display_cmd: String = cmd.chars().take(90).collect();
+                            detail.push(Line::from(vec![
+                                Span::styled("    $ ", Style::default().fg(Color::Rgb(100, 200, 100))),
+                                Span::styled(display_cmd, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                            ]));
+                            if !output.is_empty() {
+                                for ol in output.lines().take(5) {
+                                    detail.push(Line::from(Span::styled(
+                                        format!("      {}", ol),
+                                        Style::default().fg(Color::Rgb(120, 120, 120)),
+                                    )));
+                                }
+                                let total_lines = output.lines().count();
+                                if total_lines > 5 {
+                                    detail.push(Line::from(Span::styled(
+                                        format!("      ... ({} more lines)", total_lines - 5),
+                                        Style::default().fg(Color::DarkGray),
+                                    )));
+                                }
+                            }
+                            detail.push(Line::from(""));
+                        }
+                        CommandLogEntry::Memory(detail_text) => {
+                            let display: String = detail_text.chars().take(80).collect();
+                            detail.push(Line::from(vec![
+                                Span::styled("    >> ", Style::default().fg(Color::Rgb(180, 130, 255))),
+                                Span::styled(format!("MEMORY: {}", display), Style::default().fg(Color::Rgb(180, 130, 255))),
+                            ]));
+                        }
+                        CommandLogEntry::ServiceCall(detail_text) => {
+                            let display: String = detail_text.chars().take(80).collect();
+                            detail.push(Line::from(vec![
+                                Span::styled("    -> ", Style::default().fg(Color::Rgb(100, 200, 255))),
+                                Span::styled(format!("CALL: {}", display), Style::default().fg(Color::Rgb(100, 200, 255))),
+                            ]));
+                        }
+                        CommandLogEntry::Mempalace(detail_text) => {
+                            let display: String = detail_text.chars().take(80).collect();
+                            detail.push(Line::from(Span::styled(
+                                format!("    ~ {}", display),
+                                Style::default().fg(Color::Rgb(100, 180, 255)),
+                            )));
+                        }
+                    }
+                }
+            }
 
             // Apply scroll
             let skip = scroll.min(detail.len().saturating_sub(1));
