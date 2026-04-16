@@ -397,9 +397,13 @@ fn main() -> anyhow::Result<()> {
                                             }
                                             "/status" => {
                                                 let s = cached_state.as_ref().unwrap();
+                                                let beats_str = match s.max_daily_beats {
+                                                    Some(cap) => format!("{}/{}", s.heartbeat.beats_today, cap),
+                                                    None => format!("{}", s.heartbeat.beats_today),
+                                                };
                                                 stream.push(StreamEntry::new(EntryKind::System, format!(
-                                                    "Notes: {} | Beats: {}/50 | Queue: {} | Failures: {} | Intents: {}",
-                                                    s.palace.total_notes, s.heartbeat.beats_today,
+                                                    "Notes: {} | Beats: {} | Queue: {} | Failures: {} | Intents: {}",
+                                                    s.palace.total_notes, beats_str,
                                                     s.system.queue_count,
                                                     s.failures.iter().filter(|f| f.resolution == "pending").count(),
                                                     s.intentions.iter().filter(|i| i.status == "pending").count(),
