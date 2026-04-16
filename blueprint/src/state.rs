@@ -18,6 +18,7 @@ pub struct NeilState {
     pub essence_files: Vec<String>,
     pub services: Vec<String>,
     pub tick: u64,
+    pub max_daily_beats: Option<usize>, // from config.toml, None = no cap
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -117,7 +118,23 @@ impl NeilState {
             essence_files,
             services,
             tick: 0,
+            max_daily_beats: Self::load_max_daily(neil_home),
         }
+    }
+
+    fn load_max_daily(home: &PathBuf) -> Option<usize> {
+        let config = fs::read_to_string(home.join("config.toml")).unwrap_or_default();
+        for line in config.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("max_daily") {
+                if let Some(val) = trimmed.split('=').nth(1) {
+                    let val = val.trim();
+                    if val == "0" || val.is_empty() { return None; } // 0 = no cap
+                    return val.parse().ok();
+                }
+            }
+        }
+        None // no setting = no cap
     }
 
     fn load_heartbeat(home: &PathBuf) -> HeartbeatState {

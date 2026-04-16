@@ -1009,7 +1009,13 @@ fn render_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &NeilState, sea
 
     let status_lines = vec![
         Line::from(Span::styled(" NEIL ", Style::default().fg(Color::Black).bg(Color::Cyan))),
-        Line::from(Span::styled(format!(" beats: {}/50", state.heartbeat.beats_today), Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(
+            match state.max_daily_beats {
+                Some(cap) => format!(" beats: {}/{}", state.heartbeat.beats_today, cap),
+                None => format!(" beats: {}", state.heartbeat.beats_today),
+            },
+            Style::default().fg(if state.max_daily_beats.map(|c| state.heartbeat.beats_today > c).unwrap_or(false) { Color::Red } else { Color::DarkGray }),
+        )),
         Line::from(Span::styled(format!(" queue: {}", state.system.queue_count),
             Style::default().fg(if state.system.queue_count > 0 { Color::Yellow } else { Color::DarkGray }))),
         Line::from(Span::styled(format!(" notes: {}", state.palace.total_notes), Style::default().fg(Color::Cyan))),
