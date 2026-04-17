@@ -47,7 +47,8 @@ static char g_ai_system_flag[64];
 static char g_ai_prompt_flag[16];
 static int g_max_react_turns = 3;
 static int g_claude_timeout = 300;
-static int g_agent_manages_stream = 0;  /* 1 = external agent writes .neil_stream */  /* seconds, 0 = no timeout */
+static int g_agent_manages_stream = 0;
+static int g_neil_os_enabled = 1;  /* observable kill-switch flag */  /* 1 = external agent writes .neil_stream */  /* seconds, 0 = no timeout */
 
 /* Resolved paths -- set once at startup from NEIL_HOME env var */
 static char g_neil_home[MAX_PATH];
@@ -167,6 +168,8 @@ static void resolve_neil_paths(void) {
                 g_max_react_turns = atoi(val);
             else if (strcmp(key, "agent_manages_stream") == 0)
                 g_agent_manages_stream = atoi(val);
+            else if (strcmp(key, "neil_os_enabled") == 0)
+                g_neil_os_enabled = atoi(val);
             else if (strcmp(key, "claude_timeout") == 0)
                 g_claude_timeout = atoi(val);
         }
