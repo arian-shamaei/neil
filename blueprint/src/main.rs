@@ -1557,18 +1557,33 @@ fn render_heartbeat_expanded(
             if cmd_log.is_empty() {
                 right_lines.push(Line::from(Span::styled("  (no commands recorded)", Style::default().fg(Color::DarkGray))));
             } else {
+                // Usable width after 2-char indent + 2-char prefix + 2-space continuation
+                let wrap_w = content_width.saturating_sub(6).max(20);
+                let cont_w = content_width.saturating_sub(6).max(20);
+
                 for entry in &cmd_log {
                     match entry {
                         CommandLogEntry::Command { cmd, output } => {
-                            let display_cmd: String = cmd.chars().take(content_width.saturating_sub(4)).collect();
-                            right_lines.push(Line::from(vec![
-                                Span::styled("  $ ", Style::default().fg(Color::Rgb(100, 200, 100))),
-                                Span::styled(display_cmd, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                            ]));
-                            for ol in output.lines().take(8) {
-                                right_lines.push(Line::from(Span::styled(
-                                    format!("    {}", ol), Style::default().fg(Color::Rgb(120, 120, 120)),
-                                )));
+                            // Wrap the command itself
+                            let cmd_lines = textwrap_simple(cmd, wrap_w);
+                            for (i, cl) in cmd_lines.iter().enumerate() {
+                                let prefix = if i == 0 { "  $ " } else { "    " };
+                                let color = if i == 0 { Color::Rgb(100, 200, 100) } else { Color::DarkGray };
+                                right_lines.push(Line::from(vec![
+                                    Span::styled(prefix.to_string(), Style::default().fg(color)),
+                                    Span::styled(cl.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                                ]));
+                            }
+                            // Wrap output lines (max 8 source lines shown)
+                            let mut source_line_count = 0;
+                            for ol in output.lines() {
+                                if source_line_count >= 8 { break; }
+                                source_line_count += 1;
+                                for wl in textwrap_simple(ol, cont_w) {
+                                    right_lines.push(Line::from(Span::styled(
+                                        format!("    {}", wl), Style::default().fg(Color::Rgb(120, 120, 120)),
+                                    )));
+                                }
                             }
                             let total = output.lines().count();
                             if total > 8 {
@@ -1579,40 +1594,74 @@ fn render_heartbeat_expanded(
                             right_lines.push(Line::from(""));
                         }
                         CommandLogEntry::Memory(d) => {
-                            right_lines.push(Line::from(vec![
-                                Span::styled("  >> ", Style::default().fg(Color::Rgb(180, 130, 255))),
-                                Span::styled(format!("MEMORY: {}", d), Style::default().fg(Color::Rgb(180, 130, 255))),
-                            ]));
+                            let full = format!("MEMORY: {}", d);
+                            let wrapped = textwrap_simple(&full, wrap_w);
+                            for (i, wl) in wrapped.iter().enumerate() {
+                                let prefix = if i == 0 { "  >> " } else { "     " };
+                                right_lines.push(Line::from(vec![
+                                    Span::styled(prefix.to_string(), Style::default().fg(Color::Rgb(180, 130, 255))),
+                                    Span::styled(wl.clone(), Style::default().fg(Color::Rgb(180, 130, 255))),
+                                ]));
+                            }
                         }
                         CommandLogEntry::ServiceCall(d) => {
-                            right_lines.push(Line::from(vec![
-                                Span::styled("  -> ", Style::default().fg(Color::Rgb(100, 200, 255))),
-                                Span::styled(format!("CALL: {}", d), Style::default().fg(Color::Rgb(100, 200, 255))),
-                            ]));
+                            let full = format!("CALL: {}", d);
+                            let wrapped = textwrap_simple(&full, wrap_w);
+                            for (i, wl) in wrapped.iter().enumerate() {
+                                let prefix = if i == 0 { "  -> " } else { "     " };
+                                right_lines.push(Line::from(vec![
+                                    Span::styled(prefix.to_string(), Style::default().fg(Color::Rgb(100, 200, 255))),
+                                    Span::styled(wl.clone(), Style::default().fg(Color::Rgb(100, 200, 255))),
+                                ]));
+                            }
                         }
                         CommandLogEntry::Mempalace(d) => {
-                            right_lines.push(Line::from(Span::styled(
-                                format!("  ~ {}", d), Style::default().fg(Color::Rgb(100, 180, 255)),
-                            )));
+                            for (i, wl) in textwrap_simple(d, wrap_w).iter().enumerate() {
+                                let prefix = if i == 0 { "  ~ " } else { "    " };
+                                right_lines.push(Line::from(Span::styled(
+                                    format!("{}{}", prefix, wl), Style::default().fg(Color::Rgb(100, 180, 255)),
+                                )));
+                            }
                         }
                         CommandLogEntry::FileWrite(d) => {
-                            right_lines.push(Line::from(vec![
-                                Span::styled("  W ", Style::default().fg(Color::Black).bg(Color::Green)),
-                                Span::styled(format!(" {}", d), Style::default().fg(Color::Green)),
-                            ]));
+                            let wrapped = textwrap_simple(d, wrap_w);
+                            for (i, wl) in wrapped.iter().enumerate() {
+                                if i == 0 {
+                                    right_lines.push(Line::from(vec![
+                                        Span::styled("  W ".to_string(), Style::default().fg(Color::Black).bg(Color::Green)),
+                                        Span::styled(format!(" {}", wl), Style::default().fg(Color::Green)),
+                                    ]));
+                                } else {
+                                    right_lines.push(Line::from(Span::styled(
+                                        format!("     {}", wl), Style::default().fg(Color::Green),
+                                    )));
+                                }
+                            }
                         }
                         CommandLogEntry::FileRead(d) => {
-                            right_lines.push(Line::from(vec![
-                                Span::styled("  R ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-                                Span::styled(format!(" {}", d), Style::default().fg(Color::Cyan)),
-                            ]));
+                            let wrapped = textwrap_simple(d, wrap_w);
+                            for (i, wl) in wrapped.iter().enumerate() {
+                                if i == 0 {
+                                    right_lines.push(Line::from(vec![
+                                        Span::styled("  R ".to_string(), Style::default().fg(Color::Black).bg(Color::Cyan)),
+                                        Span::styled(format!(" {}", wl), Style::default().fg(Color::Cyan)),
+                                    ]));
+                                } else {
+                                    right_lines.push(Line::from(Span::styled(
+                                        format!("     {}", wl), Style::default().fg(Color::Cyan),
+                                    )));
+                                }
+                            }
                         }
                         CommandLogEntry::BashAction(d) => {
-                            let display: String = d.chars().take(content_width.saturating_sub(4)).collect();
-                            right_lines.push(Line::from(vec![
-                                Span::styled("  $ ", Style::default().fg(Color::Rgb(100, 200, 100))),
-                                Span::styled(display, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                            ]));
+                            for (i, wl) in textwrap_simple(d, wrap_w).iter().enumerate() {
+                                let prefix = if i == 0 { "  $ " } else { "    " };
+                                let color = if i == 0 { Color::Rgb(100, 200, 100) } else { Color::DarkGray };
+                                right_lines.push(Line::from(vec![
+                                    Span::styled(prefix.to_string(), Style::default().fg(color)),
+                                    Span::styled(wl.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                                ]));
+                            }
                         }
                     }
                 }

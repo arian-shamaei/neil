@@ -116,3 +116,25 @@ This grammar unifies three separate proposals from recent beats:
 4. Add header-awareness to dedup.log (don't skip `force` prompts).
 5. Surface parsed header in blueprint queue panel.
 6. Document in essence/actions.md once stable.
+
+## Addendum: Flat-vs-structured decision (2026-04-16)
+
+Validated after stress-testing 10 realistic future scenarios
+(GRAMMAR_STRESS_TEST.md). Decision: **keep the grammar flat.**
+
+Zero of the 10 scenarios need structured values. All fit via:
+- CSV for lists (paths, tool names, dependency IDs)
+- Key-namespacing (`context-*`, `retro-*`) for grouped options
+- Body-of-prompt for content vs metadata
+
+**Escape valve for genuinely nested config:** reference an external
+config file via `config=<path>`. This is the standard Unix pattern
+(systemd unit files, git config). The header stays flat; complex
+shape lives next to it, not inside it.
+
+**Revisit trigger:** revisit only if two or more happen:
+- Three+ callers need the same namespaced key cluster.
+- Operators report header readability pain.
+- A use case genuinely needs nested values in the header.
+
+Until then, flat is correct. Integration unblocked.

@@ -228,11 +228,16 @@ $HOME/.neil/self/memory_decay.sh decaying 2>/dev/null || echo "decay: unavailabl
 
 echo ""
 echo "=== Stream ==="
-if [ -f "\$HOME/.neil/.neil_stream" ]; then
-    HEAD=\$(head -1 "\$HOME/.neil/.neil_stream" 2>/dev/null)
-    STATUS=\$(echo "\$HEAD" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
-    SIZE=\$(wc -c < "\$HOME/.neil/.neil_stream" 2>/dev/null)
-    echo "status: \$STATUS (\${SIZE} bytes)"
+if [ -f "$HOME/.neil/.neil_stream" ]; then
+    HEAD=$(head -1 "$HOME/.neil/.neil_stream" 2>/dev/null)
+    STATUS=$(echo "$HEAD" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
+    SIZE=$(wc -c < "$HOME/.neil/.neil_stream" 2>/dev/null)
+    echo "status: $STATUS (${SIZE} bytes)"
 else
     echo "status: idle"
+fi
+
+# Beat router: decides which 3C mode this beat should be
+if [ -x "$HOME/.neil/tools/beat_router/beat_router.sh" ]; then
+    NEIL_HOME="$HOME/.neil" bash "$HOME/.neil/tools/beat_router/beat_router.sh"
 fi
