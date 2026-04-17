@@ -691,10 +691,22 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => { scroll_offset += 3; auto_scroll = false; }
+                    MouseEventKind::ScrollUp => {
+                        if matches!(view, View::Panel(1)) && hb_expanded {
+                            if hb_scroll > 0 { hb_scroll = hb_scroll.saturating_sub(3); }
+                            needs_redraw = true;
+                        } else {
+                            scroll_offset += 3; auto_scroll = false;
+                        }
+                    }
                     MouseEventKind::ScrollDown => {
-                        scroll_offset = (scroll_offset - 3).max(0);
-                        if scroll_offset == 0 { auto_scroll = true; }
+                        if matches!(view, View::Panel(1)) && hb_expanded {
+                            hb_scroll += 3;
+                            needs_redraw = true;
+                        } else {
+                            scroll_offset = (scroll_offset - 3).max(0);
+                            if scroll_offset == 0 { auto_scroll = true; }
+                        }
                     }
                     _ => {}
                 },

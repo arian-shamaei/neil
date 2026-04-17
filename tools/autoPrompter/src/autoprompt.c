@@ -311,6 +311,37 @@ static char *run_command(const char *cmd) {
     return buf;
 }
 
+/* Like run_command but also returns exit status of the child via *status_out.
+ * status_out is set to -1 if popen/pclose fails or the child didn't exit
+ * normally; otherwise it's the child's exit code (0 = success). */
+static char *run_command_status(const char *cmd, int *status_out) {
+    FILE *fp = popen(cmd, "r");
+    if (!fp) { if (status_out) *status_out = -1; return NULL; }
+
+    size_t cap = 4096, len = 0;
+    char *buf = malloc(cap);
+    if (!buf) { pclose(fp); if (status_out) *status_out = -1; return NULL; }
+
+    size_t n;
+    while ((n = fread(buf + len, 1, cap - len - 1, fp)) > 0) {
+        len += n;
+        if (len >= cap - 1) {
+            cap *= 2;
+            char *tmp = realloc(buf, cap);
+            if (!tmp) { free(buf); pclose(fp); if (status_out) *status_out = -1; return NULL; }
+            buf = tmp;
+        }
+    }
+    int pc = pclose(fp);
+    if (status_out) {
+        if (pc == -1 || !WIFEXITED(pc)) *status_out = -1;
+        else *status_out = WEXITSTATUS(pc);
+    }
+    buf[len] = '\0';
+    return buf;
+}
+
+
 /* Extract a meaningful search query from the prompt for mempalace lookup.
  *
  * For heartbeat prompts: reads the last heartbeat_log.json entry and pulls
@@ -566,7 +597,12 @@ static void extract_memories(const char *output) {
 
         /* Find the | separator */
         char *pipe = strchr(line, '|');
-        if (!pipe) { p = eol; continue; }
+        if (!pipe) {
+            fprintf(stderr, "[autoprompt] NOTIFY: missing '|' separator, skipping\n");
+            log_internal_failure("notify-dispatch", "low",
+                "missing-pipe", line);
+            p = eol; continue;
+        }
 
         /* Body is after | */
         char *b = pipe + 1;
@@ -638,6 +674,52 @@ static void reindex_mempalace(void) {
     }
 }
 
+/* Append a single failure entry to failures.json from inside autoprompter.
+ * Mirrors the JSON schema written by record_failures() for FAIL: lines. */
+static void log_internal_failure(const char *source, const char *severity,
+                                  const char *context, const char *error) {
+    char fail_path[MAX_PATH];
+    snprintf(fail_path, sizeof(fail_path), "%s/self/failures.json", g_neil_home);
+
+    char esc_err[2048];
+    size_t ei = 0;
+    const char *e = error ? error : "";
+    for (size_t i = 0; e[i] && ei < sizeof(esc_err) - 2; i++) {
+        if (e[i] == '"' || e[i] == '\\') esc_err[ei++] = '\\';
+        esc_err[ei++] = e[i];
+    }
+    esc_err[ei] = '\0';
+
+    char esc_ctx[512];
+    size_t ci = 0;
+    const char *c = context ? context : "";
+    for (size_t i = 0; c[i] && ci < sizeof(esc_ctx) - 2; i++) {
+        if (c[i] == '"' || c[i] == '\\') esc_ctx[ci++] = '\\';
+        esc_ctx[ci++] = c[i];
+    }
+    esc_ctx[ci] = '\0';
+
+    char ts[32];
+    timestamp_now(ts, sizeof(ts));
+
+    char entry[4096];
+    int elen = snprintf(entry, sizeof(entry),
+        "{\"timestamp\":\"%s\",\"source\":\"%s\",\"error\":\"%s\","
+        "\"context\":\"%s\",\"severity\":\"%s\",\"resolution\":\"pending\",\"notes\":\"\"}\n",
+        ts, source ? source : "unknown", esc_err, esc_ctx,
+        severity ? severity : "medium");
+
+    int fd = open(fail_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        ssize_t w = write(fd, entry, (size_t)elen);
+        (void)w;
+        close(fd);
+    }
+    fprintf(stderr, "[autoprompt] FAIL: [%s] %s: %s\n",
+            severity ? severity : "medium",
+            source ? source : "unknown", esc_err);
+}
+
 /* Parse NOTIFY: lines from output and dispatch to channel scripts. */
 static void dispatch_notifications(const char *output) {
     if (!output) return;
@@ -689,6 +771,8 @@ static void dispatch_notifications(const char *output) {
                  g_neil_home, channel);
         if (access(ch_path, X_OK) != 0) {
             fprintf(stderr, "[autoprompt] NOTIFY: unknown channel '%s'\n", channel);
+            log_internal_failure("notify-dispatch", "low",
+                channel, "unknown channel (no script at outputs/channels)");
             p = eol; continue;
         }
 
@@ -723,9 +807,14 @@ static void dispatch_notifications(const char *output) {
         n += snprintf(cmd + n, sizeof(cmd) - n, "%s 2>&1", ch_path);
 
         fprintf(stderr, "[autoprompt] NOTIFY: channel=%s\n", channel);
-        char *result = run_command(cmd);
-        if (result) {
-            free(result);
+        int notify_status = 0;
+        char *result = run_command_status(cmd, &notify_status);
+        if (result) free(result);
+        if (notify_status != 0) {
+            char ctx[128];
+            snprintf(ctx, sizeof(ctx), "%s exit=%d", channel, notify_status);
+            log_internal_failure("notify-dispatch", "low",
+                ctx, "channel script returned non-zero");
         }
 
         p = eol;
