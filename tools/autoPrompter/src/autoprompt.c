@@ -1803,12 +1803,17 @@ static int run_claude(const char *prompt, const char *system_prompt,
         /* Ensure local bin dirs are in PATH */
         const char *oldpath = getenv("PATH");
         char newpath[MAX_PATH];
-        snprintf(newpath, sizeof(newpath), "%s/.local/bin:%s",
+        snprintf(newpath, sizeof(newpath), "%s/.neil/bin:%s/.local/bin:%s",
+                 getenv("HOME") ? getenv("HOME") : "/tmp",
                  getenv("HOME") ? getenv("HOME") : "/tmp",
                  oldpath ? oldpath : "/usr/bin");
         setenv("PATH", newpath, 1);
         if (g_current_prompt_name[0]) setenv("NEIL_PROMPT_NAME", g_current_prompt_name, 1);
         setenv("NEIL_HOME", g_neil_home, 1);
+        {
+            char hn[256];
+            if (gethostname(hn, sizeof(hn)) == 0) setenv("NEIL_NODE_ID", hn, 0);
+        }
 
         /* Build argument array from config */
         const char *argv[32];

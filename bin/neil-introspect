@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""
+neil-introspect -- Read-only state snapshot of Neil-OS.
+
+Usage:
+    neil-introspect              # human-readable summary
+    neil-introspect --json       # machine-readable JSON
+    neil-introspect --services   # just the services section
+    neil-introspect --beats      # just recent beats
+    neil-introspect --intentions # just pending work
+    neil-introspect --budget     # just budget state (Phase 4+)
+
+Part of Neil-OS 0.1.0. See ~/.neil/os/ARCHITECTURE.md for the full OS model.
+Zero side effects -- never writes, never executes Neil code.
+"""
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+NEIL_HOME = Path(os.environ.get("NEIL_HOME", os.path.expanduser("~/.neil")))
+NODE_ID = os.environ.get("NEIL_NODE_ID", socket.gethostname())
+
+
+def load_jsonl(path: Path, limit: int = 0) -> list[dict]:
+    if not path.exists():
+        return []
+    lines = path.read_text().splitlines()
+    if limit > 0:
+        lines = lines[-limit:]
+    out = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+    return out
+
+
+def get_version() -> str:
+    p = NEIL_HOME / "os" / "VERSION"
+    return p.read_text().strip() if p.exists() else "unknown"
+
+
+def get_services() -> dict:
+    """Current service/process liveness."""
+    services = {}
+    # systemd-declared services
+    for name in ["autoprompt", "neil-webhook-watcher", "neil-vision-inbox-watcher"]:
+        try:
+            r = subprocess.run(
+                ["systemctl", "is-active", name],
+                capture_output=True, text=True, timeout=2
+            )
+            services[name] = {
+                "kind": "systemd",
+                "state": r.stdout.strip() or "unknown",
+            }
+        except Exception:
+            services[name] = {"kind": "systemd", "state": "probe-failed"}
+    # Neil-internal processes
+    for name, pattern in [
+        ("autoprompt", "tools/autoPrompter/autoprompt"),
+        ("neil-blueprint", "neil-blueprint"),
+        ("beat_router", "beat_router.sh"),
+    ]:
+        try:
+            r = subprocess.run(
+                ["pgrep", "-f", pattern],
+                capture_output=True, text=True, timeout=2
+            )
+            pids = [p for p in r.stdout.strip().split("\n") if p]
+            if name not in services:
+                services[name] = {}
+            services[name]["pids"] = pids
+        except Exception:
+            pass
+    # Phase 2+ state file
+    state_file = NEIL_HOME / "state" / "services.json"
+    if state_file.exists():
+        try:
+            services["_init_tracked"] = json.loads(state_file.read_text())
+        except Exception:
+            pass
+    return services
+
+
+def get_beats(limit: int = 5) -> list[dict]:
+    beats = load_jsonl(NEIL_HOME / "heartbeat_log.json", limit=limit)
+    # Keep only summary fields for the snapshot
+    return [
+        {
+            "timestamp": b.get("timestamp", ""),
+            "status": b.get("status", ""),
+            "summary": (b.get("summary") or b.get("action") or "")[:120],
+            "node_id": b.get("node_id", ""),
+        }
+        for b in beats
+    ]
+
+
+def get_intentions() -> dict:
+    items = load_jsonl(NEIL_HOME / "intentions.json")
+    pending = [i for i in items if i.get("status") == "pending"]
+    completed = [i for i in items if i.get("status") == "completed"]
+    return {
+        "pending_count": len(pending),
+        "completed_count": len(completed),
+        "pending": [
+            {
+                "priority": i.get("priority", ""),
+                "description": (i.get("description") or "")[:120],
+                "due": i.get("due", ""),
+            }
+            for i in pending[:10]
+        ],
+    }
+
+
+def get_failures() -> dict:
+    items = load_jsonl(NEIL_HOME / "self" / "failures.json")
+    unresolved = [f for f in items if f.get("resolution") == "pending"]
+    return {
+        "unresolved_count": len(unresolved),
+        "unresolved": [
+            {
+                "severity": f.get("severity", ""),
+                "source": f.get("source", ""),
+                "error": (f.get("error") or "")[:120],
+            }
+            for f in unresolved[:5]
+        ],
+    }
+
+
+def get_queue() -> dict:
+    q = NEIL_HOME / "tools" / "autoPrompter" / "queue"
+    if not q.exists():
+        return {"count": 0, "files": []}
+    files = sorted(
+        [f.name for f in q.iterdir() if f.name.endswith(".md")]
+    )
+    return {"count": len(files), "files": files[:10]}
+
+
+def get_stream() -> dict:
+    p = NEIL_HOME / ".neil_stream"
+    if not p.exists():
+        return {"active": False}
+    size = p.stat().st_size
+    head = p.read_text(errors="replace")[:200]
+    running = '"running"' in head
+    return {"active": running, "bytes": size}
+
+
+def get_budget() -> dict:
+    # Phase 4 placeholder
+    p = NEIL_HOME / "state" / "budget.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            return {"state": "unreadable"}
+    return {"state": "not-tracked-yet", "note": "neil-warden lands in Phase 4"}
+
+
+def get_rhythms() -> dict:
+    """Quick presence signals across the three rhythms."""
+    out = {}
+    # Human presence via blueprint state
+    bp = NEIL_HOME / ".blueprint_state.json"
+    if bp.exists():
+        try:
+            s = json.loads(bp.read_text())
+            out["human"] = {
+                "user_active": s.get("user_active", False),
+                "streaming": s.get("streaming", False),
+                "last_input": s.get("last_input_time", ""),
+            }
+        except Exception:
+            out["human"] = {"error": "unreadable"}
+    # World signals: vision inbox
+    vision_inbox = NEIL_HOME / "vision" / "inbox"
+    if vision_inbox.exists():
+        out["world"] = {
+            "vision_inbox_count": sum(1 for _ in vision_inbox.iterdir()),
+        }
+    # Machine: queue depth + pending intentions
+    out["machine"] = {
+        "queue_depth": get_queue()["count"],
+        "pending_intentions": get_intentions()["pending_count"],
+    }
+    return out
+
+
+def full_snapshot() -> dict:
+    return {
+        "node_id": NODE_ID,
+        "neil_os_version": get_version(),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "services": get_services(),
+        "beats_recent": get_beats(5),
+        "intentions": get_intentions(),
+        "failures": get_failures(),
+        "queue": get_queue(),
+        "stream": get_stream(),
+        "budget": get_budget(),
+        "rhythms": get_rhythms(),
+    }
+
+
+def render_human(s: dict) -> str:
+    lines = []
+    lines.append(f"=== Neil-OS {s['neil_os_version']} on {s['node_id']} ===")
+    lines.append(f"    {s['timestamp']}")
+    lines.append("")
+
+    lines.append("Services:")
+    for name, info in s["services"].items():
+        if name.startswith("_"):
+            continue
+        state = info.get("state", "?")
+        pids = info.get("pids", [])
+        pid_str = f" pid={','.join(pids)}" if pids else ""
+        lines.append(f"  {name:<30} {state}{pid_str}")
+    lines.append("")
+
+    rh = s["rhythms"]
+    lines.append("Rhythms:")
+    if "human" in rh:
+        h = rh["human"]
+        act = "ACTIVE" if h.get("user_active") else "idle"
+        lines.append(f"  human    {act}  streaming={h.get('streaming', False)}  last_input={h.get('last_input', '?')}")
+    if "world" in rh:
+        lines.append(f"  world    vision_inbox={rh['world'].get('vision_inbox_count', 0)}")
+    m = rh["machine"]
+    lines.append(f"  machine  queue={m['queue_depth']}  pending_intentions={m['pending_intentions']}")
+    lines.append("")
+
+    i = s["intentions"]
+    lines.append(f"Intentions: {i['pending_count']} pending, {i['completed_count']} completed")
+    for p in i["pending"][:5]:
+        lines.append(f"  [{p['priority']:<8}] {p['description']}")
+    lines.append("")
+
+    f = s["failures"]
+    if f["unresolved_count"] > 0:
+        lines.append(f"Failures: {f['unresolved_count']} unresolved")
+        for u in f["unresolved"][:3]:
+            lines.append(f"  [{u['severity']}] {u['source']}: {u['error']}")
+        lines.append("")
+
+    lines.append("Recent beats:")
+    for b in s["beats_recent"]:
+        lines.append(f"  {b['timestamp']}  [{b['status']:<7}] {b['summary'][:70]}")
+    lines.append("")
+
+    st = s["stream"]
+    lines.append(f"Stream: {'ACTIVE' if st.get('active') else 'idle'}  ({st.get('bytes', 0)} bytes)")
+
+    b = s["budget"]
+    lines.append(f"Budget: {b.get('state', 'unknown')}")
+    if b.get("note"):
+        lines.append(f"        {b['note']}")
+
+    return "\n".join(lines)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Neil-OS state snapshot")
+    ap.add_argument("--json", action="store_true", help="JSON output (machine readable)")
+    ap.add_argument("--services", action="store_true", help="Just services section")
+    ap.add_argument("--beats", action="store_true", help="Just recent beats")
+    ap.add_argument("--intentions", action="store_true", help="Just intentions")
+    ap.add_argument("--failures", action="store_true", help="Just failures")
+    ap.add_argument("--budget", action="store_true", help="Just budget state")
+    ap.add_argument("--rhythms", action="store_true", help="Just rhythm signals")
+    args = ap.parse_args()
+
+    sub = None
+    if args.services:   sub = ("services", get_services())
+    elif args.beats:    sub = ("beats_recent", get_beats(20))
+    elif args.intentions: sub = ("intentions", get_intentions())
+    elif args.failures: sub = ("failures", get_failures())
+    elif args.budget:   sub = ("budget", get_budget())
+    elif args.rhythms:  sub = ("rhythms", get_rhythms())
+
+    if sub:
+        print(json.dumps(sub[1], indent=2 if not args.json else None))
+        return 0
+
+    snap = full_snapshot()
+    if args.json:
+        print(json.dumps(snap, indent=2))
+    else:
+        print(render_human(snap))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
