@@ -164,3 +164,15 @@ neil_os_enabled = true   # false reverts to pre-os-refactor behavior
 ```
 
 Every phase has an independent rollback path documented in the plan.
+
+## See also: STACKABLE.md
+
+The deeper framing: Neil is cognitive hardware. Agent behaviors (3C gate,
+retention optimization, personality) are software running on the Neil-OS
+substrate. The autoprompter is the universal protocol between Neil
+instances, which makes Neil stackable -- a parent Neil can dispatch to
+child Neils on other devices (embedded, VMs, edge nodes) via prompt files.
+
+See `~/.neil/os/STACKABLE.md` for the full reframing. Every phase of the
+OS roadmap is either substrate (hardening primitives), instance
+(configuring one deployment), or cluster (composing multiple Neils).

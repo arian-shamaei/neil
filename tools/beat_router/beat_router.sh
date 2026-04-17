@@ -56,10 +56,11 @@ if [ -f "$INTENTIONS" ]; then
     done < "$INTENTIONS"
 fi
 
-# Unresolved failures (highest severity wins)
+# Unresolved failures (highest severity wins; skip approval-tagged when no signal)
 failure_count=0
 top_failure=""
 top_severity="low"
+skipped_approval_fail=0
 if [ -f "$FAILURES" ]; then
     sev_rank() {
         case "$1" in
@@ -74,6 +75,15 @@ if [ -f "$FAILURES" ]; then
         [ -z "$line" ] && continue
         case "$line" in
             *'"resolution":"pending"'*)
+                # Skip approval-tagged failures when no approval signal present
+                ftag=""
+                case "$line" in
+                    *'"tag":"'*) ftag=$(echo "$line" | sed 's/.*"tag":"\([^"]*\)".*/\1/') ;;
+                esac
+                if [ "$ftag" = "approval" ] && [ "$approval_signals_exist" -eq 0 ]; then
+                    skipped_approval_fail=$((skipped_approval_fail + 1))
+                    continue
+                fi
                 failure_count=$((failure_count + 1))
                 sev=$(echo "$line" | sed 's/.*"severity":"\([^"]*\)".*/\1/')
                 rank=$(sev_rank "$sev")
@@ -142,7 +152,11 @@ if [ "$pending_count" -gt 0 ]; then
 elif [ "$failure_count" -gt 0 ]; then
     # Rule 2: unresolved failure
     mode="CREATIVITY"
-    reason="$failure_count unresolved FAIL(s); highest severity: $top_severity"
+    if [ "$skipped_approval_fail" -gt 0 ]; then
+        reason="$failure_count unresolved FAIL(s); highest severity: $top_severity (skipped $skipped_approval_fail approval-gated)"
+    else
+        reason="$failure_count unresolved FAIL(s); highest severity: $top_severity"
+    fi
     target="$top_failure"
     required="DONE: (fixed) or FAIL: (still broken + diagnosis) or INTEND: (specific fix plan)"
     forbidden="ignoring the failure; starting unrelated initiative work"
@@ -166,8 +180,9 @@ elif [ "$last_mode" = "CONFIGURATION" ]; then
 else
     # Default: configuration + rotation
     mode="CONFIGURATION"
-    if [ "$skipped_approval" -gt 0 ]; then
-        reason="no pending non-approval work ($skipped_approval awaiting operator); grounding before acting"
+    total_skipped=$((skipped_approval + skipped_approval_fail))
+    if [ "$total_skipped" -gt 0 ]; then
+        reason="no pending non-approval work ($total_skipped awaiting operator); grounding before acting"
     else
         reason="no pending work; grounding before acting"
     fi
