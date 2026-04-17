@@ -195,22 +195,13 @@ case "$NEIL_SERVICE" in
             done
         ;;
 
-    *)
-        echo "ERROR: no handler for service '$NEIL_SERVICE'"
-        exit 1
-        ;;
-esac
-
-# Clear credential from env immediately
-unset NEIL_CRED
-
-# --- plugin: wolfram ---
+    # --- plugin: wolfram ---
     wolfram)
         ENCODED=$(printf '%s' "$PARAM_input" | sed 's/ /+/g')
         curl -s "https://api.wolframalpha.com/v1/result?appid=$NEIL_CRED&i=$ENCODED" 2>&1
         ;;
 
-# --- service: vision ---
+    # --- service: vision ---
     vision)
         case "$NEIL_ACTION" in
             look)
@@ -240,3 +231,12 @@ unset NEIL_CRED
                 ;;
         esac
         ;;
+
+    *)
+        echo "ERROR: no handler for service '$NEIL_SERVICE'"
+        exit 1
+        ;;
+esac
+
+# Clear credential from env immediately
+unset NEIL_CRED
