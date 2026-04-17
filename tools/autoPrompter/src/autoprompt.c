@@ -176,6 +176,7 @@ static void resolve_neil_paths(void) {
         fclose(cfg);
         fprintf(stderr, "[autoprompt] config: ai=%s prompt=%s system=%s\n",
                 g_ai_command, g_ai_prompt_flag, g_ai_system_flag);
+        fprintf(stderr, "[autoprompt] config loaded: neil_os_enabled=%d\n", g_neil_os_enabled);
     }
 }
 
