@@ -18,6 +18,14 @@ if grep -q '^mode_routing = false' "$NEIL_HOME/config.toml" 2>/dev/null; then
     exit 0
 fi
 
+# OS-layer kill switch: if neil_os_enabled is false, beat_router (an OS-layer
+# scheduler feature) must not emit directives. This honors the documented flag
+# in essence/overview.md and config.toml [os] section. See ~/.neil/os/.
+if grep -qE '^neil_os_enabled[[:space:]]*=[[:space:]]*(false|0)' "$NEIL_HOME/config.toml" 2>/dev/null; then
+    # Flag is explicitly disabled; skip directive emission entirely
+    exit 0
+fi
+
 # ---- gather state ----
 
 # Detect approval signals: any *.md in ~/.neil/approvals/ other than README.md
