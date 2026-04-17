@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""neil-promote -- review proposed memories from child Neils.
+
+Parent Neil calls this (or the operator) to review items in
+~/.neil/state/pending_promotions.json.
+
+Usage:
+    neil-promote list                    # show all pending items
+    neil-promote list --status accepted  # filter by status
+    neil-promote show <id>                # full detail for one item
+    neil-promote accept <id>              # write to palace via zettel, mark accepted
+    neil-promote reject <id> <reason>     # discard with reason, mark rejected
+    neil-promote merge  <id> <note-id>    # append body to existing zettel note
+    neil-promote defer  <id>              # leave pending, skip this review cycle
+    neil-promote stats                    # summary: pending/accepted/rejected counts
+
+Accepted items trigger a MEMORY: write via the zettel binary. The
+pending_promotions.json row stays with status=accepted for audit.
+
+Pending items beyond `auto_threshold` (default 20) trigger a
+PROMOTION_REVIEW beat in beat_router.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+NEIL_HOME = Path(os.environ.get("NEIL_HOME", os.path.expanduser("~/.neil")))
+PENDING = NEIL_HOME / "state" / "pending_promotions.json"
+ZETTEL = NEIL_HOME / "memory" / "zettel" / "zettel"
+
+
+def _load() -> list[dict]:
+    if not PENDING.exists():
+        return []
+    out = []
+    for line in PENDING.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+    return out
+
+
+def _save(items: list[dict]) -> None:
+    PENDING.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PENDING.with_suffix(".tmp")
+    with tmp.open("w") as f:
+        for item in items:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    tmp.replace(PENDING)
+
+
+def _ensure_id(item: dict) -> dict:
+    if item.get("id"):
+        return item
+    # sha256 of summary+promoter+proposed_at, first 12 chars
+    key = f"{item.get('summary', '')}|{item.get('promoter', '')}|{item.get('proposed_at', '')}"
+    item["id"] = hashlib.sha256(key.encode()).hexdigest()[:12]
+    return item
+
+
+def cmd_list(args):
+    items = _load()
+    if args.status:
+        items = [i for i in items if i.get("status", "pending") == args.status]
+    if not items:
+        print("(no pending promotions)")
+        return 0
+    for item in items:
+        item = _ensure_id(item)
+        status = item.get("status", "pending")
+        promoter = item.get("promoter", "?")[:30]
+        conf = item.get("confidence", "?")
+        summary = (item.get("summary", "") or "")[:80]
+        marker = {"pending": " ", "accepted": "+", "rejected": "-",
+                  "merged": "M", "deferred": "."}.get(status, "?")
+        print(f"  {marker} [{item['id']}] [{status:<9}] [{conf:<6}] {promoter:<30} | {summary}")
+    return 0
+
+
+def cmd_show(args):
+    items = _load()
+    for item in items:
+        item = _ensure_id(item)
+        if item["id"] == args.id:
+            print(json.dumps(item, indent=2, ensure_ascii=False))
+            return 0
+    print(f"not found: {args.id}", file=sys.stderr)
+    return 1
+
+
+def cmd_accept(args):
+    items = _load()
+    found = None
+    for item in items:
+        item = _ensure_id(item)
+        if item["id"] == args.id:
+            found = item
+            break
+    if not found:
+        print(f"not found: {args.id}", file=sys.stderr)
+        return 1
+    if found.get("status") not in (None, "pending", "deferred"):
+        print(f"cannot accept: status is {found.get('status')}", file=sys.stderr)
+        return 2
+
+    # Build zettel new command
+    body = found.get("body", found.get("summary", ""))
+    wing = found.get("wing", "")
+    room = found.get("room", "")
+    tags = found.get("tags") or []
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+
+    cmd = [str(ZETTEL), "new", body]
+    if wing: cmd += ["--wing", wing]
+    if room: cmd += ["--room", room]
+    if tags: cmd += ["--tags", ",".join(tags)]
+
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        print(f"zettel new failed: {r.stderr}", file=sys.stderr)
+        return 3
+
+    note_id = r.stdout.strip()
+    found["status"] = "accepted"
+    found["accepted_at"] = time.strftime("%Y-%m-%dT%H-%M-%S")
+    found["palace_note_id"] = note_id
+    found["decision_reason"] = args.reason or ""
+
+    _save(items)
+    print(f"accepted -> {note_id}")
+    return 0
+
+
+def cmd_reject(args):
+    items = _load()
+    for item in items:
+        item = _ensure_id(item)
+        if item["id"] == args.id:
+            item["status"] = "rejected"
+            item["rejected_at"] = time.strftime("%Y-%m-%dT%H-%M-%S")
+            item["decision_reason"] = args.reason
+            _save(items)
+            print(f"rejected: {args.reason}")
+            return 0
+    print(f"not found: {args.id}", file=sys.stderr)
+    return 1
+
+
+def cmd_merge(args):
+    items = _load()
+    found = None
+    for item in items:
+        item = _ensure_id(item)
+        if item["id"] == args.id:
+            found = item
+            break
+    if not found:
+        print(f"not found: {args.id}", file=sys.stderr)
+        return 1
+
+    note_path = NEIL_HOME / "memory" / "palace" / "notes" / f"{args.note_id}.md"
+    if not note_path.exists():
+        print(f"target note not found: {note_path}", file=sys.stderr)
+        return 2
+
+    existing = note_path.read_text()
+    separator = f"\n\n---\n## Merged from promotion {found['id']} ({time.strftime('%Y-%m-%d')})\n\n"
+    body = found.get("body", found.get("summary", ""))
+    note_path.write_text(existing + separator + body)
+
+    found["status"] = "merged"
+    found["merged_at"] = time.strftime("%Y-%m-%dT%H-%M-%S")
+    found["merged_into"] = args.note_id
+    found["decision_reason"] = args.reason or ""
+    _save(items)
+    print(f"merged into {args.note_id}")
+    return 0
+
+
+def cmd_defer(args):
+    items = _load()
+    for item in items:
+        item = _ensure_id(item)
+        if item["id"] == args.id:
+            item["status"] = "deferred"
+            item["deferred_at"] = time.strftime("%Y-%m-%dT%H-%M-%S")
+            _save(items)
+            print(f"deferred: {args.id}")
+            return 0
+    print(f"not found: {args.id}", file=sys.stderr)
+    return 1
+
+
+def cmd_stats(args):
+    items = _load()
+    counts = {}
+    for item in items:
+        s = item.get("status", "pending")
+        counts[s] = counts.get(s, 0) + 1
+    total = sum(counts.values())
+    print(f"Pending promotions queue: {total} total")
+    for status, count in sorted(counts.items()):
+        print(f"  {status:<10} {count}")
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="neil-promote")
+    sp = p.add_subparsers(dest="cmd")
+
+    pl = sp.add_parser("list"); pl.add_argument("--status")
+    pl.set_defaults(func=cmd_list)
+
+    ps = sp.add_parser("show"); ps.add_argument("id")
+    ps.set_defaults(func=cmd_show)
+
+    pa = sp.add_parser("accept"); pa.add_argument("id"); pa.add_argument("--reason", default="")
+    pa.set_defaults(func=cmd_accept)
+
+    pr = sp.add_parser("reject"); pr.add_argument("id"); pr.add_argument("reason")
+    pr.set_defaults(func=cmd_reject)
+
+    pm = sp.add_parser("merge"); pm.add_argument("id"); pm.add_argument("note_id"); pm.add_argument("--reason", default="")
+    pm.set_defaults(func=cmd_merge)
+
+    pd = sp.add_parser("defer"); pd.add_argument("id")
+    pd.set_defaults(func=cmd_defer)
+
+    pst = sp.add_parser("stats"); pst.set_defaults(func=cmd_stats)
+
+    args = p.parse_args()
+    if not hasattr(args, "func"):
+        p.print_help()
+        return 1
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

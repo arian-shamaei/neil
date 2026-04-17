@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""neil-beat-tick -- increments beats_consumed for in_progress contracted intentions.
+
+Called by autoprompt.c at the START of each beat. Increments by 1 for any
+in_progress contracted intention. Sets wall_clock_start if missing.
+"""
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+
+def main():
+    neil_home = Path(os.environ.get("NEIL_HOME", os.path.expanduser("~/.neil")))
+    path = neil_home / "intentions.json"
+    if not path.exists():
+        return 0
+
+    entries = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append({"_parsed": True, "data": json.loads(line)})
+        except json.JSONDecodeError:
+            entries.append({"_parsed": False, "raw": line})
+
+    now_ts = time.strftime("%Y-%m-%dT%H-%M-%S")
+    changed = False
+    for wrap in entries:
+        if not wrap["_parsed"]:
+            continue
+        e = wrap["data"]
+        if e.get("status") != "in_progress":
+            continue
+        if not e.get("fulfillment"):
+            continue
+        state = e.setdefault("fulfillment_state", {})
+        state["beats_consumed"] = int(state.get("beats_consumed", 0)) + 1
+        if not state.get("wall_clock_start"):
+            state["wall_clock_start"] = now_ts
+        changed = True
+
+    if changed:
+        tmp = path.with_suffix(".tmp")
+        with tmp.open("w") as f:
+            for wrap in entries:
+                if wrap["_parsed"]:
+                    f.write(json.dumps(wrap["data"], ensure_ascii=False) + "\n")
+                else:
+                    f.write(wrap["raw"] + "\n")
+        tmp.replace(path)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

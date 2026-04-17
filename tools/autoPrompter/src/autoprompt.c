@@ -70,6 +70,7 @@ static char g_current_prompt_name[256] = "";     /* filename of prompt being pro
 /* Forward declarations */
 static void timestamp_now(char *buf, size_t cap);
 static void stream_action(const char *prefix, const char *detail, const char *cmd, const char *output);
+static void log_internal_failure(const char *source, const char *severity, const char *context, const char *error);
 static void set_seal_pose(const char *eyes, const char *mouth, const char *body, const char *indicator, const char *label);static void stream_write(const char *data, size_t len);static int run_claude(const char *prompt, const char *system_prompt, char **out, size_t *out_len);static void extract_memories(const char *output);
 static char *execute_tool_actions(const char *output);
 static unsigned long djb2_hash(const char *str, size_t len);
@@ -742,7 +743,12 @@ static void dispatch_notifications(const char *output) {
 
         /* Find the | separator */
         char *pipe = strchr(line, '|');
-        if (!pipe) { p = eol; continue; }
+        if (!pipe) {
+            fprintf(stderr, "[autoprompt] NOTIFY: missing '|' separator, skipping\n");
+            log_internal_failure("notify-dispatch", "low",
+                "missing-pipe", line);
+            p = eol; continue;
+        }
 
         char *message = pipe + 1;
         while (*message == ' ') message++;
@@ -822,6 +828,28 @@ static void dispatch_notifications(const char *output) {
 }
 
 /* Parse INTEND: lines and append to intentions.json */
+/* Helper: extract a key=value token from a space-separated line.
+ * Returns pointer just past the match or NULL if not found.
+ * Writes value into out (max outsz bytes). */
+static const char *extract_token(const char *line, const char *key, char *out, size_t outsz) {
+    size_t klen = strlen(key);
+    const char *p = line;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncmp(p, key, klen) == 0 && p[klen] == '=') {
+            p += klen + 1;
+            size_t i = 0;
+            while (*p && *p != ' ' && *p != '\t' && i < outsz - 1)
+                out[i++] = *p++;
+            out[i] = '\0';
+            return p;
+        }
+        /* advance past this token */
+        while (*p && *p != ' ' && *p != '\t') p++;
+    }
+    return NULL;
+}
+
 static void record_intentions(const char *output) {
     if (!output) return;
 
@@ -853,21 +881,38 @@ static void record_intentions(const char *output) {
         while (*description == ' ') description++;
         *pipe = '\0';
 
-        /* Parse params: priority=, after=, tag= */
+        /* Parse all known key= tokens (backward compatible; unknown tokens ignored) */
         char priority[32] = "medium";
         char after[32] = "";
         char tag[64] = "";
+        char verify[MAX_PATH] = "";
+        char max_beats[16] = "";
+        char max_tokens_s[16] = "";
+        char max_sec[16] = "";
+        char max_cost[16] = "";
+        char lifecycle[16] = "persistent";
+        char memory_mode[16] = "full";
+        char persona[32] = "default";
+        char model_hint[16] = "auto";
+        char target[32] = "main";
+        char sandbox[4] = "0";
+        char scope_dir[MAX_PATH] = "";
 
-        char *tok = strtok(line, " ");
-        while (tok) {
-            if (strncmp(tok, "priority=", 9) == 0)
-                snprintf(priority, sizeof(priority), "%s", tok + 9);
-            else if (strncmp(tok, "after=", 6) == 0)
-                snprintf(after, sizeof(after), "%s", tok + 6);
-            else if (strncmp(tok, "tag=", 4) == 0)
-                snprintf(tag, sizeof(tag), "%s", tok + 4);
-            tok = strtok(NULL, " ");
-        }
+        extract_token(line, "priority",    priority,     sizeof(priority));
+        extract_token(line, "after",       after,        sizeof(after));
+        extract_token(line, "tag",         tag,          sizeof(tag));
+        extract_token(line, "verify",      verify,       sizeof(verify));
+        extract_token(line, "max_beats",   max_beats,    sizeof(max_beats));
+        extract_token(line, "max_tokens",  max_tokens_s, sizeof(max_tokens_s));
+        extract_token(line, "max_sec",     max_sec,      sizeof(max_sec));
+        extract_token(line, "max_cost",    max_cost,     sizeof(max_cost));
+        extract_token(line, "lifecycle",   lifecycle,    sizeof(lifecycle));
+        extract_token(line, "memory",      memory_mode,  sizeof(memory_mode));
+        extract_token(line, "persona",     persona,      sizeof(persona));
+        extract_token(line, "model",       model_hint,   sizeof(model_hint));
+        extract_token(line, "target",      target,       sizeof(target));
+        extract_token(line, "sandbox",     sandbox,      sizeof(sandbox));
+        extract_token(line, "scope_dir",   scope_dir,    sizeof(scope_dir));
 
         if (!description[0]) { p = eol; continue; }
 
@@ -881,7 +926,7 @@ static void record_intentions(const char *output) {
             if (unit == 'm') secs = val * 60;
             else if (unit == 'h') secs = val * 3600;
             else if (unit == 'd') secs = val * 86400;
-            else secs = val * 60; /* default minutes */
+            else secs = val * 60;
 
             time_t due_time = now + secs;
             struct tm *tm = localtime(&due_time);
@@ -898,14 +943,80 @@ static void record_intentions(const char *output) {
         }
         esc_desc[ei] = '\0';
 
+        /* Escape verify path too */
+        char esc_verify[MAX_PATH];
+        size_t vi = 0;
+        for (size_t i = 0; verify[i] && vi < sizeof(esc_verify) - 2; i++) {
+            if (verify[i] == '"' || verify[i] == '\\')
+                esc_verify[vi++] = '\\';
+            esc_verify[vi++] = verify[i];
+        }
+        esc_verify[vi] = '\0';
+
         char ts[32];
         timestamp_now(ts, sizeof(ts));
 
-        char entry[4096];
+        /* Build JSON entry with optional fulfillment + executor objects.
+         * For backward compat, fulfillment{} only appears if verify or any
+         * budget field is set. executor{} always appears with defaults. */
+        int has_contract = verify[0] || max_beats[0] || max_tokens_s[0] ||
+                           max_sec[0] || max_cost[0];
+
+        char entry[8192];
         int elen = snprintf(entry, sizeof(entry),
             "{\"created\":\"%s\",\"priority\":\"%s\",\"due\":\"%s\","
-            "\"tag\":\"%s\",\"description\":\"%s\",\"status\":\"pending\"}\n",
-            ts, priority, due, tag, esc_desc);
+            "\"tag\":\"%s\",\"description\":\"%s\",\"status\":\"pending\","
+            "\"node_id\":\"%s\"",
+            ts, priority, due, tag, esc_desc,
+            getenv("NEIL_NODE_ID") ? getenv("NEIL_NODE_ID") : "unknown");
+
+        /* Executor object (always present, defaults if unspecified) */
+        elen += snprintf(entry + elen, sizeof(entry) - elen,
+            ",\"executor\":{"
+            "\"target\":\"%s\","
+            "\"lifecycle\":\"%s\","
+            "\"memory_mode\":\"%s\","
+            "\"persona\":\"%s\","
+            "\"model_hint\":\"%s\","
+            "\"sandbox\":%s,"
+            "\"scope_dir\":\"%s\""
+            "}",
+            target, lifecycle, memory_mode, persona, model_hint,
+            (sandbox[0] == '1' || sandbox[0] == 't') ? "true" : "false",
+            scope_dir);
+
+        /* Fulfillment object only if contract specified */
+        if (has_contract) {
+            elen += snprintf(entry + elen, sizeof(entry) - elen,
+                ",\"fulfillment\":{"
+                "\"verify_cmd\":\"%s\","
+                "\"verify_timeout_sec\":60,"
+                "\"budget\":{"
+                    "\"max_beats\":%s,"
+                    "\"max_tokens\":%s,"
+                    "\"max_wall_clock_sec\":%s,"
+                    "\"max_cost_usd\":%s"
+                "}"
+                "}"
+                ",\"fulfillment_state\":{"
+                    "\"attempts\":0,"
+                    "\"beats_consumed\":0,"
+                    "\"tokens_consumed\":0,"
+                    "\"wall_clock_start\":\"\","
+                    "\"wall_clock_end\":\"\","
+                    "\"cost_usd\":0.0,"
+                    "\"last_verify\":\"pending\","
+                    "\"last_verify_msg\":\"\","
+                    "\"failed_reason\":\"\""
+                "}",
+                esc_verify,
+                max_beats[0]    ? max_beats    : "0",
+                max_tokens_s[0] ? max_tokens_s : "0",
+                max_sec[0]      ? max_sec      : "0",
+                max_cost[0]     ? max_cost     : "0");
+        }
+
+        elen += snprintf(entry + elen, sizeof(entry) - elen, "}\n");
 
         int fd = open(intentions_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) {
@@ -914,15 +1025,18 @@ static void record_intentions(const char *output) {
             close(fd);
         }
 
-        fprintf(stderr, "[autoprompt] INTEND: %s [%s] due:%s\n",
-                esc_desc, priority, due[0] ? due : "now");
+        fprintf(stderr, "[autoprompt] INTEND: %s [%s]%s%s\n",
+                esc_desc, priority,
+                has_contract ? " [contracted]" : "",
+                verify[0] ? " verify=set" : "");
 
-        /* Stream intention so TUI shows it */
+        /* Stream for TUI */
         {
             char intend_detail[512];
             snprintf(intend_detail, sizeof(intend_detail),
-                     "priority=%s due=%s | %s", priority,
-                     due[0] ? due : "now", esc_desc);
+                     "priority=%s%s | %s", priority,
+                     has_contract ? " [contract]" : "",
+                     esc_desc);
             stream_action("INTEND", intend_detail, NULL, NULL);
         }
 
@@ -1050,15 +1164,29 @@ static void complete_intentions(const char *output) {
         }
         esc_kw[ei] = '\0';
 
-        /* Use sed to replace first matching pending line */
-        char cmd[2048];
+        /* Delegate to neil-complete-intent helper -- handles verify_cmd,
+         * fulfillment_state tracking, and atomic rewrite of intentions.json. */
+        char cmd[4096];
         snprintf(cmd, sizeof(cmd),
-            "sed -i '0,/%s.*\"pending\"/{s/\"status\":\"pending\"/\"status\":\"completed\"/}' %s",
-            esc_kw, intentions_path);
+            "NEIL_HOME=%s %s/bin/neil-complete-intent '%s' 2>&1",
+            g_neil_home, g_neil_home, esc_kw);
 
         char *result = run_command(cmd);
-        free(result);
-        fprintf(stderr, "[autoprompt] DONE: %s\n", keyword);
+        if (result) {
+            fprintf(stderr, "[autoprompt] DONE: %s -> %s", keyword, result);
+
+            /* Stream result so TUI shows verify outcome */
+            char detail[512];
+            char first_line[256];
+            size_t fi = 0;
+            for (size_t i = 0; result[i] && result[i] != '\n' && fi < sizeof(first_line) - 1; i++)
+                first_line[fi++] = result[i];
+            first_line[fi] = '\0';
+            snprintf(detail, sizeof(detail), "keyword=%s | %s", keyword, first_line);
+            stream_action("DONE", detail, NULL, NULL);
+
+            free(result);
+        }
 
         p = eol;
     }
@@ -1662,9 +1790,11 @@ static char *execute_service_calls(const char *output) {
             else if (strcmp(key, "action") == 0)
                 snprintf(action, sizeof(action), "%s", val);
             else if (key[0] && val[0]) {
-                /* collect remaining params for the handler */
+                /* Collect remaining params for the handler.
+                 * Always quote values (handler.sh's eval_params handles quotes)
+                 * to preserve spaces and special chars within values. */
                 pi += snprintf(params + pi, sizeof(params) - pi,
-                    "%s%s=%s", pi > 0 ? " " : "", key, val);
+                    "%s%s=\"%s\"", pi > 0 ? " " : "", key, val);
             }
         }
 
@@ -2060,6 +2190,14 @@ static void process_prompt(const char *filename) {
     snprintf(g_current_prompt_name, sizeof(g_current_prompt_name), "%s", filename);
     g_processing = 1;
     set_seal_pose("focused", "neutral", "swim", "thought", "thinking...");
+
+    /* Tick in_progress contracted intentions: +1 beat, set start time */
+    {
+        char tick_cmd[MAX_PATH];
+        snprintf(tick_cmd, sizeof(tick_cmd), "%s/bin/neil-beat-tick 2>/dev/null", g_neil_home);
+        char *tick_out = run_command(tick_cmd);
+        free(tick_out);
+    }
 
     /* 2. Read prompt content */
     size_t prompt_len;

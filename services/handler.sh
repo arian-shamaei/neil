@@ -44,6 +44,24 @@ eval_params() {
 eval_params
 
 case "$NEIL_SERVICE" in
+    spawn_temp)
+        case "$NEIL_ACTION" in
+            run)
+                NEIL_TASK="$PARAM_task" \
+                NEIL_VERIFY="$PARAM_verify" \
+                NEIL_MAX_SEC="${PARAM_max_sec:-300}" \
+                NEIL_MEMORY="${PARAM_memory:-read_only}" \
+                NEIL_PERSONA="${PARAM_persona:-minimal}" \
+                NEIL_HOME="$HOME/.neil" \
+                python3 "$HOME/.neil/tools/temp_neil/spawn.py" 2>&1
+                ;;
+            *)
+                echo "ERROR: unknown action for spawn_temp: $NEIL_ACTION"
+                exit 1
+                ;;
+        esac
+        ;;
+
     test)
         case "$NEIL_ACTION" in
             echo)

@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""neil-persona -- manage the persona registry.
+
+Usage:
+    neil-persona list                     # list all activatable personas
+    neil-persona show <name>              # print a persona file
+    neil-persona active                   # show currently active persona
+    neil-persona switch <name>            # set active persona
+    neil-persona validate <path|name>     # check a persona file against the schema
+
+Persona files live in ~/.neil/personas/. The active persona is stored in
+~/.neil/state/active_persona.txt (default: "default").
+
+Files starting with underscore (_schema.md, _*.md) are meta and excluded
+from `list`. A persona with `draft: true` in frontmatter is also excluded.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+NEIL_HOME = Path(os.environ.get("NEIL_HOME", os.path.expanduser("~/.neil")))
+REGISTRY = NEIL_HOME / "personas"
+STATE = NEIL_HOME / "state" / "active_persona.txt"
+
+REQUIRED_FRONTMATTER_KEYS = ["name", "description", "metadata"]
+REQUIRED_METADATA_KEYS = ["version", "persona_class", "default_memory_mode"]
+REQUIRED_SECTIONS = [
+    "## 1. Identity",
+    "## 2. Behavioral Sliders",
+    "## 3. Laws",
+    "## 4. Voice Patterns",
+    "## 6. Output Standards",
+    "## 7. Neil-substrate contracts",
+    "## 9. Hard constraints",
+    "## 10. Long session rules",
+    "## 11. Failure modes",
+    "## 12. Changelog",
+]
+REQUIRED_SLIDERS = [
+    "directness", "cushioning", "emotional_intensity", "risk_tolerance",
+    "convergence", "scope", "authority", "collaboration_style", "curiosity"
+]
+
+
+def parse_frontmatter(text: str) -> tuple[dict, str]:
+    """Return (frontmatter_dict, body). Only parses if text starts with ---."""
+    if not text.startswith("---\n"):
+        return {}, text
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        return {}, text
+    raw = text[4:end]
+    body = text[end + 5:]
+
+    # Minimal YAML parser: just key: value and nested indented blocks.
+    # Good enough for our structured frontmatter without a dependency.
+    out: dict = {}
+    stack = [(0, out)]
+    lines = raw.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not line.strip() or line.strip().startswith("#"):
+            i += 1
+            continue
+        indent = len(line) - len(line.lstrip())
+        while stack and stack[-1][0] > indent:
+            stack.pop()
+        k, v = line.strip().split(":", 1) if ":" in line else (line.strip(), "")
+        k = k.strip()
+        v = v.strip()
+        if v == "" or v == ">":
+            # Folded scalar: accumulate indented lines until dedent
+            if v == ">":
+                chunks = []
+                i += 1
+                while i < len(lines):
+                    nl = lines[i]
+                    if not nl.strip():
+                        i += 1
+                        continue
+                    nindent = len(nl) - len(nl.lstrip())
+                    if nindent <= indent:
+                        break
+                    chunks.append(nl.strip())
+                    i += 1
+                stack[-1][1][k] = " ".join(chunks)
+                continue
+            # Empty value: start a dict
+            stack[-1][1][k] = {}
+            stack.append((indent + 2, stack[-1][1][k]))
+            i += 1
+            continue
+        # strip quotes
+        if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+            v = v[1:-1]
+        # parse lists
+        if v.startswith("[") and v.endswith("]"):
+            v = [x.strip().strip('"\'') for x in v[1:-1].split(",") if x.strip()]
+        stack[-1][1][k] = v
+        i += 1
+    return out, body
+
+
+def list_personas(show_meta: bool = False) -> list[dict]:
+    """Return list of {name, description, file, class, draft} for activatable personas."""
+    if not REGISTRY.exists():
+        return []
+    result = []
+    for p in sorted(REGISTRY.glob("*.md")):
+        name = p.stem
+        is_meta = name.startswith("_")
+        if is_meta and not show_meta:
+            continue
+        text = p.read_text()
+        fm, _ = parse_frontmatter(text)
+        draft = fm.get("metadata", {}).get("draft") in ("true", True)
+        if draft and not show_meta:
+            continue
+        result.append({
+            "name": name,
+            "file": str(p),
+            "description": fm.get("description", "").strip(),
+            "class": fm.get("metadata", {}).get("persona_class", ""),
+            "draft": draft,
+            "meta": is_meta,
+        })
+    return result
+
+
+def active_persona() -> str:
+    if STATE.exists():
+        v = STATE.read_text().strip()
+        if v:
+            return v
+    return "default"
+
+
+def switch_persona(name: str) -> int:
+    found = [p for p in list_personas(show_meta=True) if p["name"] == name]
+    if not found:
+        print(f"persona not found: {name}", file=sys.stderr)
+        return 1
+    if found[0]["meta"]:
+        print(f"cannot activate meta persona: {name}", file=sys.stderr)
+        return 2
+    if found[0]["draft"]:
+        print(f"cannot activate draft persona: {name}", file=sys.stderr)
+        return 3
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(name + "\n")
+    print(f"active persona -> {name}")
+    return 0
+
+
+def validate(path_or_name: str) -> int:
+    path = Path(path_or_name)
+    if not path.exists() and not path.is_absolute():
+        path = REGISTRY / (path_or_name if path_or_name.endswith(".md") else path_or_name + ".md")
+    if not path.exists():
+        print(f"file not found: {path}", file=sys.stderr)
+        return 1
+
+    text = path.read_text()
+    errors = []
+    warnings = []
+
+    # Frontmatter
+    fm, body = parse_frontmatter(text)
+    if not fm:
+        errors.append("missing YAML frontmatter (must start with ---)")
+    else:
+        for k in REQUIRED_FRONTMATTER_KEYS:
+            if k not in fm:
+                errors.append(f"frontmatter missing required key: {k}")
+        md = fm.get("metadata") if isinstance(fm.get("metadata"), dict) else {}
+        for k in REQUIRED_METADATA_KEYS:
+            if k not in md:
+                errors.append(f"metadata missing required key: {k}")
+        # name must match filename
+        if fm.get("name") and path.stem != fm["name"]:
+            errors.append(f"frontmatter name '{fm.get('name')}' does not match filename '{path.stem}'")
+
+    # Required sections
+    for section in REQUIRED_SECTIONS:
+        if section not in text:
+            errors.append(f"missing section: {section}")
+
+    # Sliders block
+    m = re.search(r'"sliders"\s*:\s*\{([^}]+)\}', body, re.DOTALL)
+    if not m:
+        errors.append("missing sliders JSON block under Section 2")
+    else:
+        sliders_text = m.group(1)
+        for slider in REQUIRED_SLIDERS:
+            if f'"{slider}"' not in sliders_text:
+                errors.append(f"missing slider: {slider}")
+
+    # Report
+    if errors:
+        print(f"VALIDATION FAILED for {path.name}:")
+        for e in errors:
+            print(f"  [ERR] {e}")
+        for w in warnings:
+            print(f"  [WRN] {w}")
+        return 1
+    if warnings:
+        print(f"valid with warnings for {path.name}:")
+        for w in warnings:
+            print(f"  [WRN] {w}")
+        return 0
+    print(f"valid: {path.name}")
+    return 0
+
+
+def cmd_list(args):
+    personas = list_personas(show_meta=args.all)
+    active = active_persona()
+    if args.json:
+        print(json.dumps({
+            "active": active,
+            "personas": personas,
+        }, indent=2))
+        return 0
+    print(f"Registry: {REGISTRY}")
+    print(f"Active:   {active}")
+    print()
+    print(f"{'name':<16} {'class':<20} {'file'}")
+    print("-" * 70)
+    for p in personas:
+        marker = "*" if p["name"] == active else " "
+        draft = " [draft]" if p["draft"] else ""
+        meta = " [meta]" if p["meta"] else ""
+        print(f"{marker} {p['name']:<14} {p['class']:<20} {Path(p['file']).name}{draft}{meta}")
+    return 0
+
+
+def cmd_show(args):
+    target = REGISTRY / (args.name if args.name.endswith(".md") else args.name + ".md")
+    if not target.exists():
+        print(f"not found: {target}", file=sys.stderr)
+        return 1
+    print(target.read_text())
+    return 0
+
+
+def cmd_active(args):
+    print(active_persona())
+    return 0
+
+
+def cmd_switch(args):
+    return switch_persona(args.name)
+
+
+def cmd_validate(args):
+    return validate(args.target)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="neil-persona")
+    sp = p.add_subparsers(dest="cmd")
+
+    p_list = sp.add_parser("list", help="list personas")
+    p_list.add_argument("--all", action="store_true", help="include meta and draft personas")
+    p_list.add_argument("--json", action="store_true")
+    p_list.set_defaults(func=cmd_list)
+
+    p_show = sp.add_parser("show", help="print a persona file")
+    p_show.add_argument("name")
+    p_show.set_defaults(func=cmd_show)
+
+    p_active = sp.add_parser("active", help="show current active persona")
+    p_active.set_defaults(func=cmd_active)
+
+    p_switch = sp.add_parser("switch", help="set active persona")
+    p_switch.add_argument("name")
+    p_switch.set_defaults(func=cmd_switch)
+
+    p_val = sp.add_parser("validate", help="validate a persona file against the schema")
+    p_val.add_argument("target", help="persona name or path")
+    p_val.set_defaults(func=cmd_validate)
+
+    args = p.parse_args()
+    if not hasattr(args, "func"):
+        p.print_help()
+        return 1
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

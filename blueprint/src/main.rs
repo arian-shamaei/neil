@@ -39,6 +39,7 @@ const PANEL_NAMES: &[(&str, &str)] = &[
     ("Services", "Registered APIs and plugins"),
     ("Failures", "Unresolved errors and lessons"),
     ("Logs", "Raw history browser"),
+    ("Cluster", "Live Neil instances and their connections"),
 ];
 
 struct FpsTracker {
@@ -107,6 +108,9 @@ fn main() -> anyhow::Result<()> {
     let mut hb_expanded: bool = false; // whether detail view is open
     let mut hb_scroll: usize = 0; // scroll offset in content pane
     let mut hb_section: usize = 0; // selected section in expanded view
+    let mut cluster_selection: usize = 0; // selected instance in Cluster panel
+    let mut cluster_expanded: bool = false; // detail view open
+    let mut cluster_scroll: usize = 0;
 
     // Pre-load prompt history from past result files
     if let Ok(entries) = fs::read_dir(&history_dir) {
@@ -372,7 +376,7 @@ fn main() -> anyhow::Result<()> {
                         render_panel_selector(frame, size, panel_selection);
                     }
                     View::Panel(idx) => {
-                        render_panel_view(frame, size, *idx, state, fps.fps, hb_selection, hb_expanded, hb_scroll, hb_section);
+                        render_panel_view(frame, size, *idx, state, fps.fps, hb_selection, hb_expanded, hb_scroll, hb_section, cluster_selection, cluster_expanded, cluster_scroll);
                     }
                 }
             })?;
@@ -650,7 +654,9 @@ fn main() -> anyhow::Result<()> {
                         View::Panel(pidx) => match key.code {
                             KeyCode::Esc | KeyCode::Tab => {
                                 if hb_expanded && *pidx == 1 {
-                                    hb_expanded = false; // back to list
+                                    hb_expanded = false;
+                                } else if cluster_expanded && *pidx == 7 {
+                                    cluster_expanded = false;
                                 } else {
                                     view = View::Chat;
                                 }
@@ -661,6 +667,8 @@ fn main() -> anyhow::Result<()> {
                                     view = View::Panel(idx);
                                     hb_expanded = false;
                                     hb_scroll = 0;
+                                    cluster_expanded = false;
+                                    cluster_scroll = 0;
                                 }
                             }
                             KeyCode::Up if *pidx == 1 => {
@@ -685,6 +693,25 @@ fn main() -> anyhow::Result<()> {
                                     hb_section = 0;
                                     hb_scroll = 0;
                                 }
+                            }
+                            KeyCode::Up if *pidx == 7 => {
+                                if cluster_expanded {
+                                    if cluster_scroll > 0 { cluster_scroll = cluster_scroll.saturating_sub(1); }
+                                } else if cluster_selection > 0 {
+                                    cluster_selection -= 1;
+                                }
+                            }
+                            KeyCode::Down if *pidx == 7 => {
+                                if cluster_expanded {
+                                    cluster_scroll += 1;
+                                } else {
+                                    // Bounded by snapshot size at render time; allow overshoot and clamp in render.
+                                    cluster_selection += 1;
+                                }
+                            }
+                            KeyCode::Enter if *pidx == 7 => {
+                                cluster_expanded = !cluster_expanded;
+                                cluster_scroll = 0;
                             }
                             _ => {}
                         },
@@ -1046,7 +1073,7 @@ fn render_stream_cached(
         Span::styled(" NEIL ", Style::default().fg(Color::Black).bg(Color::Cyan)),
         status_span,
         Span::styled(format!("{} ", time_str), Style::default().fg(Color::DarkGray)),
-        Span::styled("Alt+1-7:panels Ctrl+S:sidebar Esc:quit ", Style::default().fg(Color::Rgb(60, 60, 60))),
+        Span::styled("Alt+1-8:panels Ctrl+S:sidebar Esc:quit ", Style::default().fg(Color::Rgb(60, 60, 60))),
     ]);
     frame.render_widget(Paragraph::new(header), chunks[0]);
 
@@ -1332,7 +1359,8 @@ fn render_panel_selector(frame: &mut ratatui::Frame, area: Rect, selected: usize
 }
 
 fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: &NeilState, fps: u32,
-                     hb_sel: usize, hb_expanded: bool, hb_scroll: usize, hb_section: usize) {
+                     hb_sel: usize, hb_expanded: bool, hb_scroll: usize, hb_section: usize,
+                     cluster_sel: usize, cluster_expanded: bool, cluster_scroll: usize) {
     let (name, _) = PANEL_NAMES.get(idx).unwrap_or(&("?", ""));
 
     // Heartbeat expanded: two-pane layout rendered directly
@@ -1340,11 +1368,18 @@ fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: 
         render_heartbeat_expanded(frame, area, state, hb_sel, hb_section, hb_scroll, fps);
         return;
     }
+    // Cluster expanded: two-pane detail view
+    if idx == 7 && cluster_expanded {
+        render_cluster_expanded(frame, area, cluster_sel, cluster_scroll, fps);
+        return;
+    }
 
     let title = if idx == 1 {
         format!(" {} | Up/Down:select Enter:expand Esc:close ", name)
+    } else if idx == 7 {
+        format!(" {} | Up/Down:select Enter:open Esc:close ", name)
     } else {
-        format!(" {} | Esc:close 1-7:switch ", name)
+        format!(" {} | Esc:close 1-8:switch ", name)
     };
     let block = Block::default().borders(Borders::ALL).title(title).border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
@@ -1358,6 +1393,7 @@ fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: 
         4 => render_services_panel(state),
         5 => render_failures_panel(state),
         6 => render_logs_panel(),
+        7 => render_cluster_panel_selectable(state, cluster_sel),
         _ => vec![Line::from("Unknown panel")],
     };
     frame.render_widget(Paragraph::new(lines), inner);
@@ -1766,6 +1802,578 @@ fn render_logs_panel() -> Vec<Line<'static>> {
     content.lines().rev().take(30).collect::<Vec<_>>().into_iter().rev()
         .map(|l| Line::from(Span::styled(format!("  {}", l), Style::default().fg(Color::DarkGray))))
         .collect()
+}
+
+/// Cluster panel with selectable cards (selection highlight but no expansion).
+/// Instance index 0 = MAIN, 1..=N = live temps, N+1..=M = recent history.
+fn render_cluster_panel_selectable(_state: &NeilState, selection: usize) -> Vec<Line<'static>> {
+    cluster_lines(selection)
+}
+
+fn cluster_lines(selection: usize) -> Vec<Line<'static>> {
+    // Invoke neil-cluster to get current cluster state
+    let neil_home = env::var("NEIL_HOME").map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env::var("HOME").unwrap_or("/tmp".into())).join(".neil"));
+    let bin = neil_home.join("bin/neil-cluster");
+    if !bin.exists() {
+        return vec![
+            Line::from(Span::styled("  neil-cluster not installed", Style::default().fg(Color::Red))),
+            Line::from(""),
+            Line::from(Span::styled(format!("  expected at: {}", bin.display()), Style::default().fg(Color::DarkGray))),
+        ];
+    }
+
+    let output = std::process::Command::new(&bin)
+        .arg("status")
+        .arg("--json")
+        .arg("--compact")
+        .env("NEIL_HOME", &neil_home)
+        .output();
+
+    let json_text = match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        Ok(o) => {
+            return vec![
+                Line::from(Span::styled("  neil-cluster failed", Style::default().fg(Color::Red))),
+                Line::from(Span::styled(format!("  stderr: {}", String::from_utf8_lossy(&o.stderr)), Style::default().fg(Color::DarkGray))),
+            ];
+        }
+        Err(e) => {
+            return vec![
+                Line::from(Span::styled(format!("  error: {}", e), Style::default().fg(Color::Red))),
+            ];
+        }
+    };
+
+    // Parse JSON (handwritten; we already have serde in deps but avoid extra coupling here)
+    // Extract main fields and temp list for rendering.
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    let node_id = extract_string(&json_text, "\"node_id\"").unwrap_or("unknown".into());
+    let ts = extract_string(&json_text, "\"timestamp\"").unwrap_or("?".into());
+    lines.push(Line::from(vec![
+        Span::styled("  Cluster on ", Style::default().fg(Color::DarkGray)),
+        Span::styled(node_id.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  @ {}", ts), Style::default().fg(Color::DarkGray)),
+    ]));
+    lines.push(Line::from(""));
+
+    // MAIN card (instance index 0)
+    let main_selected = selection == 0;
+    let main_prefix = if main_selected { " > " } else { "   " };
+    let main_color = if main_selected { Color::Cyan } else { Color::Cyan };
+    let main_name = extract_main_field(&json_text, "name").unwrap_or("main".into());
+    let main_persona = extract_main_field(&json_text, "persona").unwrap_or("default".into());
+    let main_mem = extract_main_field(&json_text, "memory_type").unwrap_or("full".into());
+    let main_status = extract_main_field(&json_text, "status").unwrap_or("idle".into());
+    let main_up = extract_main_field(&json_text, "uptime_sec").unwrap_or("0".into());
+    let main_task = extract_main_field(&json_text, "current_task");
+    lines.push(Line::from(vec![
+        Span::styled(main_prefix.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled("[MAIN]  ".to_string(), Style::default().fg(main_color).add_modifier(if main_selected { Modifier::BOLD } else { Modifier::empty() })),
+        Span::styled(status_dot(&main_status).to_string(), Style::default().fg(status_color(&main_status))),
+        Span::raw(" "),
+        Span::styled(main_name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" persona={} ", main_persona), Style::default().fg(Color::Rgb(180, 130, 255))),
+        Span::styled(format!("mem={} ", main_mem), Style::default().fg(Color::Rgb(100, 180, 255))),
+        Span::styled(format!("up={}", fmt_duration(&main_up)), Style::default().fg(Color::DarkGray)),
+    ]));
+    if let Some(task) = main_task.as_deref() {
+        let task_disp: String = task.chars().take(80).collect();
+        lines.push(Line::from(vec![
+            Span::styled("         task: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(task_disp, Style::default().fg(Color::White)),
+        ]));
+    }
+
+    // Temp cards: parse the temps array, instance indices 1..=N
+    let temps = parse_temps(&json_text);
+    if temps.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  (no live temp instances)", Style::default().fg(Color::DarkGray))));
+    } else {
+        lines.push(Line::from(""));
+        for (i, t) in temps.iter().enumerate() {
+            let instance_idx = i + 1;
+            let is_sel = selection == instance_idx;
+            let sel_prefix = if is_sel { " > " } else { "   " };
+            let branch = if i == temps.len() - 1 { "└──" } else { "├──" };
+            lines.push(Line::from(vec![
+                Span::styled(sel_prefix.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{} ", branch), Style::default().fg(Color::Rgb(80, 80, 80))),
+                Span::styled("[temp]  ", Style::default().fg(Color::Yellow).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() })),
+                Span::styled(status_dot(&t.status), Style::default().fg(status_color(&t.status))),
+                Span::raw(" "),
+                Span::styled(t.name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("       ", Style::default()),
+                Span::styled(format!("persona={} ", t.persona), Style::default().fg(Color::Rgb(180, 130, 255))),
+                Span::styled(format!("mem={} ", t.memory_type), Style::default().fg(Color::Rgb(100, 180, 255))),
+                Span::styled(format!("up={}", fmt_duration(&t.uptime_sec)), Style::default().fg(Color::DarkGray)),
+            ]));
+            if !t.current_task.is_empty() {
+                let task_disp: String = t.current_task.chars().take(72).collect();
+                lines.push(Line::from(vec![
+                    Span::styled("         task: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(task_disp, Style::default().fg(Color::White)),
+                ]));
+            }
+            if let Some(pm) = &t.proposed_memories {
+                if pm > &0 {
+                    lines.push(Line::from(vec![
+                        Span::styled("         proposed: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("{} memories waiting to promote", pm),
+                            Style::default().fg(Color::Rgb(255, 200, 100)),
+                        ),
+                    ]));
+                }
+            }
+        }
+    }
+
+    // Stats footer
+    lines.push(Line::from(""));
+    let pending = extract_number(&json_text, "\"pending_promotions_count\"").unwrap_or(0);
+    let pending_color = if pending >= 5 { Color::Yellow } else { Color::DarkGray };
+    lines.push(Line::from(vec![
+        Span::styled("  pending promotions: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(pending.to_string(), Style::default().fg(pending_color).add_modifier(Modifier::BOLD)),
+    ]));
+
+    // Recent history section
+    let recent = parse_recent(&json_text);
+    if !recent.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Recent (last hour):",
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )));
+        for ev in recent.iter().rev().take(10) {
+            let (icon, color) = match ev.event.as_str() {
+                "spawn" => ("▸", Color::Yellow),
+                "complete" => ("✓", Color::Green),
+                "fail" => ("✗", Color::Red),
+                _ => ("·", Color::DarkGray),
+            };
+            let short_id: String = ev.id.chars().skip("neil_temp_".len()).take(20).collect();
+            let detail: String = ev.detail.chars().take(70).collect();
+            lines.push(Line::from(vec![
+                Span::styled("    ", Style::default()),
+                Span::styled(icon.to_string(), Style::default().fg(color)),
+                Span::styled(format!(" {} ", ev.ts), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{:<10}", ev.event), Style::default().fg(color)),
+                Span::styled(format!(" {:<20} ", short_id), Style::default().fg(Color::Rgb(120, 120, 120))),
+                Span::styled(detail, Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+
+    lines
+}
+
+struct RecentEvent {
+    ts: String,
+    event: String,
+    id: String,
+    detail: String,
+}
+
+fn parse_recent(json: &str) -> Vec<RecentEvent> {
+    let mut out = Vec::new();
+    let Some(idx) = json.find("\"recent\"") else { return out; };
+    let after = &json[idx..];
+    let Some(bracket) = after.find('[') else { return out; };
+    let body = &after[bracket..];
+    let mut depth = 0;
+    let mut end = 0;
+    for (i, c) in body.chars().enumerate() {
+        match c {
+            '[' | '{' => depth += 1,
+            ']' | '}' => { depth -= 1; if depth == 0 { end = i; break; } }
+            _ => {}
+        }
+    }
+    if end == 0 { return out; }
+    let arr = &body[1..end];
+    let bytes = arr.as_bytes();
+    let mut cur_depth = 0;
+    let mut start = 0;
+    let mut objects: Vec<&str> = Vec::new();
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'{' => { if cur_depth == 0 { start = i; } cur_depth += 1; }
+            b'}' => { cur_depth -= 1; if cur_depth == 0 { objects.push(&arr[start..=i]); } }
+            _ => {}
+        }
+    }
+    for obj in objects {
+        let e = RecentEvent {
+            ts: extract_obj_field(obj, "ts").unwrap_or_default(),
+            event: extract_obj_field(obj, "event").unwrap_or_default(),
+            id: extract_obj_field(obj, "id").unwrap_or_default(),
+            detail: extract_obj_field(obj, "detail").unwrap_or_default(),
+        };
+        out.push(e);
+    }
+    out
+}
+
+/// Cluster expanded: two-pane detail view for the selected instance.
+/// Left = instance list. Right = detail pane for selected instance.
+fn render_cluster_expanded(
+    frame: &mut ratatui::Frame, area: Rect, selection: usize, scroll: usize, fps: u32,
+) {
+    // Fetch cluster snapshot
+    let neil_home = env::var("NEIL_HOME").map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env::var("HOME").unwrap_or("/tmp".into())).join(".neil"));
+    let bin = neil_home.join("bin/neil-cluster");
+    let output = std::process::Command::new(&bin)
+        .arg("status").arg("--json").arg("--compact")
+        .env("NEIL_HOME", &neil_home)
+        .output();
+    let json_text = match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => "{}".to_string(),
+    };
+
+    // Outer block
+    let title = " Cluster: instance detail | Esc:back Up/Down:scroll ".to_string();
+    let outer = Block::default().borders(Borders::ALL).title(title)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    // Split: left 24 cols, right flexible
+    let h_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(24), Constraint::Min(30)])
+        .split(inner);
+    let left_area = h_chunks[0];
+    let right_area = h_chunks[1];
+
+    // Build instance list (MAIN + temps). Selection is bounded to list size.
+    let temps = parse_temps(&json_text);
+    let total_instances = 1 + temps.len();
+    let bounded_sel = if total_instances == 0 { 0 } else { selection.min(total_instances - 1) };
+
+    // Left column: instance list
+    let mut left_lines: Vec<Line<'static>> = vec![Line::from("")];
+    // MAIN
+    let sel_main = bounded_sel == 0;
+    left_lines.push(Line::from(vec![
+        Span::styled(if sel_main { " > " } else { "   " }, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled("MAIN", Style::default().fg(if sel_main { Color::Cyan } else { Color::DarkGray }).add_modifier(if sel_main { Modifier::BOLD } else { Modifier::empty() })),
+    ]));
+    left_lines.push(Line::from(""));
+    for (i, t) in temps.iter().enumerate() {
+        let sel = bounded_sel == i + 1;
+        let short: String = t.name.chars().skip("neil_temp_".len()).take(16).collect();
+        left_lines.push(Line::from(vec![
+            Span::styled(if sel { " > " } else { "   " }, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("temp: {}", short), Style::default().fg(if sel { Color::Yellow } else { Color::DarkGray }).add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() })),
+        ]));
+    }
+    let left_block = Block::default().borders(Borders::RIGHT).border_style(Style::default().fg(Color::Rgb(50, 50, 50)));
+    let left_inner = left_block.inner(left_area);
+    frame.render_widget(left_block, left_area);
+    frame.render_widget(Paragraph::new(left_lines), left_inner);
+
+    // Right pane: detail for selected
+    let mut right_lines: Vec<Line<'static>> = vec![Line::from("")];
+    if bounded_sel == 0 {
+        // MAIN detail
+        let name = extract_main_field(&json_text, "name").unwrap_or("main".into());
+        let persona = extract_main_field(&json_text, "persona").unwrap_or("default".into());
+        let mem = extract_main_field(&json_text, "memory_type").unwrap_or("full".into());
+        let status = extract_main_field(&json_text, "status").unwrap_or("idle".into());
+        let up = extract_main_field(&json_text, "uptime_sec").unwrap_or("0".into());
+        let pid = extract_main_field(&json_text, "pid").unwrap_or("".into());
+        let task = extract_main_field(&json_text, "current_task");
+        let pending = extract_main_field(&json_text, "pending_intentions").unwrap_or("0".into());
+
+        right_lines.push(Line::from(vec![
+            Span::styled("  MAIN NEIL  ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled(name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]));
+        right_lines.push(Line::from(""));
+        right_lines.push(field_line("status", &status, status_color(&status)));
+        right_lines.push(field_line("persona", &persona, Color::Rgb(180, 130, 255)));
+        right_lines.push(field_line("memory", &mem, Color::Rgb(100, 180, 255)));
+        right_lines.push(field_line("uptime", &fmt_duration(&up), Color::White));
+        if !pid.is_empty() {
+            right_lines.push(field_line("pid", &pid, Color::DarkGray));
+        }
+        right_lines.push(field_line("pending intentions", &pending, Color::White));
+        if let Some(t) = task.as_deref() {
+            right_lines.push(Line::from(""));
+            right_lines.push(Line::from(Span::styled("  current task:", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))));
+            right_lines.push(Line::from(Span::styled(format!("    {}", t), Style::default().fg(Color::White))));
+        }
+        right_lines.push(Line::from(""));
+        right_lines.push(Line::from(Span::styled(
+            "  This is the running local Neil. Enter the chat view (Esc, Esc) to interact.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else if let Some(t) = temps.get(bounded_sel - 1) {
+        right_lines.push(Line::from(vec![
+            Span::styled("  TEMP NEIL  ", Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled(t.name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]));
+        right_lines.push(Line::from(""));
+        right_lines.push(field_line("status", &t.status, status_color(&t.status)));
+        right_lines.push(field_line("persona", &t.persona, Color::Rgb(180, 130, 255)));
+        right_lines.push(field_line("memory", &t.memory_type, Color::Rgb(100, 180, 255)));
+        right_lines.push(field_line("uptime", &fmt_duration(&t.uptime_sec), Color::White));
+        if let Some(pm) = &t.proposed_memories {
+            right_lines.push(field_line("proposed memories", &pm.to_string(),
+                if *pm > 0 { Color::Rgb(255, 200, 100) } else { Color::DarkGray }));
+        }
+        if !t.current_task.is_empty() {
+            right_lines.push(Line::from(""));
+            right_lines.push(Line::from(Span::styled("  current task:", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))));
+            for line in textwrap_simple(&t.current_task, 72) {
+                right_lines.push(Line::from(Span::styled(format!("    {}", line), Style::default().fg(Color::White))));
+            }
+        }
+        right_lines.push(Line::from(""));
+        right_lines.push(Line::from(Span::styled(
+            "  Ephemeral instance -- will self-destruct on fulfillment or budget exhaustion.",
+            Style::default().fg(Color::DarkGray),
+        )));
+        right_lines.push(Line::from(""));
+        right_lines.push(Line::from(Span::styled(
+            "  [note] SSH-into-instance is reserved for Phase 5 VM-based children.",
+            Style::default().fg(Color::Rgb(80, 80, 80)),
+        )));
+    } else {
+        right_lines.push(Line::from(Span::styled("  (no instance at this index)", Style::default().fg(Color::DarkGray))));
+    }
+
+    // Apply scroll
+    let skip = scroll.min(right_lines.len().saturating_sub(1));
+    let visible: Vec<Line> = right_lines.into_iter().skip(skip).collect();
+    frame.render_widget(Paragraph::new(visible), right_area);
+
+    // FPS
+    let fps_text = format!(" {}fps ", fps);
+    let fl = fps_text.len() as u16;
+    let fx = area.x + area.width.saturating_sub(fl + 1);
+    let fy = area.y + area.height - 1;
+    frame.render_widget(
+        Paragraph::new(Span::styled(fps_text, Style::default().fg(Color::DarkGray))),
+        Rect::new(fx, fy, fl, 1),
+    );
+}
+
+fn field_line(label: &str, value: &str, value_color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {:<20} ", label), Style::default().fg(Color::DarkGray)),
+        Span::styled(value.to_string(), Style::default().fg(value_color)),
+    ])
+}
+
+fn render_cluster_card(
+    kind: &str, name: &str, persona: &str, memory: &str, status: &str,
+    uptime: &str, task: Option<&str>, border: Color,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  [{}]    ", kind), Style::default().fg(border)),
+        Span::styled(status_dot(status), Style::default().fg(status_color(status))),
+        Span::raw(" "),
+        Span::styled(name.to_string(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" persona={} ", persona), Style::default().fg(Color::Rgb(180, 130, 255))),
+        Span::styled(format!("mem={} ", memory), Style::default().fg(Color::Rgb(100, 180, 255))),
+        Span::styled(format!("up={}", fmt_duration(uptime)), Style::default().fg(Color::DarkGray)),
+        Span::styled(task.map(|t| format!("\n      task: {}", t.chars().take(80).collect::<String>())).unwrap_or_default(), Style::default().fg(Color::White)),
+    ])
+}
+
+fn status_dot(status: &str) -> &'static str {
+    match status {
+        "active" => "●",
+        "idle" => "○",
+        "dying" => "~",
+        "error" => "✗",
+        _ => "?",
+    }
+}
+
+fn status_color(status: &str) -> Color {
+    match status {
+        "active" => Color::Green,
+        "idle" => Color::DarkGray,
+        "dying" => Color::Yellow,
+        "error" => Color::Red,
+        _ => Color::DarkGray,
+    }
+}
+
+fn fmt_duration(sec_str: &str) -> String {
+    let sec: u64 = sec_str.parse().unwrap_or(0);
+    if sec < 60 { return format!("{}s", sec); }
+    if sec < 3600 { return format!("{}m{}s", sec / 60, sec % 60); }
+    let h = sec / 3600;
+    let m = (sec % 3600) / 60;
+    format!("{}h{}m", h, m)
+}
+
+/// Temp Neil descriptor parsed from the neil-cluster JSON blob.
+struct TempInstance {
+    name: String,
+    persona: String,
+    memory_type: String,
+    status: String,
+    uptime_sec: String,
+    current_task: String,
+    proposed_memories: Option<usize>,
+}
+
+/// Handwritten tiny JSON extractor for a top-level string field.
+/// Looks for "key":"value" and returns the value.
+fn extract_string(json: &str, key: &str) -> Option<String> {
+    let idx = json.find(key)?;
+    let after = &json[idx + key.len()..];
+    // Skip whitespace and ':'
+    let colon = after.find(':')?;
+    let after = &after[colon + 1..].trim_start();
+    let quote = after.find('"')?;
+    let start = quote + 1;
+    let rest = &after[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn extract_number(json: &str, key: &str) -> Option<usize> {
+    let idx = json.find(key)?;
+    let after = &json[idx + key.len()..];
+    let colon = after.find(':')?;
+    let after = &after[colon + 1..].trim_start();
+    let mut n = String::new();
+    for c in after.chars() {
+        if c.is_ascii_digit() { n.push(c); }
+        else if !n.is_empty() { break; }
+        else if c == '-' || c.is_whitespace() { continue; }
+        else { break; }
+    }
+    n.parse().ok()
+}
+
+/// Extract a field from the "main" object specifically.
+fn extract_main_field(json: &str, field: &str) -> Option<String> {
+    let main_idx = json.find("\"main\"")?;
+    let after_main = &json[main_idx..];
+    // Find the opening { for main's object
+    let brace = after_main.find('{')?;
+    let body = &after_main[brace..];
+    // Find matching close brace with simple depth counter
+    let mut depth = 0;
+    let mut end = 0;
+    for (i, c) in body.chars().enumerate() {
+        match c {
+            '{' => depth += 1,
+            '}' => { depth -= 1; if depth == 0 { end = i; break; } }
+            _ => {}
+        }
+    }
+    if end == 0 { return None; }
+    let main_body = &body[..=end];
+
+    let key_pat = format!("\"{}\"", field);
+    let key_idx = main_body.find(&key_pat)?;
+    let after_key = &main_body[key_idx + key_pat.len()..];
+    let colon = after_key.find(':')?;
+    let after_colon = after_key[colon + 1..].trim_start();
+
+    if after_colon.starts_with('"') {
+        let inner = &after_colon[1..];
+        let end_q = inner.find('"')?;
+        Some(inner[..end_q].to_string())
+    } else if after_colon.starts_with("null") {
+        None
+    } else {
+        // Number or boolean
+        let mut out = String::new();
+        for c in after_colon.chars() {
+            if c.is_alphanumeric() || c == '.' || c == '-' { out.push(c); }
+            else { break; }
+        }
+        if out.is_empty() { None } else { Some(out) }
+    }
+}
+
+/// Parse the "temps" array into TempInstance records.
+fn parse_temps(json: &str) -> Vec<TempInstance> {
+    let mut out = Vec::new();
+    let Some(temps_idx) = json.find("\"temps\"") else { return out; };
+    let after = &json[temps_idx..];
+    let Some(bracket) = after.find('[') else { return out; };
+    let body = &after[bracket..];
+    // Find matching ]
+    let mut depth = 0;
+    let mut end = 0;
+    for (i, c) in body.chars().enumerate() {
+        match c {
+            '[' | '{' => depth += 1,
+            ']' | '}' => { depth -= 1; if depth == 0 { end = i; break; } }
+            _ => {}
+        }
+    }
+    if end == 0 { return out; }
+    let arr = &body[1..end]; // strip outer brackets
+
+    // Split into objects at top-level }, { boundaries
+    let mut cur_depth = 0;
+    let mut start = 0;
+    let bytes = arr.as_bytes();
+    let mut objects: Vec<&str> = Vec::new();
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'{' => { if cur_depth == 0 { start = i; } cur_depth += 1; }
+            b'}' => { cur_depth -= 1; if cur_depth == 0 { objects.push(&arr[start..=i]); } }
+            _ => {}
+        }
+    }
+
+    for obj in objects {
+        let t = TempInstance {
+            name: extract_obj_field(obj, "name").unwrap_or_default(),
+            persona: extract_obj_field(obj, "persona").unwrap_or("minimal".into()),
+            memory_type: extract_obj_field(obj, "memory_type").unwrap_or("ephemeral".into()),
+            status: extract_obj_field(obj, "status").unwrap_or("active".into()),
+            uptime_sec: extract_obj_field(obj, "uptime_sec").unwrap_or("0".into()),
+            current_task: extract_obj_field(obj, "current_task").unwrap_or_default(),
+            proposed_memories: extract_obj_field(obj, "proposed_memories").and_then(|s| s.parse().ok()),
+        };
+        out.push(t);
+    }
+    out
+}
+
+fn extract_obj_field(obj: &str, field: &str) -> Option<String> {
+    let key_pat = format!("\"{}\"", field);
+    let idx = obj.find(&key_pat)?;
+    let after_key = &obj[idx + key_pat.len()..];
+    let colon = after_key.find(':')?;
+    let after_colon = after_key[colon + 1..].trim_start();
+
+    if after_colon.starts_with('"') {
+        let inner = &after_colon[1..];
+        let end_q = inner.find('"')?;
+        Some(inner[..end_q].to_string())
+    } else if after_colon.starts_with("null") {
+        None
+    } else {
+        let mut out = String::new();
+        for c in after_colon.chars() {
+            if c.is_alphanumeric() || c == '.' || c == '-' { out.push(c); }
+            else { break; }
+        }
+        if out.is_empty() { None } else { Some(out) }
+    }
 }
 
 // ── Helpers ──

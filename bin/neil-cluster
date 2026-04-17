@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""neil-cluster -- list Neil instances and their connections.
+
+Outputs JSON describing the current cognitive-OS cluster:
+  - the main (autoprompt) instance
+  - live temp Neils (running subprocesses with /tmp/neil_temp_* dirs)
+  - recent finished instances (from activity log)
+  - pending promotions (gold in-flight)
+
+Used by the blueprint TUI Cluster panel. Intended to be fast (<200ms)
+and read-only.
+
+Usage:
+    neil-cluster status            # current state
+    neil-cluster status --json     # same, compact JSON
+    neil-cluster history [--since 10m]
+    neil-cluster tree              # human-readable tree view
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+NEIL_HOME = Path(os.environ.get("NEIL_HOME", os.path.expanduser("~/.neil")))
+ACTIVITY_LOG = NEIL_HOME / "state" / "cluster_activity.jsonl"
+PENDING_PROMO = NEIL_HOME / "state" / "pending_promotions.json"
+
+
+def _active_persona() -> str:
+    p = NEIL_HOME / "state" / "active_persona.txt"
+    if p.exists():
+        return p.read_text().strip() or "default"
+    return "default"
+
+
+def _main_instance() -> dict:
+    """Describe the main Neil (autoprompt process + its current context)."""
+    inst = {
+        "id":           "main",
+        "name":         "main",
+        "kind":         "persistent",
+        "host":         os.environ.get("NEIL_NODE_ID", "sealserver"),
+        "persona":      _active_persona(),
+        "memory_type":  "full",
+        "status":       "idle",
+        "pid":          None,
+        "uptime_sec":   0,
+        "parent":       None,
+        "children":     [],
+        "current_task": None,
+    }
+
+    # Find autoprompt process
+    try:
+        r = subprocess.run(["pgrep", "-f", "tools/autoPrompter/autoprompt"],
+                           capture_output=True, text=True, timeout=2)
+        pids = [p for p in r.stdout.strip().split("\n") if p.strip()]
+        if pids:
+            inst["pid"] = int(pids[0])
+            try:
+                with open(f"/proc/{pids[0]}/stat") as f:
+                    parts = f.read().split()
+                    start_ticks = int(parts[21])
+                    # convert clock ticks since boot -> wall-clock approximate
+                    clk_tck = os.sysconf("SC_CLK_TCK")
+                    with open("/proc/uptime") as u:
+                        uptime_now = float(u.read().split()[0])
+                    proc_uptime = uptime_now - (start_ticks / clk_tck)
+                    inst["uptime_sec"] = int(proc_uptime)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Check if a beat is active (stream running)
+    stream = NEIL_HOME / ".neil_stream"
+    if stream.exists():
+        try:
+            head = stream.read_text(errors="ignore")[:200]
+            if '"running"' in head:
+                inst["status"] = "active"
+                m = re.search(r'"prompt":"([^"]+)"', head)
+                if m:
+                    inst["current_task"] = m.group(1)
+            elif '"done"' in head:
+                inst["status"] = "idle"
+        except Exception:
+            pass
+
+    # Count pending intentions as a load signal
+    try:
+        intents_path = NEIL_HOME / "intentions.json"
+        if intents_path.exists():
+            pending = 0
+            for line in intents_path.read_text().splitlines():
+                line = line.strip()
+                if not line: continue
+                try:
+                    e = json.loads(line)
+                    if e.get("status") == "pending":
+                        pending += 1
+                except Exception:
+                    pass
+            inst["pending_intentions"] = pending
+    except Exception:
+        pass
+
+    return inst
+
+
+def _live_temp_instances() -> list[dict]:
+    """Enumerate currently running temp Neils by /tmp/neil_temp_* dirs + process."""
+    out = []
+    for d in glob.glob("/tmp/neil_temp_*"):
+        if not os.path.isdir(d):
+            continue
+        name = os.path.basename(d)
+        # name format: neil_temp_<ts>_<pid>_<rnd>
+        parts = name.split("_")
+        created_ts = None
+        pid_hint = None
+        try:
+            if len(parts) >= 3:
+                created_ts = int(parts[2])
+            if len(parts) >= 4:
+                pid_hint = int(parts[3])
+        except ValueError:
+            pass
+
+        inst = {
+            "id":           name,
+            "name":         name,
+            "kind":         "temporary",
+            "host":         os.environ.get("NEIL_NODE_ID", "sealserver"),
+            "persona":      "minimal",
+            "memory_type":  "ephemeral",
+            "status":       "active",
+            "pid":          None,
+            "uptime_sec":   int(time.time() - created_ts) if created_ts else 0,
+            "parent":       "main",
+            "children":     [],
+            "current_task": None,
+            "temp_home":    d,
+        }
+
+        # Look up the actual python agent process running in this temp home
+        try:
+            env_pattern = f"NEIL_HOME={d}"
+            r = subprocess.run(["pgrep", "-f", "neil_agent.py"],
+                               capture_output=True, text=True, timeout=2)
+            for pid in r.stdout.strip().split("\n"):
+                if not pid.strip(): continue
+                try:
+                    with open(f"/proc/{pid}/environ") as f:
+                        envs = f.read()
+                        if env_pattern in envs:
+                            inst["pid"] = int(pid)
+                            break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Read the task essence if present
+        task_md = Path(d) / "essence" / "task.md"
+        if task_md.exists():
+            try:
+                content = task_md.read_text()
+                m = re.search(r'Your task:\s*\n([^\n]+)', content)
+                if m:
+                    inst["current_task"] = m.group(1).strip()[:120]
+            except Exception:
+                pass
+
+        # Check if proposed_memories.json has content (gold in-flight)
+        proposed = Path(d) / "state" / "proposed_memories.json"
+        if proposed.exists():
+            try:
+                lines = [l for l in proposed.read_text().splitlines() if l.strip()]
+                inst["proposed_memories"] = len(lines)
+            except Exception:
+                pass
+
+        out.append(inst)
+    return out
+
+
+def _recent_history(since_sec: int = 3600) -> list[dict]:
+    """Read recent instance end events from activity log."""
+    if not ACTIVITY_LOG.exists():
+        return []
+    cutoff = time.time() - since_sec
+    out = []
+    for line in ACTIVITY_LOG.read_text().splitlines():
+        line = line.strip()
+        if not line: continue
+        try:
+            e = json.loads(line)
+            ts_str = e.get("ts", "")
+            ts = 0
+            if ts_str:
+                try:
+                    ts = time.mktime(time.strptime(ts_str, "%Y-%m-%dT%H-%M-%S"))
+                except ValueError:
+                    pass
+            if ts and ts >= cutoff:
+                out.append(e)
+        except Exception:
+            pass
+    return out
+
+
+def _pending_promotions_count() -> int:
+    if not PENDING_PROMO.exists():
+        return 0
+    count = 0
+    for line in PENDING_PROMO.read_text().splitlines():
+        line = line.strip()
+        if not line: continue
+        try:
+            e = json.loads(line)
+            if e.get("status", "pending") == "pending":
+                count += 1
+        except Exception:
+            pass
+    return count
+
+
+def cluster_snapshot() -> dict:
+    main = _main_instance()
+    temps = _live_temp_instances()
+    for t in temps:
+        main["children"].append(t["id"])
+    return {
+        "node_id":    os.environ.get("NEIL_NODE_ID", "sealserver"),
+        "timestamp":  time.strftime("%Y-%m-%dT%H-%M-%S"),
+        "main":       main,
+        "temps":      temps,
+        "recent":     _recent_history(3600),
+        "pending_promotions_count": _pending_promotions_count(),
+    }
+
+
+def render_tree(snap: dict) -> str:
+    """Human-readable tree view of the cluster."""
+    lines = []
+    lines.append(f"=== Cluster on {snap['node_id']} @ {snap['timestamp']} ===")
+    lines.append("")
+
+    m = snap["main"]
+    status_mark = {"active": "●", "idle": "○", "error": "✗"}.get(m["status"], "?")
+    uptime = _fmt_duration(m["uptime_sec"])
+    lines.append(f"  [MAIN]   {status_mark} {m['name']:<16} persona={m['persona']:<10} mem={m['memory_type']:<8} up={uptime}")
+    if m.get("current_task"):
+        lines.append(f"             task: {m['current_task'][:80]}")
+    if m.get("pending_intentions"):
+        lines.append(f"             pending intentions: {m['pending_intentions']}")
+
+    if snap["temps"]:
+        lines.append("")
+        for i, t in enumerate(snap["temps"]):
+            branch = "└──" if i == len(snap["temps"]) - 1 else "├──"
+            status_mark = {"active": "●", "idle": "○", "dying": "~"}.get(t["status"], "?")
+            uptime = _fmt_duration(t["uptime_sec"])
+            lines.append(f"  {branch} [temp]  {status_mark} {t['name']:<30} persona={t['persona']:<10} mem={t['memory_type']:<10} up={uptime}")
+            if t.get("current_task"):
+                lines.append(f"                   task: {t['current_task'][:60]}")
+            if t.get("proposed_memories"):
+                lines.append(f"                   proposed: {t['proposed_memories']} memories waiting to promote")
+    else:
+        lines.append("")
+        lines.append("  (no live temp instances)")
+
+    lines.append("")
+    lines.append(f"  Pending promotions: {snap['pending_promotions_count']}")
+
+    if snap["recent"]:
+        lines.append("")
+        lines.append(f"  Recent (last hour): {len(snap['recent'])} completed instances")
+
+    return "\n".join(lines)
+
+
+def _fmt_duration(sec: int) -> str:
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m{sec % 60}s"
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    return f"{h}h{m}m"
+
+
+def cmd_status(args):
+    snap = cluster_snapshot()
+    if args.json:
+        print(json.dumps(snap, indent=None if args.compact else 2))
+    else:
+        print(json.dumps(snap, indent=2))
+    return 0
+
+
+def cmd_tree(args):
+    print(render_tree(cluster_snapshot()))
+    return 0
+
+
+def cmd_history(args):
+    # Parse --since like "10m" or "1h"
+    since = args.since
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    unit = since[-1] if since and since[-1] in mult else "m"
+    val = since[:-1] if since and since[-1] in mult else since
+    try:
+        sec = int(val) * mult.get(unit, 60)
+    except ValueError:
+        sec = 600
+    items = _recent_history(sec)
+    if args.json:
+        print(json.dumps(items, indent=2))
+    else:
+        for e in items:
+            print(f"  {e.get('ts', '?')}  {e.get('event', '?'):<10}  {e.get('id', '?')}  {e.get('detail', '')[:80]}")
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="neil-cluster")
+    sp = p.add_subparsers(dest="cmd")
+
+    ps = sp.add_parser("status", help="current cluster state")
+    ps.add_argument("--json", action="store_true")
+    ps.add_argument("--compact", action="store_true")
+    ps.set_defaults(func=cmd_status)
+
+    pt = sp.add_parser("tree", help="tree view")
+    pt.set_defaults(func=cmd_tree)
+
+    ph = sp.add_parser("history", help="recent finished instances")
+    ph.add_argument("--since", default="1h")
+    ph.add_argument("--json", action="store_true")
+    ph.set_defaults(func=cmd_history)
+
+    args = p.parse_args()
+    if not hasattr(args, "func"):
+        # Default to tree view
+        print(render_tree(cluster_snapshot()))
+        return 0
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

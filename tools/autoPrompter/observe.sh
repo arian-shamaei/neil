@@ -238,6 +238,10 @@ else
 fi
 
 # Beat router: decides which 3C mode this beat should be
+if [ -x "$HOME/.neil/bin/neil-budget-check" ]; then
+    NEIL_HOME="$HOME/.neil" "$HOME/.neil/bin/neil-budget-check"
+fi
+
 if [ -x "$HOME/.neil/tools/beat_router/beat_router.sh" ]; then
     NEIL_HOME="$HOME/.neil" bash "$HOME/.neil/tools/beat_router/beat_router.sh"
 fi

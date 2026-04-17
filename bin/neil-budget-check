@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""neil-budget-check -- enforce fulfillment budgets; emit observation section.
+
+Run from observe.sh. For each in_progress or pending intention with a
+fulfillment contract:
+
+  1. Check budget limits (max_beats, max_tokens, max_wall_clock_sec, max_cost_usd).
+     If any exceeded -> status=timeout, failed_reason=<which>.
+  2. Emit a "=== Contracted Work ===" section to stdout so Neil sees
+     contracted intentions' current budget state every beat.
+
+Intended invocation:
+    NEIL_HOME=$HOME/.neil ~/.neil/bin/neil-budget-check
+
+Writes updates to intentions.json atomically. Stdout is observation text.
+"""
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+
+def main():
+    neil_home = Path(os.environ.get("NEIL_HOME", os.path.expanduser("~/.neil")))
+    path = neil_home / "intentions.json"
+
+    if not path.exists():
+        return 0
+
+    entries = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append({"_parsed": True, "data": json.loads(line)})
+        except json.JSONDecodeError:
+            entries.append({"_parsed": False, "raw": line})
+
+    now = time.time()
+    now_ts = time.strftime("%Y-%m-%dT%H-%M-%S")
+    changed = False
+    contracted_lines = []
+
+    for wrap in entries:
+        if not wrap["_parsed"]:
+            continue
+        e = wrap["data"]
+        status = e.get("status", "")
+        ful = e.get("fulfillment")
+        state = e.get("fulfillment_state")
+
+        if not ful or status not in ("pending", "in_progress"):
+            continue
+
+        budget = ful.get("budget", {})
+        if state is None:
+            state = {}
+            e["fulfillment_state"] = state
+
+        # Enforce budgets only for in_progress work (beats consumed)
+        blocker = None
+        max_beats = int(budget.get("max_beats", 0) or 0)
+        max_tokens = int(budget.get("max_tokens", 0) or 0)
+        max_wall = int(budget.get("max_wall_clock_sec", 0) or 0)
+        max_cost = float(budget.get("max_cost_usd", 0) or 0)
+
+        beats = int(state.get("beats_consumed", 0))
+        tokens = int(state.get("tokens_consumed", 0))
+        cost = float(state.get("cost_usd", 0))
+
+        wall_elapsed = 0
+        if state.get("wall_clock_start"):
+            try:
+                start_t = time.mktime(time.strptime(
+                    state["wall_clock_start"], "%Y-%m-%dT%H-%M-%S"))
+                wall_elapsed = int(now - start_t)
+            except ValueError:
+                wall_elapsed = 0
+
+        if max_beats > 0 and beats >= max_beats:
+            blocker = "beat_budget"
+        elif max_tokens > 0 and tokens >= max_tokens:
+            blocker = "token_budget"
+        elif max_wall > 0 and wall_elapsed >= max_wall:
+            blocker = "wall_clock"
+        elif max_cost > 0 and cost >= max_cost:
+            blocker = "cost_cap"
+
+        if blocker and status == "in_progress":
+            e["status"] = "timeout"
+            state["failed_reason"] = blocker
+            state["wall_clock_end"] = now_ts
+            changed = True
+
+        # Format observation line
+        desc = (e.get("description", "") or "")[:60]
+        budget_str = []
+        if max_beats > 0:
+            budget_str.append(f"beats:{beats}/{max_beats}")
+        if max_tokens > 0:
+            budget_str.append(f"tokens:{tokens}/{max_tokens}")
+        if max_wall > 0:
+            budget_str.append(f"wall:{wall_elapsed}/{max_wall}s")
+        if max_cost > 0:
+            budget_str.append(f"cost:${cost:.2f}/${max_cost:.2f}")
+
+        last_v = state.get("last_verify", "pending")
+        last_msg = (state.get("last_verify_msg", "") or "")[:80]
+
+        contracted_lines.append(
+            f"  [{e.get('priority', '?')}] {desc}"
+        )
+        contracted_lines.append(
+            f"      status={status} verify={last_v}"
+            f"{'  ' + ' '.join(budget_str) if budget_str else ''}"
+        )
+        if last_v == "fail" and last_msg:
+            contracted_lines.append(f"      last_msg: {last_msg}")
+        if blocker:
+            contracted_lines.append(f"      BUDGET EXHAUSTED: {blocker} -> marked timeout")
+
+    if changed:
+        tmp = path.with_suffix(".tmp")
+        with tmp.open("w") as f:
+            for wrap in entries:
+                if wrap["_parsed"]:
+                    f.write(json.dumps(wrap["data"], ensure_ascii=False) + "\n")
+                else:
+                    f.write(wrap["raw"] + "\n")
+        tmp.replace(path)
+
+    # Emit observation section
+    if contracted_lines:
+        print()
+        print("=== Contracted Work ===")
+        for line in contracted_lines:
+            print(line)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
