@@ -169,7 +169,7 @@ static void resolve_neil_paths(void) {
             else if (strcmp(key, "agent_manages_stream") == 0)
                 g_agent_manages_stream = atoi(val);
             else if (strcmp(key, "neil_os_enabled") == 0)
-                g_neil_os_enabled = atoi(val);
+                g_neil_os_enabled = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0) ? 1 : 0;
             else if (strcmp(key, "claude_timeout") == 0)
                 g_claude_timeout = atoi(val);
         }
