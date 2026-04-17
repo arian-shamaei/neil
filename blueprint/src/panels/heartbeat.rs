@@ -54,7 +54,7 @@ impl Panel for HeartbeatPanel {
                     Style::default().fg(status_color),
                 ),
                 Span::styled(
-                    entry.summary.chars().take(inner.width as usize - 20).collect::<String>(),
+                    entry.summary.chars().take((inner.width as usize).saturating_sub(20)).collect::<String>(),
                     Style::default().fg(Color::White),
                 ),
             ]);
