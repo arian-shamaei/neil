@@ -11,6 +11,7 @@ INTENTIONS="$NEIL_HOME/intentions.json"
 FAILURES="$NEIL_HOME/self/failures.json"
 HB_LOG="$NEIL_HOME/heartbeat_log.json"
 ROTATION="$NEIL_HOME/self/study_rotation.txt"
+APPROVALS_DIR="$NEIL_HOME/approvals"
 
 # Check config flag; silently exit if disabled
 if grep -q '^mode_routing = false' "$NEIL_HOME/config.toml" 2>/dev/null; then
@@ -19,14 +20,33 @@ fi
 
 # ---- gather state ----
 
-# Pending intentions
+# Detect approval signals: any *.md in ~/.neil/approvals/ other than README.md
+approval_signals_exist=0
+if [ -d "$APPROVALS_DIR" ]; then
+    for f in "$APPROVALS_DIR"/*.md; do
+        [ -e "$f" ] || continue
+        case "$(basename "$f")" in
+            README.md) continue ;;
+            *) approval_signals_exist=1; break ;;
+        esac
+    done
+fi
+
+# Pending intentions (skipping approval-gated ones when no signal present)
 pending_count=0
 oldest_pending=""
+skipped_approval=0
 if [ -f "$INTENTIONS" ]; then
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         case "$line" in
             *'"status":"pending"'*)
+                # Extract tag to check if this is approval-gated
+                itag=$(echo "$line" | sed 's/.*"tag":"\([^"]*\)".*/\1/')
+                if [ "$itag" = "approval" ] && [ "$approval_signals_exist" -eq 0 ]; then
+                    skipped_approval=$((skipped_approval + 1))
+                    continue
+                fi
                 pending_count=$((pending_count + 1))
                 if [ -z "$oldest_pending" ]; then
                     oldest_pending=$(echo "$line" | sed 's/.*"description":"\([^"]*\)".*/\1/' | cut -c1-100)
@@ -110,7 +130,11 @@ forbidden=""
 if [ "$pending_count" -gt 0 ]; then
     # Rule 1: pending intention
     mode="CREATIVITY"
-    reason="$pending_count pending intention(s) -- execute oldest"
+    if [ "$skipped_approval" -gt 0 ]; then
+        reason="$pending_count pending intention(s) -- execute oldest (skipped $skipped_approval approval-gated)"
+    else
+        reason="$pending_count pending intention(s) -- execute oldest"
+    fi
     target="$oldest_pending"
     required="DONE: (completed) or FAIL: (blocked) or INTEND: (refined followup)"
     forbidden="starting new initiative work while intentions pending"
@@ -142,7 +166,11 @@ elif [ "$last_mode" = "CONFIGURATION" ]; then
 else
     # Default: configuration + rotation
     mode="CONFIGURATION"
-    reason="no pending work; grounding before acting"
+    if [ "$skipped_approval" -gt 0 ]; then
+        reason="no pending non-approval work ($skipped_approval awaiting operator); grounding before acting"
+    else
+        reason="no pending work; grounding before acting"
+    fi
     required="MEMORY: of ground truth; INTEND: if something actionable emerges"
     forbidden="writing code; proposing architectures; speculation without reading"
 fi

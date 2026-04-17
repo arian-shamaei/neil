@@ -1,0 +1,1 @@
+/home/seal/.neil/self/snapshot.sh
