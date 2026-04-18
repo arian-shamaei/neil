@@ -1920,82 +1920,105 @@ fn cluster_lines(selection: usize) -> Vec<Line<'static>> {
         });
     }
 
-    // ── MAIN card (boxed, 48 wide) ──
+    // ── Layout constants (mirror cluster_preview.py) ──
+    const INDENT:   usize = 2;
+    const CARD_W:   usize = 22;
+    const GAP:      usize = 2;
+    const PER_ROW:  usize = 3;
+    const MAIN_W:   usize = 48;
+
+    let connector_style = Style::default().fg(Color::Rgb(90, 90, 110));
+
+    // Compute centered layout: MAIN and first-row children share the same center.
+    let n_first = children.len().min(PER_ROW);
+    let (main_indent, card_indent) = if n_first == 0 {
+        (INDENT, INDENT)
+    } else {
+        let row_w = n_first * CARD_W + (n_first - 1) * GAP;
+        if row_w >= MAIN_W {
+            (INDENT + (row_w - MAIN_W) / 2, INDENT)
+        } else {
+            (INDENT, INDENT + (MAIN_W - row_w) / 2)
+        }
+    };
+
+    // ── MAIN card ──
     let main_card = build_main_box(&main_name, &main_status, &main_persona, &main_mem,
                                    &main_up, &main_task, &main_pending, main_selected);
-    let indent = 4;
     for cl in main_card {
-        lines.push(prefix_line(&cl, indent));
+        lines.push(prefix_line(&cl, main_indent));
     }
 
-    if !children.is_empty() {
-        // trunk + fan-out indicator row
+    if children.is_empty() {
+        lines.push(Line::from(""));
         lines.push(prefix_line(&Line::from(Span::styled(
-            "│".to_string(), Style::default().fg(Color::Rgb(80, 80, 80)),
-        )), indent + 24));
+            "(no live children)", Style::default().fg(Color::DarkGray),
+        )), INDENT));
+    } else {
+        let main_center = main_indent + MAIN_W / 2;
+        let card_centers: Vec<usize> = (0..n_first)
+            .map(|i| card_indent + i * (CARD_W + GAP) + CARD_W / 2)
+            .collect();
 
-        // Children in rows of 3
-        let per_row: usize = 3;
-        let card_w: usize = 22; // inner width incl borders (exclusive would be card_w - 2)
-        let gap: usize = 2;
+        // Trunk line (single `│` at MAIN center)
+        let mut trunk = String::new();
+        for _ in 0..main_center { trunk.push(' '); }
+        trunk.push('│');
+        lines.push(Line::from(Span::styled(trunk, connector_style)));
 
-        for (row_idx, row) in children.chunks(per_row).enumerate() {
-            // fan-out connector line: ┌─┴─┐ style across this row
-            let mut conn_spans: Vec<Span> = vec![Span::raw(" ".repeat(indent))];
-            for (i, _) in row.iter().enumerate() {
-                if i == 0 {
-                    let half = (card_w / 2).saturating_sub(1);
-                    conn_spans.push(Span::styled("─".repeat(half), Style::default().fg(Color::Rgb(80,80,80))));
-                    conn_spans.push(Span::styled(if row.len() == 1 && row_idx == 0 { "┴".to_string() } else { "┬".to_string() },
-                                                 Style::default().fg(Color::Rgb(80,80,80))));
-                } else {
-                    let between = gap + card_w - 1;
-                    conn_spans.push(Span::styled("─".repeat(between), Style::default().fg(Color::Rgb(80,80,80))));
-                    conn_spans.push(Span::styled("┬".to_string(), Style::default().fg(Color::Rgb(80,80,80))));
-                }
-                if i == row.len() - 1 {
-                    let half = card_w / 2;
-                    conn_spans.push(Span::styled("─".repeat(half), Style::default().fg(Color::Rgb(80,80,80))));
-                }
+        // Fan-out connector: special-case N=1 as a straight drop.
+        if n_first == 1 {
+            let mut drop = String::new();
+            for _ in 0..card_centers[0] { drop.push(' '); }
+            drop.push('│');
+            lines.push(Line::from(Span::styled(drop, connector_style)));
+        } else {
+            let left = card_centers[0];
+            let right = *card_centers.last().unwrap();
+            let width = right.max(main_center) + 1;
+            let mut buf: Vec<char> = vec![' '; width];
+            for col in left..=right { buf[col] = '─'; }
+            buf[left]  = '┌';
+            buf[right] = '┐';
+            for c in &card_centers[1..card_centers.len() - 1] { buf[*c] = '┬'; }
+            if main_center > left && main_center < right {
+                buf[main_center] = if card_centers.contains(&main_center) { '┼' } else { '┴' };
             }
-            if row_idx == 0 {
-                lines.push(Line::from(conn_spans));
-                // ▼ markers above each card
-                let mut arrow_spans: Vec<Span> = vec![Span::raw(" ".repeat(indent))];
-                for (i, _) in row.iter().enumerate() {
-                    if i > 0 { arrow_spans.push(Span::raw(" ".repeat(gap))); }
-                    let left = card_w / 2;
-                    let right = card_w - left - 1;
-                    arrow_spans.push(Span::raw(" ".repeat(left)));
-                    arrow_spans.push(Span::styled("▼".to_string(), Style::default().fg(Color::Rgb(120,120,120))));
-                    arrow_spans.push(Span::raw(" ".repeat(right)));
-                }
-                lines.push(Line::from(arrow_spans));
-            }
+            lines.push(Line::from(Span::styled(
+                buf.into_iter().collect::<String>(), connector_style,
+            )));
+        }
 
-            // Render cards for this row, composing side-by-side line by line
+        // Arrow row: ▼ at each card center
+        {
+            let mut buf: Vec<char> = vec![' '; card_centers[card_centers.len()-1] + 1];
+            for c in &card_centers { buf[*c] = '▼'; }
+            lines.push(Line::from(Span::styled(
+                buf.into_iter().collect::<String>(),
+                Style::default().fg(Color::Rgb(120, 120, 120)),
+            )));
+        }
+
+        // Children cards (all rows use the same card_indent)
+        for (row_idx, row) in children.chunks(PER_ROW).enumerate() {
             let row_cards: Vec<Vec<Line<'static>>> = row.iter().enumerate().map(|(i, c)| {
-                let global_idx = row_idx * per_row + i;
+                let global_idx = row_idx * PER_ROW + i;
                 let sel = selection == global_idx + 1;
-                build_child_box(c, sel, card_w)
+                build_child_box(c, sel, CARD_W)
             }).collect();
-
             let card_h = row_cards[0].len();
             for li in 0..card_h {
-                let mut spans: Vec<Span> = vec![Span::raw(" ".repeat(indent))];
+                let mut spans: Vec<Span> = vec![Span::raw(" ".repeat(card_indent))];
                 for (i, card) in row_cards.iter().enumerate() {
-                    if i > 0 { spans.push(Span::raw(" ".repeat(gap))); }
+                    if i > 0 { spans.push(Span::raw(" ".repeat(GAP))); }
                     for s in &card[li].spans { spans.push(s.clone()); }
                 }
                 lines.push(Line::from(spans));
             }
-
-            if row_idx < (children.len() - 1) / per_row { lines.push(Line::from("")); }
+            if row_idx < (children.len() - 1) / PER_ROW {
+                lines.push(Line::from(""));
+            }
         }
-    } else {
-        lines.push(prefix_line(&Line::from(Span::styled(
-            "(no live children)", Style::default().fg(Color::DarkGray),
-        )), indent + 2));
     }
 
     // Stats footer
