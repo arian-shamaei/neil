@@ -250,6 +250,10 @@ case "$NEIL_SERVICE" in
         esac
         ;;
 
+    spawn_vm)
+        sh "$HOME/.neil/tools/spawn_vm/spawn_vm.sh"
+        ;;
+
     *)
         echo "ERROR: no handler for service '$NEIL_SERVICE'"
         exit 1

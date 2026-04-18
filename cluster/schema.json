@@ -1,0 +1,64 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Child Neil Record",
+  "description": "One entry in ~/.neil/cluster/nodes/ describing a child Neil instance spawned by this parent.",
+  "type": "object",
+  "required": ["id", "provider", "name", "transport", "status", "created"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Unique identifier; 'dryrun-*' for synthetic records."
+    },
+    "provider": {
+      "type": "string",
+      "enum": ["hetzner", "digitalocean", "lambda", "local", "dryrun"],
+      "description": "IaaS provider or 'local' for same-host subprocess."
+    },
+    "name": {
+      "type": "string",
+      "description": "Human-readable child Neil name."
+    },
+    "transport": {
+      "type": "object",
+      "description": "How the parent reaches this child.",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["ssh", "queue_sync", "http_webhook", "local_fs"]
+        },
+        "endpoint": {
+          "type": "string",
+          "description": "ssh user@host, http URL, or filesystem path."
+        },
+        "queue_path": {
+          "type": "string",
+          "description": "Path on child where prompts are dropped (absolute on child's filesystem)."
+        }
+      }
+    },
+    "status": {
+      "type": "string",
+      "enum": ["provisioning", "bootstrapping", "ready", "unreachable", "destroyed"]
+    },
+    "ip": {
+      "type": ["string", "null"],
+      "description": "Public IP (null if no public IP / not yet assigned)."
+    },
+    "size": {
+      "type": "string",
+      "description": "Provider size/flavor slug."
+    },
+    "region": {
+      "type": "string"
+    },
+    "created": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "last_heartbeat": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "Last time child sent a heartbeat to parent; null before first beat."
+    }
+  }
+}
