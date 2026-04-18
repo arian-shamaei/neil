@@ -1933,6 +1933,36 @@ fn cluster_lines(selection: usize) -> Vec<Line<'static>> {
         }
     }
 
+    // VM peers (spawn_vm). Not selectable in MVP — just listed.
+    let peers = parse_peers(&json_text);
+    if !peers.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  VM Peers (spawn_vm)",
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )));
+        for (i, p) in peers.iter().enumerate() {
+            let branch = if i == peers.len() - 1 { "└──" } else { "├──" };
+            let status_col = match p.status.as_str() {
+                "running" => Color::Green,
+                "stale"   => Color::Red,
+                "stopped" => Color::DarkGray,
+                _         => Color::Yellow,
+            };
+            lines.push(Line::from(vec![
+                Span::styled("   ".to_string(), Style::default()),
+                Span::styled(format!("{} ", branch), Style::default().fg(Color::Rgb(80, 80, 80))),
+                Span::styled("[peer]  ", Style::default().fg(Color::Rgb(100, 200, 200))),
+                Span::styled(status_dot(&p.status), Style::default().fg(status_col)),
+                Span::raw(" "),
+                Span::styled(p.name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("  ip={} ", p.ip), Style::default().fg(Color::Rgb(150, 150, 200))),
+                Span::styled(format!("image={} ", p.image), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("status={}", p.status), Style::default().fg(status_col)),
+            ]));
+        }
+    }
+
     // Stats footer
     lines.push(Line::from(""));
     let pending = extract_number(&json_text, "\"pending_promotions_count\"").unwrap_or(0);
@@ -2232,6 +2262,13 @@ struct TempInstance {
     proposed_memories: Option<usize>,
 }
 
+struct PeerInstance {
+    name: String,
+    ip: String,
+    image: String,
+    status: String,
+}
+
 /// Handwritten tiny JSON extractor for a top-level string field.
 /// Looks for "key":"value" and returns the value.
 fn extract_string(json: &str, key: &str) -> Option<String> {
@@ -2349,6 +2386,45 @@ fn parse_temps(json: &str) -> Vec<TempInstance> {
             proposed_memories: extract_obj_field(obj, "proposed_memories").and_then(|s| s.parse().ok()),
         };
         out.push(t);
+    }
+    out
+}
+
+fn parse_peers(json: &str) -> Vec<PeerInstance> {
+    let mut out = Vec::new();
+    let Some(idx) = json.find("\"peers\"") else { return out; };
+    let after = &json[idx..];
+    let Some(bracket) = after.find('[') else { return out; };
+    let body = &after[bracket..];
+    let mut depth = 0;
+    let mut end = 0;
+    for (i, c) in body.chars().enumerate() {
+        match c {
+            '[' | '{' => depth += 1,
+            ']' | '}' => { depth -= 1; if depth == 0 { end = i; break; } }
+            _ => {}
+        }
+    }
+    if end == 0 { return out; }
+    let arr = &body[1..end];
+    let mut cur_depth = 0;
+    let mut start = 0;
+    let bytes = arr.as_bytes();
+    let mut objects: Vec<&str> = Vec::new();
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'{' => { if cur_depth == 0 { start = i; } cur_depth += 1; }
+            b'}' => { cur_depth -= 1; if cur_depth == 0 { objects.push(&arr[start..=i]); } }
+            _ => {}
+        }
+    }
+    for obj in objects {
+        out.push(PeerInstance {
+            name:   extract_obj_field(obj, "name").unwrap_or_default(),
+            ip:     extract_obj_field(obj, "ip").unwrap_or_else(|| "?".into()),
+            image:  extract_obj_field(obj, "image").unwrap_or_else(|| "?".into()),
+            status: extract_obj_field(obj, "status").unwrap_or_else(|| "?".into()),
+        });
     }
     out
 }

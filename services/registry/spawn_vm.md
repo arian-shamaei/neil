@@ -1,85 +1,68 @@
-# spawn_vm Service
+---
+service: spawn_vm
+phase: 3
+category: infrastructure
+---
 
-Autonomously provision a remote VM and install Neil on it, creating a
-child Neil in the cluster. This is the transport primitive described in
-STACKABLE.md: it turns a parent Neil into something that can dispatch
-work to Neils running on other hosts (embedded, VMs, edge nodes).
+# spawn_vm
 
-Status: **Phase 2 of 5 -- registry + dispatch + cluster schema**.
-Bootstrap (Phase 3), cluster registration (Phase 4), and live-provision
-test (Phase 5) are pending. Today this service supports only dry-run
-actions that produce synthetic VM records; real provisioning requires
-operator approval and a configured provider credential.
+Autonomous VM (LXD container) provisioning. Neil calls this to create peer
+VMs on demand -- e.g. to offload parallel work, isolate experiments, or
+test new substrate changes without risk to the parent.
 
-## Account
-
-- **identity**: parent Neil with provider API credentials in vault
-- **scope**: cluster-wide; creates/destroys real cloud resources when
-  not in dry-run mode
-- **rate limit**: billable -- guardrails require operator approval for
-  non-dry-run actions
-
-## Actions
-
-### create
-
-Provision a VM and install Neil on it. Returns the child Neil's record.
+## Call surface
 
 ```
-CALL: service=spawn_vm action=create provider=hetzner size=small region=nbg1 name=neil-child-01 dry_run=1
+CALL: spawn_vm action=create  name=<name>
+CALL: spawn_vm action=destroy name=<name>
+CALL: spawn_vm action=list
+CALL: spawn_vm action=status  name=<name>
 ```
 
-| Param    | Required | Description |
-|----------|----------|-------------|
-| provider | yes      | hetzner / digitalocean / lambda |
-| size     | no       | small / medium / gpu (default small) |
-| region   | no       | provider-specific region (default provider's cheapest) |
-| name     | no       | child Neil name (default neil-child-<timestamp>) |
-| dry_run  | no       | 1 = synthetic record only, 0 = real provisioning (default 1) |
+## Effects
 
-Returns a JSON record `{id, provider, name, ip, status, created}`.
-Real provisioning (dry_run=0) requires operator approval via guardrails.
+- **create** -- `lxc launch <image> <name>`, installs sshd + python3 inside,
+  injects `~/.neil/keys/peer_ed25519.pub` into the container's
+  `/root/.ssh/authorized_keys`, waits for sshd, registers in
+  `~/.neil/state/peers.json` with `status=ready`.
+- **destroy** -- `lxc stop --force` + `lxc delete`, removes from peers.json.
+- **list** -- prints registered peers (name, IP, status, image).
+- **status** -- `lxc info` head + registry entry for one peer.
 
-### destroy
+## Preconditions
 
-Tear down a previously created VM and remove its cluster entry.
+- LXD installed, current user in `lxd` group (both set up by
+  `neil_install.sh`).
+- `~/.neil/keys/peer_ed25519[.pub]` exists (created at install time,
+  never regenerated).
 
-```
-CALL: service=spawn_vm action=destroy id=<vm_id> dry_run=1
-```
+## Post-conditions (create)
 
-| Param   | Required | Description |
-|---------|----------|-------------|
-| id      | yes      | VM id from prior create |
-| dry_run | no       | 1 = synthetic (default 1) |
+- Peer reachable: `ssh -i ~/.neil/keys/peer_ed25519 root@<ip>`.
+- Entry in `~/.neil/state/peers.json`:
+  ```json
+  {
+    "<name>": {
+      "ip": "10.x.y.z",
+      "image": "ubuntu:24.04",
+      "status": "ready",
+      "created_at": "2026-..."
+    }
+  }
+  ```
 
-### list
+## Tunables
 
-List all child Neils registered in ~/.neil/cluster/.
+- `NEIL_VM_IMAGE` env var overrides the default `ubuntu:24.04`.
+- `NEIL_HOME` env var overrides `$HOME/.neil`.
 
-```
-CALL: service=spawn_vm action=list
-```
+## Phase notes
 
-No parameters. Returns JSON array of child Neil records.
+Phase 3 = real `lxc launch`, not dry-run. Cross-host SSH is **not** used
+during setup; bootstrap rides the privileged LXD socket (`lxc exec` /
+`lxc file push`). Dispatch to an already-created peer uses the injected
+keypair over normal SSH.
 
-### status
-
-Get the status of a specific child Neil (last heartbeat, queue depth,
-reachability).
-
-```
-CALL: service=spawn_vm action=status id=<vm_id>
-```
-
-| Param | Required | Description |
-|-------|----------|-------------|
-| id    | yes      | VM id |
-
-## Implementation
-
-Dispatch lives in ~/.neil/services/handler.sh (case spawn_vm).
-Provider adapters and cluster registry writes live in
-~/.neil/tools/spawn_vm/. Dry-run mode returns deterministic synthetic
-records so the verify script can exercise all four actions without
-touching real infrastructure.
+Phase 4 (future): push Neil substrate (essence, neil_agent.py, SDK venv,
+credentials) into a freshly-created peer so it can run its own
+heartbeat -- turning "peer VM" into "peer Neil".

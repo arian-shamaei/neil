@@ -232,16 +232,63 @@ def _pending_promotions_count() -> int:
     return count
 
 
+def _live_peers() -> list[dict]:
+    # spawn_vm peers from peers.json, cross-checked against lxc list for liveness.
+    peers_file = NEIL_HOME / "state" / "peers.json"
+    if not peers_file.exists():
+        return []
+    try:
+        reg = json.loads(peers_file.read_text() or "{}")
+    except Exception:
+        return []
+    live = {}
+    try:
+        r = subprocess.run(
+            ["/snap/bin/lxc", "list", "--format", "csv", "-c", "n,s,4"],
+            capture_output=True, text=True, timeout=3,
+        )
+        for line in r.stdout.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 2:
+                live[parts[0]] = parts[1].upper()
+    except Exception:
+        pass
+    out = []
+    for name, rec in reg.items():
+        state = live.get(name)
+        if state == "RUNNING":
+            status = "running"
+        elif state:
+            status = state.lower()
+        else:
+            status = "stale"
+        out.append({
+            "id":              f"peer:{name}",
+            "name":            name,
+            "kind":            "vm_peer",
+            "ip":              rec.get("ip"),
+            "image":           rec.get("image"),
+            "status":          status,
+            "registry_status": rec.get("status"),
+            "created":         rec.get("created_at"),
+        })
+    return out
+
+
 def cluster_snapshot() -> dict:
     main = _main_instance()
     temps = _live_temp_instances()
+    peers = _live_peers()
     for t in temps:
         main["children"].append(t["id"])
+    for p in peers:
+        main["children"].append(p["id"])
     return {
         "node_id":    os.environ.get("NEIL_NODE_ID", "sealserver"),
         "timestamp":  time.strftime("%Y-%m-%dT%H-%M-%S"),
         "main":       main,
         "temps":      temps,
+        "peers":      peers,
         "recent":     _recent_history(3600),
         "pending_promotions_count": _pending_promotions_count(),
     }
@@ -276,6 +323,14 @@ def render_tree(snap: dict) -> str:
     else:
         lines.append("")
         lines.append("  (no live temp instances)")
+
+    if snap.get("peers"):
+        lines.append("")
+        for i, p in enumerate(snap["peers"]):
+            branch = "└──" if i == len(snap["peers"]) - 1 else "├──"
+            mark = {"running": "●", "stopped": "○", "stale": "✗"}.get(p["status"], "?")
+            ip = p.get("ip") or "?"
+            lines.append(f"  {branch} [peer]  {mark} {p['name']:<30} ip={ip:<15} image={p.get('image','?'):<14} status={p['status']}")
 
     lines.append("")
     lines.append(f"  Pending promotions: {snap['pending_promotions_count']}")
