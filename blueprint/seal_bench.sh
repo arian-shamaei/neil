@@ -11,7 +11,7 @@ cd "$(dirname "$0")"
 
 if [ "$1" = "watch" ]; then
     echo "Watching seal.rs for changes... (Ctrl+C to stop)"
-    echo "Run in another terminal: ssh -t seal@128.95.31.185 'NEIL_HOME=~/.neil ~/.neil/blueprint/target/release/seal_test'"
+    echo "Run in another terminal: ssh -t seal@<host> 'NEIL_HOME=~/.neil ~/.neil/blueprint/target/release/seal_test'"
     while true; do
         source ~/.cargo/env
         cargo build --release --bin seal_test 2>&1 | tail -2
