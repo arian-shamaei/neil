@@ -106,6 +106,35 @@ wait_for_ssh() {
     return 1
 }
 
+push_substrate() {
+    # Push minimal Neil substrate into the container so `neil-blueprint`
+    # (and future agent loops) can run in situ.
+    local name="$1"
+    local blueprint_bin="$HOME/.local/bin/neil-blueprint"
+    [ -x "$blueprint_bin" ] || blueprint_bin="$NEIL_HOME/blueprint/target/release/neil-blueprint"
+
+    LXC exec "$name" -- mkdir -p /root/.neil/state /root/.neil/bin /root/.neil/essence
+
+    if [ -x "$blueprint_bin" ]; then
+        LXC file push "$blueprint_bin" "$name/usr/local/bin/neil-blueprint" --mode 0755 >/dev/null 2>&1 || true
+    fi
+
+    # Essence -- copy all *.md files if present
+    if [ -d "$NEIL_HOME/essence" ]; then
+        for f in "$NEIL_HOME/essence"/*.md; do
+            [ -f "$f" ] || continue
+            LXC file push "$f" "$name/root/.neil/essence/$(basename "$f")" --mode 0644 >/dev/null 2>&1 || true
+        done
+    fi
+
+    # Minimal state files so the TUI doesn't choke on missing inputs
+    LXC exec "$name" -- bash -c '
+        [ -f /root/.neil/state/intentions.json ]    || echo "[]" > /root/.neil/state/intentions.json
+        [ -f /root/.neil/state/heartbeat_log.json ] || echo "[]" > /root/.neil/state/heartbeat_log.json
+        [ -f /root/.neil/state/peers.json ]         || echo "{}" > /root/.neil/state/peers.json
+    '
+}
+
 cmd_create() {
     local name="$1"
     [ -z "$name" ] && die "usage: spawn_vm create <name>"
@@ -120,6 +149,10 @@ cmd_create() {
         die "timed out waiting for IP"
     }
     log "  $name @ $ip"
+
+    # Register immediately as "provisioning" so the cluster panel sees
+    # the peer in real time while apt/ssh setup runs.
+    registry_set "$name" "$ip" "$IMAGE" "provisioning"
 
     log "installing sshd + python3..."
     LXC exec "$name" -- bash -c '
@@ -139,6 +172,9 @@ cmd_create() {
         registry_set "$name" "$ip" "$IMAGE" "ssh-timeout"
         die "sshd didn't come up"
     }
+
+    log "pushing Neil substrate..."
+    push_substrate "$name"
 
     registry_set "$name" "$ip" "$IMAGE" "ready"
     log "READY  $name  ip=$ip  ssh -i $KEY_PRIV root@$ip"

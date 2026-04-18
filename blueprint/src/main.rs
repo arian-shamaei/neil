@@ -710,8 +710,34 @@ fn main() -> anyhow::Result<()> {
                                 }
                             }
                             KeyCode::Enter if *pidx == 7 => {
-                                cluster_expanded = !cluster_expanded;
-                                cluster_scroll = 0;
+                                // If the selection lands on a peer card, suspend
+                                // the TUI and SSH into that peer (Phase 4 hook).
+                                if let Some(peer_ip) = peer_ip_at(cluster_selection) {
+                                    let key_path = env::var("NEIL_HOME")
+                                        .map(PathBuf::from)
+                                        .unwrap_or_else(|_| PathBuf::from(env::var("HOME").unwrap_or("/tmp".into())).join(".neil"))
+                                        .join("keys/peer_ed25519");
+                                    // Suspend TUI
+                                    let _ = terminal::disable_raw_mode();
+                                    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                                    let _ = std::process::Command::new("ssh")
+                                        .args([
+                                            "-t",
+                                            "-o", "StrictHostKeyChecking=no",
+                                            "-o", "UserKnownHostsFile=/dev/null",
+                                            "-i", key_path.to_str().unwrap_or(""),
+                                            &format!("root@{}", peer_ip),
+                                            "command -v neil-blueprint >/dev/null && neil-blueprint || exec bash -l",
+                                        ])
+                                        .status();
+                                    // Resume TUI
+                                    let _ = execute!(io::stdout(), EnterAlternateScreen);
+                                    let _ = terminal::enable_raw_mode();
+                                    needs_redraw = true;
+                                } else {
+                                    cluster_expanded = !cluster_expanded;
+                                    cluster_scroll = 0;
+                                }
                             }
                             _ => {}
                         },
@@ -1858,109 +1884,118 @@ fn cluster_lines(selection: usize) -> Vec<Line<'static>> {
     ]));
     lines.push(Line::from(""));
 
-    // MAIN card (instance index 0)
+    // ── Build the node list (MAIN + all children) ──
     let main_selected = selection == 0;
-    let main_prefix = if main_selected { " > " } else { "   " };
-    let main_color = if main_selected { Color::Cyan } else { Color::Cyan };
-    let main_name = extract_main_field(&json_text, "name").unwrap_or("main".into());
+    let main_name    = extract_main_field(&json_text, "name").unwrap_or("main".into());
     let main_persona = extract_main_field(&json_text, "persona").unwrap_or("default".into());
-    let main_mem = extract_main_field(&json_text, "memory_type").unwrap_or("full".into());
-    let main_status = extract_main_field(&json_text, "status").unwrap_or("idle".into());
-    let main_up = extract_main_field(&json_text, "uptime_sec").unwrap_or("0".into());
-    let main_task = extract_main_field(&json_text, "current_task");
-    lines.push(Line::from(vec![
-        Span::styled(main_prefix.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled("[MAIN]  ".to_string(), Style::default().fg(main_color).add_modifier(if main_selected { Modifier::BOLD } else { Modifier::empty() })),
-        Span::styled(status_dot(&main_status).to_string(), Style::default().fg(status_color(&main_status))),
-        Span::raw(" "),
-        Span::styled(main_name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" persona={} ", main_persona), Style::default().fg(Color::Rgb(180, 130, 255))),
-        Span::styled(format!("mem={} ", main_mem), Style::default().fg(Color::Rgb(100, 180, 255))),
-        Span::styled(format!("up={}", fmt_duration(&main_up)), Style::default().fg(Color::DarkGray)),
-    ]));
-    if let Some(task) = main_task.as_deref() {
-        let task_disp: String = task.chars().take(80).collect();
-        lines.push(Line::from(vec![
-            Span::styled("         task: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(task_disp, Style::default().fg(Color::White)),
-        ]));
+    let main_mem     = extract_main_field(&json_text, "memory_type").unwrap_or("full".into());
+    let main_status  = extract_main_field(&json_text, "status").unwrap_or("idle".into());
+    let main_up      = extract_main_field(&json_text, "uptime_sec").unwrap_or("0".into());
+    let main_task    = extract_main_field(&json_text, "current_task").unwrap_or_default();
+    let main_pending = extract_main_field(&json_text, "pending_intentions").unwrap_or("0".into());
+
+    let temps = parse_temps(&json_text);
+    let peers = parse_peers(&json_text);
+
+    let mut children: Vec<ChildCard> = Vec::new();
+    for t in &temps {
+        children.push(ChildCard {
+            kind: "temp",
+            name: t.name.clone(),
+            status: t.status.clone(),
+            line1: format!("persona={}", t.persona),
+            line2: format!("mem={}", t.memory_type),
+            line3: if t.current_task.is_empty() { format!("up={}", fmt_duration(&t.uptime_sec)) }
+                   else { format!("task: {}", t.current_task.chars().take(20).collect::<String>()) },
+        });
+    }
+    for p in &peers {
+        children.push(ChildCard {
+            kind: "peer",
+            name: p.name.clone(),
+            status: p.status.clone(),
+            line1: format!("ip={}", p.ip),
+            line2: format!("img={}", p.image.chars().take(18).collect::<String>()),
+            line3: format!("status={}", p.status),
+        });
     }
 
-    // Temp cards: parse the temps array, instance indices 1..=N
-    let temps = parse_temps(&json_text);
-    if temps.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("  (no live temp instances)", Style::default().fg(Color::DarkGray))));
-    } else {
-        lines.push(Line::from(""));
-        for (i, t) in temps.iter().enumerate() {
-            let instance_idx = i + 1;
-            let is_sel = selection == instance_idx;
-            let sel_prefix = if is_sel { " > " } else { "   " };
-            let branch = if i == temps.len() - 1 { "└──" } else { "├──" };
-            lines.push(Line::from(vec![
-                Span::styled(sel_prefix.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("{} ", branch), Style::default().fg(Color::Rgb(80, 80, 80))),
-                Span::styled("[temp]  ", Style::default().fg(Color::Yellow).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() })),
-                Span::styled(status_dot(&t.status), Style::default().fg(status_color(&t.status))),
-                Span::raw(" "),
-                Span::styled(t.name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("       ", Style::default()),
-                Span::styled(format!("persona={} ", t.persona), Style::default().fg(Color::Rgb(180, 130, 255))),
-                Span::styled(format!("mem={} ", t.memory_type), Style::default().fg(Color::Rgb(100, 180, 255))),
-                Span::styled(format!("up={}", fmt_duration(&t.uptime_sec)), Style::default().fg(Color::DarkGray)),
-            ]));
-            if !t.current_task.is_empty() {
-                let task_disp: String = t.current_task.chars().take(72).collect();
-                lines.push(Line::from(vec![
-                    Span::styled("         task: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(task_disp, Style::default().fg(Color::White)),
-                ]));
-            }
-            if let Some(pm) = &t.proposed_memories {
-                if pm > &0 {
-                    lines.push(Line::from(vec![
-                        Span::styled("         proposed: ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(
-                            format!("{} memories waiting to promote", pm),
-                            Style::default().fg(Color::Rgb(255, 200, 100)),
-                        ),
-                    ]));
+    // ── MAIN card (boxed, 48 wide) ──
+    let main_card = build_main_box(&main_name, &main_status, &main_persona, &main_mem,
+                                   &main_up, &main_task, &main_pending, main_selected);
+    let indent = 4;
+    for cl in main_card {
+        lines.push(prefix_line(&cl, indent));
+    }
+
+    if !children.is_empty() {
+        // trunk + fan-out indicator row
+        lines.push(prefix_line(&Line::from(Span::styled(
+            "│".to_string(), Style::default().fg(Color::Rgb(80, 80, 80)),
+        )), indent + 24));
+
+        // Children in rows of 3
+        let per_row: usize = 3;
+        let card_w: usize = 22; // inner width incl borders (exclusive would be card_w - 2)
+        let gap: usize = 2;
+
+        for (row_idx, row) in children.chunks(per_row).enumerate() {
+            // fan-out connector line: ┌─┴─┐ style across this row
+            let mut conn_spans: Vec<Span> = vec![Span::raw(" ".repeat(indent))];
+            for (i, _) in row.iter().enumerate() {
+                if i == 0 {
+                    let half = (card_w / 2).saturating_sub(1);
+                    conn_spans.push(Span::styled("─".repeat(half), Style::default().fg(Color::Rgb(80,80,80))));
+                    conn_spans.push(Span::styled(if row.len() == 1 && row_idx == 0 { "┴".to_string() } else { "┬".to_string() },
+                                                 Style::default().fg(Color::Rgb(80,80,80))));
+                } else {
+                    let between = gap + card_w - 1;
+                    conn_spans.push(Span::styled("─".repeat(between), Style::default().fg(Color::Rgb(80,80,80))));
+                    conn_spans.push(Span::styled("┬".to_string(), Style::default().fg(Color::Rgb(80,80,80))));
+                }
+                if i == row.len() - 1 {
+                    let half = card_w / 2;
+                    conn_spans.push(Span::styled("─".repeat(half), Style::default().fg(Color::Rgb(80,80,80))));
                 }
             }
-        }
-    }
+            if row_idx == 0 {
+                lines.push(Line::from(conn_spans));
+                // ▼ markers above each card
+                let mut arrow_spans: Vec<Span> = vec![Span::raw(" ".repeat(indent))];
+                for (i, _) in row.iter().enumerate() {
+                    if i > 0 { arrow_spans.push(Span::raw(" ".repeat(gap))); }
+                    let left = card_w / 2;
+                    let right = card_w - left - 1;
+                    arrow_spans.push(Span::raw(" ".repeat(left)));
+                    arrow_spans.push(Span::styled("▼".to_string(), Style::default().fg(Color::Rgb(120,120,120))));
+                    arrow_spans.push(Span::raw(" ".repeat(right)));
+                }
+                lines.push(Line::from(arrow_spans));
+            }
 
-    // VM peers (spawn_vm). Not selectable in MVP — just listed.
-    let peers = parse_peers(&json_text);
-    if !peers.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  VM Peers (spawn_vm)",
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-        )));
-        for (i, p) in peers.iter().enumerate() {
-            let branch = if i == peers.len() - 1 { "└──" } else { "├──" };
-            let status_col = match p.status.as_str() {
-                "running" => Color::Green,
-                "stale"   => Color::Red,
-                "stopped" => Color::DarkGray,
-                _         => Color::Yellow,
-            };
-            lines.push(Line::from(vec![
-                Span::styled("   ".to_string(), Style::default()),
-                Span::styled(format!("{} ", branch), Style::default().fg(Color::Rgb(80, 80, 80))),
-                Span::styled("[peer]  ", Style::default().fg(Color::Rgb(100, 200, 200))),
-                Span::styled(status_dot(&p.status), Style::default().fg(status_col)),
-                Span::raw(" "),
-                Span::styled(p.name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("  ip={} ", p.ip), Style::default().fg(Color::Rgb(150, 150, 200))),
-                Span::styled(format!("image={} ", p.image), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("status={}", p.status), Style::default().fg(status_col)),
-            ]));
+            // Render cards for this row, composing side-by-side line by line
+            let row_cards: Vec<Vec<Line<'static>>> = row.iter().enumerate().map(|(i, c)| {
+                let global_idx = row_idx * per_row + i;
+                let sel = selection == global_idx + 1;
+                build_child_box(c, sel, card_w)
+            }).collect();
+
+            let card_h = row_cards[0].len();
+            for li in 0..card_h {
+                let mut spans: Vec<Span> = vec![Span::raw(" ".repeat(indent))];
+                for (i, card) in row_cards.iter().enumerate() {
+                    if i > 0 { spans.push(Span::raw(" ".repeat(gap))); }
+                    for s in &card[li].spans { spans.push(s.clone()); }
+                }
+                lines.push(Line::from(spans));
+            }
+
+            if row_idx < (children.len() - 1) / per_row { lines.push(Line::from("")); }
         }
+    } else {
+        lines.push(prefix_line(&Line::from(Span::styled(
+            "(no live children)", Style::default().fg(Color::DarkGray),
+        )), indent + 2));
     }
 
     // Stats footer
@@ -2388,6 +2423,170 @@ fn parse_temps(json: &str) -> Vec<TempInstance> {
         out.push(t);
     }
     out
+}
+
+struct ChildCard {
+    kind: &'static str,
+    name: String,
+    status: String,
+    line1: String,
+    line2: String,
+    line3: String,
+}
+
+fn prefix_line(l: &Line<'static>, indent: usize) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ".repeat(indent))];
+    for s in &l.spans { spans.push(s.clone()); }
+    Line::from(spans)
+}
+
+fn pad_to(s: &str, width: usize) -> String {
+    let w = s.chars().count();
+    if w >= width { s.chars().take(width).collect() }
+    else { format!("{}{}", s, " ".repeat(width - w)) }
+}
+
+fn build_main_box(
+    name: &str, status: &str, persona: &str, mem: &str,
+    up: &str, task: &str, pending: &str, selected: bool,
+) -> Vec<Line<'static>> {
+    let inner = 46;
+    let border_color = if selected { Color::Cyan } else { Color::Rgb(100, 100, 140) };
+    let border_mod = if selected { Modifier::BOLD } else { Modifier::empty() };
+    let bs = Style::default().fg(border_color).add_modifier(border_mod);
+
+    let label = " MAIN ";
+    let lhs_fill = (inner - label.len()) / 2;
+    let rhs_fill = inner - label.len() - lhs_fill;
+    let mut top = vec![Span::styled("┌".to_string(), bs)];
+    top.push(Span::styled("─".repeat(lhs_fill), bs));
+    top.push(Span::styled(label.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+    top.push(Span::styled("─".repeat(rhs_fill), bs));
+    top.push(Span::styled("┐".to_string(), bs));
+    let top_line = Line::from(top);
+
+    let row = |content: Vec<Span<'static>>, used: usize| -> Line<'static> {
+        let mut spans = vec![Span::styled("│".to_string(), bs)];
+        for s in content { spans.push(s); }
+        if used < inner { spans.push(Span::raw(" ".repeat(inner - used))); }
+        spans.push(Span::styled("│".to_string(), bs));
+        Line::from(spans)
+    };
+
+    let dot = status_dot(status);
+    let dot_span = Span::styled(format!(" {} ", dot), Style::default().fg(status_color(status)));
+    let name_s = pad_to(name, 18);
+    let up_s = fmt_duration(up);
+
+    let l1_used = 3 + 18 + 3 + up_s.chars().count();
+    let line1 = row(vec![
+        dot_span,
+        Span::styled(name_s, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(" up=".to_string(), Style::default().fg(Color::DarkGray)),
+        Span::styled(up_s.clone(), Style::default().fg(Color::Rgb(180, 180, 180))),
+    ], l1_used);
+
+    let persona_s = format!(" persona={}", persona);
+    let mem_s = format!("  mem={}", mem);
+    let pending_s = format!("  pending={}", pending);
+    let l2_used = persona_s.chars().count() + mem_s.chars().count() + pending_s.chars().count();
+    let line2 = row(vec![
+        Span::styled(persona_s, Style::default().fg(Color::Rgb(180, 130, 255))),
+        Span::styled(mem_s, Style::default().fg(Color::Rgb(100, 180, 255))),
+        Span::styled(pending_s, Style::default().fg(Color::Rgb(255, 200, 100))),
+    ], l2_used);
+
+    let task_disp: String = task.chars().take(inner - 8).collect();
+    let task_str = format!(" task: {}", task_disp);
+    let l3_used = task_str.chars().count();
+    let line3 = row(vec![
+        Span::styled(task_str, Style::default().fg(Color::White)),
+    ], l3_used);
+
+    let bottom = Line::from(vec![
+        Span::styled("└".to_string(), bs),
+        Span::styled("─".repeat(inner), bs),
+        Span::styled("┘".to_string(), bs),
+    ]);
+
+    vec![top_line, line1, line2, line3, bottom]
+}
+
+fn build_child_box(c: &ChildCard, selected: bool, width: usize) -> Vec<Line<'static>> {
+    let inner = width - 2;
+    let border_color = if selected { Color::Cyan }
+        else if c.kind == "peer" { Color::Rgb(100, 200, 200) }
+        else { Color::Rgb(200, 180, 80) };
+    let border_mod = if selected { Modifier::BOLD } else { Modifier::empty() };
+    let bs = Style::default().fg(border_color).add_modifier(border_mod);
+
+    let label = format!(" {} ", c.kind);
+    let lhs_fill = (inner - label.chars().count()) / 2;
+    let rhs_fill = inner - label.chars().count() - lhs_fill;
+    let label_col = if c.kind == "peer" { Color::Rgb(100, 200, 200) } else { Color::Yellow };
+    let mut top = vec![Span::styled("┌".to_string(), bs)];
+    top.push(Span::styled("─".repeat(lhs_fill), bs));
+    top.push(Span::styled(label, Style::default().fg(label_col).add_modifier(Modifier::BOLD)));
+    top.push(Span::styled("─".repeat(rhs_fill), bs));
+    top.push(Span::styled("┐".to_string(), bs));
+
+    let row_line = |text: String, color: Color| -> Line<'static> {
+        let padded = pad_to(&text, inner);
+        Line::from(vec![
+            Span::styled("│".to_string(), bs),
+            Span::styled(padded, Style::default().fg(color)),
+            Span::styled("│".to_string(), bs),
+        ])
+    };
+
+    let dot = status_dot(&c.status);
+    let name_trim: String = c.name.chars().take(inner - 3).collect();
+    let name_row = Line::from(vec![
+        Span::styled("│".to_string(), bs),
+        Span::styled(format!(" {} ", dot), Style::default().fg(status_color(&c.status))),
+        Span::styled(pad_to(&name_trim, inner - 3), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled("│".to_string(), bs),
+    ]);
+
+    let bottom = Line::from(vec![
+        Span::styled("└".to_string(), bs),
+        Span::styled("─".repeat(inner), bs),
+        Span::styled("┘".to_string(), bs),
+    ]);
+
+    vec![
+        Line::from(top),
+        name_row,
+        row_line(format!(" {}", c.line1), Color::Rgb(150, 150, 200)),
+        row_line(format!(" {}", c.line2), Color::DarkGray),
+        row_line(format!(" {}", c.line3), Color::Rgb(180, 180, 180)),
+        bottom,
+    ]
+}
+
+/// Resolve a cluster-panel selection index to a peer IP, if the selection
+/// lands on a peer row. Layout: [MAIN=0] [temps=1..N] [peers=N+1..N+M].
+fn peer_ip_at(selection: usize) -> Option<String> {
+    let neil_home = env::var("NEIL_HOME").map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env::var("HOME").unwrap_or("/tmp".into())).join(".neil"));
+    let bin = neil_home.join("bin/neil-cluster");
+    if !bin.exists() { return None; }
+    let out = std::process::Command::new(&bin)
+        .args(["status", "--json", "--compact"])
+        .env("NEIL_HOME", &neil_home)
+        .output().ok()?;
+    if !out.status.success() { return None; }
+    let json = String::from_utf8_lossy(&out.stdout).to_string();
+    let temps = parse_temps(&json);
+    let peers = parse_peers(&json);
+    let peer_start = 1 + temps.len();
+    if selection >= peer_start && selection < peer_start + peers.len() {
+        let idx = selection - peer_start;
+        let ip = peers[idx].ip.clone();
+        if ip.is_empty() || ip == "?" { None } else { Some(ip) }
+    } else {
+        None
+    }
 }
 
 fn parse_peers(json: &str) -> Vec<PeerInstance> {
