@@ -726,7 +726,7 @@ fn main() -> anyhow::Result<()> {
                                             "-o", "StrictHostKeyChecking=no",
                                             "-o", "UserKnownHostsFile=/dev/null",
                                             "-i", key_path.to_str().unwrap_or(""),
-                                            &format!("root@{}", peer_ip),
+                                            &format!("neil@{}", peer_ip),
                                             "command -v neil-blueprint >/dev/null && neil-blueprint || exec bash -l",
                                         ])
                                         .status();
