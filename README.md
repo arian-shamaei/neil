@@ -13,11 +13,11 @@ Thinks. Remembers. Acts. Learns from mistakes. Expresses itself. **Spawns copies
   - All checks passed, 0 failures                               │ 29 notes                 │
   - Queue clear, budget 10/50                                   │  openclaw: 23            │
                                                                 └──────────────────────────┘
-  **Phase 2: REASON**                                           ┌──────────────────────────┐
+  **Phase 2: REASON**                                           ┌─────────────────────────-─┐
   Nothing broken. System in good shape.                         │∼~~∿~⢀⣴⣶⣶⣤⣄⡀∼~~∿~≈~~~~≈~∼~│
-                                                                │∼~≈~⣴⠿⠿⢿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣦⣄≈⡗⠄~~∼~│
-  HEARTBEAT: status=ok summary="All green."                     │⠀⠀⢀⣼⣿⠀⣦⡎⠍⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣦⣸⠀⠀⠀⠀│
-                                                                │   ~ neil ~               │
+                                                                │∼~≈~⣴⠿⠿⢿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣦⣄≈⡗⠄~~∼│
+  HEARTBEAT: status=ok summary="All green."                     │⠀⠀⢀⣼⣿⠀⣦⡎⠍⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣦⣸⠀⠀│
+                                                                │   ~ neil ~                │
 ┌ > ────────────────────────────────────────────────────────────┘└──────────────────────────┘
 │_                                                    30fps      │
 └────────────────────────────────────────────────────────────────┘
@@ -42,7 +42,7 @@ Neil is a **cognitive operating system** that runs autonomously on your machine.
 | **Stackable** | **Spawns peer Neils** in isolated LXD containers, each with its own essence / credentials / SDK — proven at **91.7% parallelism efficiency (N=3)** |
 | **Cognitive OS** | Formal architecture in `os/ARCHITECTURE.md`, `CONTRACTS.md`, `STACKABLE.md` |
 
-## Stackable Neil — the novel part
+## Stackable Neil
 
 Every Neil instance runs the *same* substrate. The difference between "main Neil", "peer Neil in a VM", and "ephemeral Neil for one task" is **configuration**, not code:
 
@@ -67,7 +67,7 @@ Every Neil instance runs the *same* substrate. The difference between "main Neil
 - **`spawn_temp`** — ephemeral Neil for one task, scoped memory mode, result + proposed memories harvested on exit.
 - **Cluster panel (Alt+8)** — live graphical grid of instances; selectable peer cards; Enter to SSH into a peer's own blueprint TUI.
 
-### Parallelism — benchmarked and reproducible
+### Parallelism
 
 ![benchmark](docs/parallel_benchmark.png)
 
@@ -84,7 +84,7 @@ Each peer produced a distinct SHA-256-verified artifact and a distinct `proposed
 
 Peer Neils write to their *own* `proposed_memories.json`. Parent Neil scoops those during its own heartbeats, runs them through a promotion gate, and merges only what survives. Seven memory modes control how much a peer reads/writes to parent state (`none`, `ephemeral`, `scoped`, `read_only_parent`, `synthesis_gate`, `federated`, `full`).
 
-## Neil-OS — the cognitive operating system
+## Neil-OS 
 
 The substrate is intentionally OS-shaped:
 
@@ -157,7 +157,7 @@ Formal definitions live in `os/`:
 - **Animated braille seal** — blinks, breathes, changes expression with state
 - **Configurable personas** — `personas/default.md`, `personas/_schema.md`, `neil-persona` CLI; peers can be spawned with a different persona than main
 
-## TUI — Blueprint
+## TUI 
 
 - **30fps conversation-first** terminal interface (Rust + ratatui)
 - Character-by-character streaming
