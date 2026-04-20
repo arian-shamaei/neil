@@ -13,33 +13,27 @@ GWS_BIN="$HOME/.local/bin/gws"
 # Parse params into variables
 # Handles: key=value key="quoted value" key='quoted value'
 eval_params() {
-    local params="$NEIL_PARAMS"
-    while [ -n "$params" ]; do
-        params="${params#"${params%%[![:space:]]*}"}"
-        [ -z "$params" ] && break
-        key="${params%%=*}"
-        params="${params#*=}"
-        case "$params" in
-            \"*)
-                params="${params#\"}"
-                val="${params%%\"*}"
-                params="${params#*\"}"
-                ;;
-            \'*)
-                params="${params#\'}"
-                val="${params%%\'*}"
-                params="${params#*\'}"
-                ;;
-            *)
-                val="${params%% *}"
-                case "$params" in
-                    *\ *) params="${params#* }" ;;
-                    *) params="" ;;
-                esac
-                ;;
-        esac
-        export "PARAM_$key=$val"
-    done
+    # Parse $NEIL_PARAMS into PARAM_* env vars. Uses Python shlex to handle
+    # escaped quotes inside quoted values correctly.
+    [ -z "$NEIL_PARAMS" ] && return 0
+    TMP_PARAMS=$(mktemp)
+    NEIL_PARAMS="$NEIL_PARAMS" python3 -c "
+import shlex, os, sys
+raw = os.environ.get('NEIL_PARAMS', '')
+if not raw.strip():
+    sys.exit(0)
+try:
+    tokens = shlex.split(raw)
+except Exception as e:
+    sys.stderr.write(f'[handler] eval_params shlex error: {e}\n')
+    sys.exit(0)
+for t in tokens:
+    if '=' in t:
+        k, v = t.split('=', 1)
+        print(f'export PARAM_{k}={shlex.quote(v)}')
+" > "$TMP_PARAMS"
+    . "$TMP_PARAMS"
+    rm -f "$TMP_PARAMS"
 }
 eval_params
 
