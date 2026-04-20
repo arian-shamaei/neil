@@ -1,11 +1,15 @@
 {
-  "timestamp": "2026-04-20T02:03:09-07:00",
-  "ready": false,
-  "phase1": {
-    "detector_calibration": "fail",
-    "style_extractor": "fail",
-    "semantic_fidelity": "fail",
-    "edit_scorer": "fail"
-  },
-  "dispatch_gate": "Phase 1 infra must pass before Peer-A begins Phase 2 primitives"
+  "timestamp": "2026-04-20T05:03:23-07:00",
+  "all_pass": false,
+  "dimensions": {
+    "verify_style_extractor": "fail",
+    "verify_edit_scorer": "fail",
+    "verify_semantic_fidelity": "fail",
+    "verify_detector_calibration": "fail",
+    "corpus_line_count": 1393,
+    "corpus_paragraphs": "pass",
+    "spawn_vm_registered": "pass",
+    "doc_SPEC": "pass",
+    "doc_SEED_PROMPT": "pass"
+  }
 }
