@@ -21,3 +21,10 @@ tools/autoPrompter/history/
 *.swp
 memory/mempalace/
 services/vault/*.key
+
+# ── Humanizer project — corpus is derivative + per-run state ──
+projects/humanizer/author_corpus/*.jsonl
+projects/humanizer/author_corpus/*.txt
+projects/humanizer/state/metrics.jsonl
+projects/humanizer/state/phase.json
+projects/humanizer/logs/

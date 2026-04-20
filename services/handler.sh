@@ -254,6 +254,52 @@ case "$NEIL_SERVICE" in
         sh "$HOME/.neil/tools/spawn_vm/spawn_vm.sh"
         ;;
 
+    peer_send)
+        # CALL: peer_send peer=<name> message=<text>
+        PEER="$PARAM_peer"
+        MSG="$PARAM_message"
+        if [ -z "$PEER" ] || [ -z "$MSG" ]; then
+            echo "{\"service\":\"peer_send\",\"error\":\"missing peer or message\"}" >&2
+            exit 1
+        fi
+        PEER_IP=$(python3 -c "import json; d=json.load(open('$HOME/.neil/state/peers.json')); rec=d.get('$PEER',{}); print(rec.get('ip','') if rec.get('status')=='ready' else '')" 2>/dev/null)
+        if [ -z "$PEER_IP" ]; then
+            echo "{\"service\":\"peer_send\",\"error\":\"peer '$PEER' not ready or not found\"}" >&2
+            exit 1
+        fi
+        TS=$(date -u +%Y%m%dT%H%M%SZ)
+        SENDER="${NEIL_NODE_ID:-$(hostname)}"
+        TMP=$(mktemp --suffix=.md)
+        printf '%s\n' "$MSG" > "$TMP"
+        scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -i "$HOME/.neil/keys/peer_ed25519" \
+            "$TMP" "neil@$PEER_IP:/home/neil/.neil/tools/autoPrompter/queue/${TS}_from_${SENDER}.md"
+        SCP_RC=$?
+        rm -f "$TMP"
+        if [ $SCP_RC -ne 0 ]; then
+            echo "{\"service\":\"peer_send\",\"error\":\"scp failed to $PEER@$PEER_IP\"}" >&2
+            exit 1
+        fi
+        # Log to cluster_activity.jsonl
+        python3 -c "
+import json, pathlib, datetime
+p = pathlib.Path('$HOME/.neil/state/cluster_activity.jsonl')
+p.parent.mkdir(parents=True, exist_ok=True)
+with p.open('a') as f:
+    f.write(json.dumps({
+        'ts':     datetime.datetime.utcnow().isoformat(timespec='seconds')+'Z',
+        'event':  'peer_send',
+        'sender': '$SENDER',
+        'peer':   '$PEER',
+        'peer_ip':'$PEER_IP',
+        'bytes':  len('''$MSG''')
+    }) + '\n')
+"
+        echo "{\"service\":\"peer_send\",\"peer\":\"$PEER\",\"peer_ip\":\"$PEER_IP\",\"queued\":\"${TS}_from_${SENDER}.md\"}"
+        ;;
+
+
+
     *)
         echo "ERROR: no handler for service '$NEIL_SERVICE'"
         exit 1
