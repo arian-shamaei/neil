@@ -256,6 +256,8 @@ case "$NEIL_SERVICE" in
 
     peer_send)
         # CALL: peer_send peer=<name> message=<text>
+        # Runs neil_agent.py on the peer synchronously over SSH, captures reply,
+        # logs to cluster_activity.jsonl.
         PEER="$PARAM_peer"
         MSG="$PARAM_message"
         if [ -z "$PEER" ] || [ -z "$MSG" ]; then
@@ -267,35 +269,57 @@ case "$NEIL_SERVICE" in
             echo "{\"service\":\"peer_send\",\"error\":\"peer '$PEER' not ready or not found\"}" >&2
             exit 1
         fi
-        TS=$(date -u +%Y%m%dT%H%M%SZ)
         SENDER="${NEIL_NODE_ID:-$(hostname)}"
-        TMP=$(mktemp --suffix=.md)
-        printf '%s\n' "$MSG" > "$TMP"
-        scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -i "$HOME/.neil/keys/peer_ed25519" \
-            "$TMP" "neil@$PEER_IP:/home/neil/.neil/tools/autoPrompter/queue/${TS}_from_${SENDER}.md"
-        SCP_RC=$?
-        rm -f "$TMP"
-        if [ $SCP_RC -ne 0 ]; then
-            echo "{\"service\":\"peer_send\",\"error\":\"scp failed to $PEER@$PEER_IP\"}" >&2
+
+        # Escape the message for embedding in a single-quoted ssh arg.
+        MSG_ESC=$(printf '%s' "$MSG" | sed "s/'/'\\\\''/g")
+        SYS_ESC="You are peer Neil '$PEER' on a spawned VM. A sibling Neil ('$SENDER') is sending you this message. Read your ~/.neil/essence/ and ~/.neil/state/spawn_config.json for your role. Reply concisely via the same peer_send channel if a response is expected."
+
+        # Log the outbound (before execution so failures are visible in activity log)
+        python3 - "$HOME/.neil/state/cluster_activity.jsonl" "$SENDER" "$PEER" "$PEER_IP" "sent" "$MSG" <<'LOG'
+import json, pathlib, sys, datetime
+p, sender, peer, ip, event, msg = sys.argv[1:7]
+pp = pathlib.Path(p); pp.parent.mkdir(parents=True, exist_ok=True)
+with pp.open("a") as f:
+    f.write(json.dumps({
+        "ts":      datetime.datetime.utcnow().isoformat(timespec="seconds")+"Z",
+        "event":   "peer_send_" + event,
+        "sender":  sender, "peer": peer, "peer_ip": ip,
+        "bytes":   len(msg),
+    }) + "\n")
+LOG
+
+        # Exec neil_agent.py on peer synchronously
+        REPLY=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                    -o BatchMode=yes -o ConnectTimeout=10 \
+                    -i "$HOME/.neil/keys/peer_ed25519" \
+                    "neil@$PEER_IP" \
+                    "NEIL_HOME=/home/neil/.neil /home/neil/.neil/tools/autoPrompter/agent/.venv/bin/python /home/neil/.neil/tools/autoPrompter/agent/neil_agent.py --system-prompt '$SYS_ESC' -p '$MSG_ESC' 2>&1" 2>&1)
+        SSH_RC=$?
+
+        # Log completion
+        python3 - "$HOME/.neil/state/cluster_activity.jsonl" "$SENDER" "$PEER" "$PEER_IP" "$SSH_RC" "$REPLY" <<'LOG'
+import json, pathlib, sys, datetime
+p, sender, peer, ip, rc, reply = sys.argv[1:7]
+pp = pathlib.Path(p)
+with pp.open("a") as f:
+    f.write(json.dumps({
+        "ts":         datetime.datetime.utcnow().isoformat(timespec="seconds")+"Z",
+        "event":      "peer_send_complete" if rc == "0" else "peer_send_fail",
+        "sender":     sender, "peer": peer, "peer_ip": ip,
+        "ssh_rc":     int(rc),
+        "reply_chars": len(reply),
+        "reply_head":  reply[:300],
+    }) + "\n")
+LOG
+
+        if [ "$SSH_RC" -ne 0 ]; then
+            echo "{\"service\":\"peer_send\",\"peer\":\"$PEER\",\"error\":\"ssh/agent rc=$SSH_RC\",\"reply_head\":$(python3 -c "import json,sys; print(json.dumps(sys.argv[1][:300]))" "$REPLY")}" >&2
             exit 1
         fi
-        # Log to cluster_activity.jsonl
-        python3 -c "
-import json, pathlib, datetime
-p = pathlib.Path('$HOME/.neil/state/cluster_activity.jsonl')
-p.parent.mkdir(parents=True, exist_ok=True)
-with p.open('a') as f:
-    f.write(json.dumps({
-        'ts':     datetime.datetime.utcnow().isoformat(timespec='seconds')+'Z',
-        'event':  'peer_send',
-        'sender': '$SENDER',
-        'peer':   '$PEER',
-        'peer_ip':'$PEER_IP',
-        'bytes':  len('''$MSG''')
-    }) + '\n')
-"
-        echo "{\"service\":\"peer_send\",\"peer\":\"$PEER\",\"peer_ip\":\"$PEER_IP\",\"queued\":\"${TS}_from_${SENDER}.md\"}"
+        echo "{\"service\":\"peer_send\",\"peer\":\"$PEER\",\"peer_ip\":\"$PEER_IP\",\"reply_chars\":$(printf '%s' "$REPLY" | wc -c)}"
+        # Emit peer's reply as a PROMPT: so Neil can continue reasoning on it
+        printf '\nPROMPT: [peer=%s reply] %s\n' "$PEER" "$REPLY"
         ;;
 
 
