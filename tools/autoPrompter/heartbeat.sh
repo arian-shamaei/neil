@@ -13,6 +13,20 @@ if [ ! -f "$HEARTBEAT_TEMPLATE" ]; then
     exit 1
 fi
 
+# Invariant: no heartbeats while user is actively chatting.
+# TUI writes ~/.neil/state/user_active on every submit; we skip beats until
+# the flag is older than 300s (user considered idle again).
+USER_ACTIVE="$HOME/.neil/state/user_active"
+if [ -f "$USER_ACTIVE" ]; then
+    NOW=$(date +%s)
+    MTIME=$(stat -c %Y "$USER_ACTIVE" 2>/dev/null || echo 0)
+    AGE=$((NOW - MTIME))
+    if [ "$AGE" -lt 300 ]; then
+        echo "[heartbeat] skipped: user active ${AGE}s ago (< 300s threshold)"
+        exit 0
+    fi
+fi
+
 # Guard: skip if heartbeat already queued (prevents backlog when autoPrompter is slow/stopped)
 EXISTING=$(find "$QUEUE_DIR" -maxdepth 1 -name '*_heartbeat.md' -type f 2>/dev/null | wc -l)
 if [ "$EXISTING" -gt 0 ]; then

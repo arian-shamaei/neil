@@ -466,6 +466,12 @@ fn main() -> anyhow::Result<()> {
                                         auto_scroll = true;
                                         scroll_offset = 0;
                                         let ts = chrono::Local::now().format("%Y%m%dT%H%M%S");
+                                        // Invariant: signal "user is active" so cron
+                                        // heartbeats skip until the user has been quiet ~5 min.
+                                        let _ = fs::write(
+                                            neil_home.join("state/user_active"),
+                                            ts.to_string(),
+                                        );
                                         let path = queue_dir.join(format!("{}_chat.md", ts));
                                         if msg.len() > 50_000 {
                                             stream.push(StreamEntry::new(EntryKind::System,
@@ -1416,7 +1422,7 @@ fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: 
         1 => render_heartbeat_panel(state, hb_sel),
         2 => render_intentions_panel(state),
         3 => render_system_panel(state),
-        4 => render_services_panel(state),
+        4 => crate::panels::services::render(state),
         5 => render_failures_panel(state),
         6 => render_logs_panel(),
         7 => render_cluster_panel_selectable(state, cluster_sel),
@@ -1798,14 +1804,6 @@ fn render_system_panel(s: &NeilState) -> Vec<Line<'static>> {
     ]
 }
 
-fn render_services_panel(s: &NeilState) -> Vec<Line<'static>> {
-    let mut l = vec![
-        Line::from(Span::styled(format!("  {} services", s.services.len()), Style::default().fg(Color::Cyan))),
-        Line::from(""),
-    ];
-    for svc in &s.services { l.push(Line::from(Span::styled(format!("  - {}", svc.trim_end_matches(".md")), Style::default().fg(Color::White)))); }
-    l
-}
 
 fn render_failures_panel(s: &NeilState) -> Vec<Line<'static>> {
     let p: Vec<_> = s.failures.iter().filter(|f| f.resolution == "pending").collect();
