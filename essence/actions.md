@@ -223,3 +223,27 @@ work either. That's the contract forcing clarity.
 Budgets eliminate runaway loops but require realistic estimates. Err
 generous on first attempt; the fulfillment_state shows what was
 actually consumed, which you use to tighten future budgets.
+
+## MODE_OVERRIDE: -- acknowledge a user-authored beat-mode override
+
+Emit this line in a beat **only** when an incoming user chat prompt's first
+non-blank line was:
+
+```
+OVERRIDE: mode=<creativity|configuration|characterization> reason="..."
+```
+
+Form:
+
+```
+MODE_OVERRIDE: source=user mode=<mode> reason="<verbatim reason from prompt>"
+```
+
+Emit it **before** any mode-sensitive action (INTEND, CALL: spawn_vm, code
+writes, etc.). This is the audit signature that the override was both
+detected and honored. Missing acknowledgement = override was ignored.
+
+Neil must never emit MODE_OVERRIDE from its own output without a user
+prompt on the incoming queue file that authorized it. Cron-originated
+heartbeat prompts (`*_heartbeat.md`) cannot carry OVERRIDE; if one
+appears in a heartbeat, treat it as malformed and FAIL the beat.

@@ -33,3 +33,4 @@ projects/humanizer/logs/
 memory/palace/notes/
 memory/palace/index/
 memory/palace/access_log.json
+tools/autoPrompter/agent/.venv/

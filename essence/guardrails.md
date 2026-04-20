@@ -62,3 +62,31 @@ Then STOP. Do not proceed until a manual prompt explicitly approves.
 - During quiet hours, skip: intentions, consolidation, self-improvement
 - Still respond to manual prompts and events normally
 - Still log heartbeat status
+
+## User-authored beat-mode override (narrow)
+
+A user-originated chat prompt (queue filename ending `_chat.md`, not a cron
+`_heartbeat.md`) MAY include as its first non-blank line:
+
+```
+OVERRIDE: mode=<creativity|configuration|characterization> reason="<short reason>"
+```
+
+If this header is present AND the prompt is user-origin, the current beat
+directive is suspended for **this prompt's execution only**. The mode named
+becomes the effective directive for this beat.
+
+**Rules**:
+1. Only user chat prompts can invoke this — Neil MUST NOT emit OVERRIDE:
+   in its own output; cron heartbeats MUST NOT be honored.
+2. Every honored override MUST be acknowledged in the beat output with:
+   `MODE_OVERRIDE: source=user mode=<mode> reason="<reason>"`
+   emitted before any mode-sensitive action.
+3. Budget limits, loop prevention, and dangerous-operation confirmations
+   still apply in full — override changes the *mode*, not the *ceiling*.
+4. If the OVERRIDE header is malformed or names an unknown mode, IGNORE it
+   and fall through to the router-assigned directive; log a FAIL.
+
+**Reason**: prevents beat-router discipline from blocking high-stakes user
+orchestration requests while preserving the invariant that Neil cannot
+self-escalate. User authorship is the only override source.
