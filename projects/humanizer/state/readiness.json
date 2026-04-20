@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-04-20T02:03:09-07:00",
+  "ready": false,
+  "phase1": {
+    "detector_calibration": "fail",
+    "style_extractor": "fail",
+    "semantic_fidelity": "fail",
+    "edit_scorer": "fail"
+  },
+  "dispatch_gate": "Phase 1 infra must pass before Peer-A begins Phase 2 primitives"
+}
