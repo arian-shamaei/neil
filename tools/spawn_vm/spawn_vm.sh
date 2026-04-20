@@ -206,6 +206,43 @@ EOF
     "
 }
 
+kickoff_peer() {
+    # Fire the peer's first autonomous heartbeat at spawn time. The peer
+    # reads its own spawn_config.json + essence, acknowledges its role,
+    # and writes a ready.md. Populated = not idle.
+    local name="$1" ip="$2"
+    log "kicking off first heartbeat on $name..."
+    local sys_prompt
+    sys_prompt="You are peer Neil '$name', just spawned. Read /home/neil/.neil/essence/ files and /home/neil/.neil/state/spawn_config.json to learn your role (persona, memory_mode, initial_intention, parent). Then take the FIRST action your initial_intention describes — not a full plan, the first concrete step. Write a short acknowledgment to /home/neil/.neil/state/ready.md: who you are, what your role is, what you're about to do, and what you need from your counterpart. Keep under 300 words."
+    local user_prompt="Proceed now. Read your files, write ready.md, begin your first action."
+    local reply
+    reply=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                -o BatchMode=yes -o ConnectTimeout=15 \
+                -i "$KEY_PRIV" "$PEER_USER@$ip" \
+                "NEIL_HOME=$PEER_HOME/.neil $PEER_HOME/.neil/tools/autoPrompter/agent/.venv/bin/python $PEER_HOME/.neil/tools/autoPrompter/agent/neil_agent.py --system-prompt '$sys_prompt' -p '$user_prompt' 2>&1" 2>&1)
+    local rc=$?
+    # Log to cluster_activity so parent can observe
+    python3 - "$NEIL_HOME/state/cluster_activity.jsonl" "$name" "$ip" "$rc" "$reply" <<'LOG'
+import json, pathlib, sys, datetime
+p, name, ip, rc, reply = sys.argv[1:6]
+pp = pathlib.Path(p); pp.parent.mkdir(parents=True, exist_ok=True)
+with pp.open("a") as f:
+    f.write(json.dumps({
+        "ts":         datetime.datetime.utcnow().isoformat(timespec="seconds")+"Z",
+        "event":      "peer_kickoff_complete" if rc == "0" else "peer_kickoff_fail",
+        "peer":       name,
+        "peer_ip":    ip,
+        "ssh_rc":     int(rc),
+        "reply_head": reply[:300],
+    }) + "\n")
+LOG
+    if [ $rc -eq 0 ]; then
+        log "  kickoff OK ($name replied, ready.md written on peer)"
+    else
+        log "  kickoff FAILED ($name, rc=$rc) — peer may still be reachable but not self-populated"
+    fi
+}
+
 cmd_create() {
     local name="$1"
     [ -z "$name" ] && die "usage: spawn_vm create <name>"
@@ -252,6 +289,7 @@ cmd_create() {
     push_substrate "$name"
 
     registry_set "$name" "$ip" "$IMAGE" "ready"
+    kickoff_peer "$name" "$ip"
     log "READY  $name  ip=$ip  ssh -i $KEY_PRIV $PEER_USER@$ip"
 }
 
