@@ -28,3 +28,8 @@ projects/humanizer/author_corpus/*.txt
 projects/humanizer/state/metrics.jsonl
 projects/humanizer/state/phase.json
 projects/humanizer/logs/
+
+# ── Personal memory — never track (contains private thoughts, plans, observations) ──
+memory/palace/notes/
+memory/palace/index/
+memory/palace/access_log.json
