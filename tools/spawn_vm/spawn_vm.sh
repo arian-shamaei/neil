@@ -207,39 +207,77 @@ EOF
 }
 
 kickoff_peer() {
-    # Fire the peer's first autonomous heartbeat at spawn time. The peer
-    # reads its own spawn_config.json + essence, acknowledges its role,
-    # and writes a ready.md. Populated = not idle.
+    # Fire the peer's first autonomous heartbeat at spawn time, then BLOCK
+    # until the peer writes /home/neil/.neil/state/ready.md (or we time out).
+    # This ensures spawn_vm doesn't return status=ready until the peer has
+    # provably acted on its intention. No follow-up peer_send seed needed.
     local name="$1" ip="$2"
     log "kicking off first heartbeat on $name..."
+
+    # System prompt makes ready.md a hard requirement.
     local sys_prompt
-    sys_prompt="You are peer Neil '$name', just spawned. Read /home/neil/.neil/essence/ files and /home/neil/.neil/state/spawn_config.json to learn your role (persona, memory_mode, initial_intention, parent). Then take the FIRST action your initial_intention describes — not a full plan, the first concrete step. Write a short acknowledgment to /home/neil/.neil/state/ready.md: who you are, what your role is, what you're about to do, and what you need from your counterpart. Keep under 300 words."
-    local user_prompt="Proceed now. Read your files, write ready.md, begin your first action."
-    local reply
-    reply=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                -o BatchMode=yes -o ConnectTimeout=15 \
-                -i "$KEY_PRIV" "$PEER_USER@$ip" \
-                "NEIL_HOME=$PEER_HOME/.neil $PEER_HOME/.neil/tools/autoPrompter/agent/.venv/bin/python $PEER_HOME/.neil/tools/autoPrompter/agent/neil_agent.py --system-prompt '$sys_prompt' -p '$user_prompt' 2>&1" 2>&1)
-    local rc=$?
-    # Log to cluster_activity so parent can observe
-    python3 - "$NEIL_HOME/state/cluster_activity.jsonl" "$name" "$ip" "$rc" "$reply" <<'LOG'
+    sys_prompt="You are peer Neil '$name', just spawned. MANDATORY first actions:
+(1) Read /home/neil/.neil/essence/ and /home/neil/.neil/state/spawn_config.json to learn your role (persona, memory_mode, initial_intention, parent, counterpart).
+(2) Use your write_file tool to create /home/neil/.neil/state/ready.md with: role summary (one paragraph), first concrete action you're taking based on initial_intention, what you'll send via peer_send to your counterpart (if applicable), success criterion. Under 400 words.
+(3) Only after ready.md is written, describe what you will do next.
+
+You MUST write ready.md before closing this heartbeat. That is the signal to your parent that you have acted on your intention. Do not skip it under any interpretation."
+    local user_prompt="Read your essence and spawn_config. Write /home/neil/.neil/state/ready.md per the system prompt. Then begin your first concrete action from initial_intention."
+
+    # Fire neil_agent.py on the peer (background so we can poll for ready.md)
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o BatchMode=yes -o ConnectTimeout=15 \
+        -i "$KEY_PRIV" "$PEER_USER@$ip" \
+        "NEIL_HOME=$PEER_HOME/.neil nohup $PEER_HOME/.neil/tools/autoPrompter/agent/.venv/bin/python $PEER_HOME/.neil/tools/autoPrompter/agent/neil_agent.py --system-prompt '$sys_prompt' -p '$user_prompt' > $PEER_HOME/.neil/state/kickoff.log 2>&1 &" >/dev/null 2>&1 &
+    local ssh_pid=$!
+
+    # Poll for ready.md, up to 180s (agent typically finishes in 30-90s)
+    local waited=0
+    local max_wait=180
+    local ready_exists=0
+    while [ $waited -lt $max_wait ]; do
+        if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+               -o BatchMode=yes -o ConnectTimeout=5 \
+               -i "$KEY_PRIV" "$PEER_USER@$ip" \
+               "test -s $PEER_HOME/.neil/state/ready.md" 2>/dev/null; then
+            ready_exists=1
+            break
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+    wait $ssh_pid 2>/dev/null
+
+    # Pull ready.md for logging / parent visibility
+    local ready_content=""
+    if [ $ready_exists -eq 1 ]; then
+        ready_content=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                            -o BatchMode=yes -o ConnectTimeout=5 \
+                            -i "$KEY_PRIV" "$PEER_USER@$ip" \
+                            "cat $PEER_HOME/.neil/state/ready.md" 2>/dev/null)
+    fi
+
+    # Log kickoff result to cluster_activity.jsonl
+    python3 - "$NEIL_HOME/state/cluster_activity.jsonl" "$name" "$ip" "$ready_exists" "$waited" "$ready_content" <<'LOG'
 import json, pathlib, sys, datetime
-p, name, ip, rc, reply = sys.argv[1:6]
+p, name, ip, ready, waited, content = sys.argv[1:7]
 pp = pathlib.Path(p); pp.parent.mkdir(parents=True, exist_ok=True)
 with pp.open("a") as f:
     f.write(json.dumps({
-        "ts":         datetime.datetime.utcnow().isoformat(timespec="seconds")+"Z",
-        "event":      "peer_kickoff_complete" if rc == "0" else "peer_kickoff_fail",
-        "peer":       name,
-        "peer_ip":    ip,
-        "ssh_rc":     int(rc),
-        "reply_head": reply[:300],
+        "ts":            datetime.datetime.utcnow().isoformat(timespec="seconds")+"Z",
+        "event":         "peer_kickoff_complete" if ready == "1" else "peer_kickoff_timeout",
+        "peer":          name,
+        "peer_ip":       ip,
+        "ready_md":      bool(int(ready)),
+        "waited_sec":    int(waited),
+        "ready_head":    content[:400],
     }) + "\n")
 LOG
-    if [ $rc -eq 0 ]; then
-        log "  kickoff OK ($name replied, ready.md written on peer)"
+
+    if [ $ready_exists -eq 1 ]; then
+        log "  kickoff OK ($name wrote ready.md in ${waited}s)"
     else
-        log "  kickoff FAILED ($name, rc=$rc) — peer may still be reachable but not self-populated"
+        log "  kickoff TIMEOUT ($name — no ready.md after ${max_wait}s; peer may still be processing)"
     fi
 }
 
