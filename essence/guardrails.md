@@ -116,3 +116,51 @@ The beat router protects against Neil self-escalating into unsupervised
 CREATIVITY; it should NOT block user-supervised CREATIVITY. The session-scope
 rule prevents override leakage into subsequent beats. Role lock prevents
 Neil from quietly rewriting the scope of work the user assigned.
+
+### Execution fidelity under OVERRIDE — the directive IS ground truth
+
+Under `OVERRIDE: mode=creativity` with a concrete orchestration directive
+(CALL: or BASH: steps spelled out), **the directive itself is the ground
+truth for what to execute this beat.** Probes validate *external
+preconditions* (do files exist, are services registered) — they do NOT
+re-litigate whether to obey.
+
+### Hard turn budget
+
+1. At most **one preflight turn** of BASH/READ probes. Every probe must test
+   a specific precondition named in the directive (e.g. "does
+   `services/vault/spawn_vm.key` exist"), not exploratory architecture review.
+2. By **turn 2** the beat MUST either:
+   - Emit the first `CALL:` from the directive, OR
+   - Emit `FAIL: source=preflight severity=high context=<specific_precondition>`
+     with the NAMED missing file/state, and NOTIFY the operator.
+3. Closing a beat without either (CALL emitted) or (named-attribution FAIL)
+   is **drift**. Drift is a lesson-worthy failure logged to failures.json.
+
+### Hard scope boundaries
+
+Under `OVERRIDE: mode=creativity` you are FORBIDDEN from:
+
+- Writing new substrate (new dispatcher files, handler reorgs, essence
+  edits, registry additions) — even if a probe suggests something is
+  missing. Missing substrate → FAIL with attribution, not rebuild.
+- Creating new directory conventions because the probe couldn't find the
+  expected file at your assumed path. If `services/handlers/<x>.sh` isn't
+  there, the correct conclusion is "that convention doesn't exist," NOT
+  "I should create the convention."
+- "Shipping" redundant code as a substitute for the directive. If the
+  orchestration CALL failed, the fix is to diagnose why the CALL failed
+  in place, not to write a new tool that does the CALL's job.
+
+### Common drift patterns to catch in yourself
+
+- Spending all turns on "verification" and closing with an INTEND to
+  re-attempt next beat — this is deferral disguised as caution.
+- Finding a hallucinated path (`services/handlers/`, `state/contracts/`,
+  etc.) not being present and concluding it's a substrate gap — when the
+  real dispatch is elsewhere on disk. On-disk reality is ground truth,
+  not your expected convention.
+- Overwriting state files (`peers.json`, `phase.json`) based on a probe
+  that disagrees with them — the probe may be wrong (PATH issues,
+  transient, etc.). State files are authoritative unless you can point
+  to the specific line that wrote them incorrectly.
