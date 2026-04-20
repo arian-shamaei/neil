@@ -32,7 +32,7 @@ log() { echo "[spawn_vm] $*"; }
 # Call lxc. Root always has socket access; otherwise wrap in sg lxd so
 # group membership takes effect without re-login.
 LXC() {
-    if [ "$EUID" -eq 0 ] || id -nG 2>/dev/null | grep -qw lxd; then
+    if [ "${EUID:-99999}" -eq 0 ] || id -nG 2>/dev/null | grep -qw lxd; then
         lxc "$@"
     else
         sg lxd -c "lxc $(printf '%q ' "$@")"
