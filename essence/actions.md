@@ -247,3 +247,44 @@ Neil must never emit MODE_OVERRIDE from its own output without a user
 prompt on the incoming queue file that authorized it. Cron-originated
 heartbeat prompts (`*_heartbeat.md`) cannot carry OVERRIDE; if one
 appears in a heartbeat, treat it as malformed and FAIL the beat.
+
+## CALL parameter fidelity — no paraphrasing
+
+When emitting `CALL: service=<name> action=<action> <params>`, every `key=value`
+pair must match the parameter names declared in
+`services/registry/<name>.md`. Parameter names are a strict contract:
+
+- **Unknown names are silently dropped** by the handler. (`role=x` disappears
+  if the registry declares only `persona=`.)
+- **Missing names fall back to the handler's default**. (An unset
+  `initial_intention=` becomes an empty string, and the peer will be
+  populated with no task.)
+- **Neil must not invent new parameter names** based on prompt phrasing or
+  convenient shorthand. If the operator's prompt says "role=implementer,"
+  you must translate that into the registry-declared `persona=implementer`
+  — not emit `role=implementer` verbatim.
+
+### Failure pattern (recorded 2026-04-20)
+
+A humanizer-pair spawn emitted
+`CALL: service=spawn_vm action=create name=humanizer-a role=implementer essence=humanizer-peer spec=SPEC.md phase=1.1`.
+Only `name=` is a recognized `spawn_vm` param. The peer spawned with
+empty `persona`, empty `memory_mode`, and empty `initial_intention`,
+arriving idle with no task. Wasted a full substrate-push cycle.
+
+### Correct pattern
+
+Before every `CALL`, mentally check: "have I read
+`services/registry/<service>.md`? Are these exactly the param names it
+declares?" If there's extra context that doesn't fit any declared param,
+pack it into `initial_intention="<verbatim text>"` (or the equivalent
+single long-form param for other services). Never create new param names
+to carry semantic information.
+
+### When the operator's prompt uses a different word
+
+If the operator writes `"role=implementer"` in the prompt body, that is
+prose for Neil's consumption, not a literal CALL fragment. Translate
+role → persona when emitting the CALL. The registry is the source of
+truth for param names; the operator's phrasing is the source of truth
+for param values.

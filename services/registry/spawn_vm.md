@@ -7,62 +7,86 @@ category: infrastructure
 # spawn_vm
 
 Autonomous VM (LXD container) provisioning. Neil calls this to create peer
-VMs on demand -- e.g. to offload parallel work, isolate experiments, or
-test new substrate changes without risk to the parent.
+VMs on demand — e.g. to offload parallel work, isolate experiments, or
+run paired-Neil rubber-duck cycles.
 
 ## Call surface
 
+### create — launch a peer VM
+
 ```
-CALL: spawn_vm action=create  name=<name>
-CALL: spawn_vm action=destroy name=<name>
-CALL: spawn_vm action=list
-CALL: spawn_vm action=status  name=<name>
+CALL: service=spawn_vm action=create \
+      name=<name> \
+      persona=<persona_name> \
+      memory_mode=<mode> \
+      initial_intention="<verbatim first-heartbeat prompt for the peer>"
 ```
 
-## Effects
+**Parameters:**
 
-- **create** -- `lxc launch <image> <name>`, installs sshd + python3 inside,
-  injects `~/.neil/keys/peer_ed25519.pub` into the container's
-  `/root/.ssh/authorized_keys`, waits for sshd, registers in
-  `~/.neil/state/peers.json` with `status=ready`.
-- **destroy** -- `lxc stop --force` + `lxc delete`, removes from peers.json.
-- **list** -- prints registered peers (name, IP, status, image).
-- **status** -- `lxc info` head + registry entry for one peer.
+| Param | Required | Default | Purpose |
+|---|---|---|---|
+| `name` | yes | — | Container name. Must be unique; lowercase letters, digits, hyphens. |
+| `persona` | no | `minimal` | Persona name from `~/.neil/personas/`. Written to peer's `spawn_config.json`. |
+| `memory_mode` | no | `read_only_parent` | One of: `none`, `ephemeral`, `scoped`, `read_only_parent`, `synthesis_gate`, `federated`, `full`. |
+| `initial_intention` | no | `""` | **Verbatim text** passed to the peer's first autonomous heartbeat at spawn time. Describes the peer's role, first action, counterpart, and success criterion. Empty string = peer will sit idle asking for direction. |
+
+**These are the ONLY recognized param names.** `role=`, `essence=`, `spec=`, `phase=`, etc. are NOT valid and will be silently dropped by spawn_vm.sh. Put all role-shaping text inside the single `initial_intention="..."` value.
+
+### destroy — remove a peer
+
+```
+CALL: service=spawn_vm action=destroy name=<name>
+```
+
+### list — show all registered peers
+
+```
+CALL: service=spawn_vm action=list
+```
+
+### status — inspect one peer
+
+```
+CALL: service=spawn_vm action=status name=<name>
+```
+
+## Effects of create
+
+1. `lxc launch ubuntu:24.04 <name>` — 60s cold
+2. apt install sshd + python + venv inside container — 90s
+3. Create `neil` user (non-root; required because claude-agent-sdk refuses root)
+4. Inject Neil's `peer_ed25519.pub` into peer's `authorized_keys`
+5. Push complete substrate: essence/, neil_agent.py, venv + claude-agent-sdk, credentials, services/handler.sh + registry, state skeleton
+6. Write `spawn_config.json` on peer with {name, parent_node, persona, memory_mode, initial_intention}
+7. **Fire first autonomous heartbeat on peer via ssh + neil_agent.py**: peer reads its config, acknowledges role, writes `ready.md`, begins first concrete step
+8. Register in parent's `~/.neil/state/peers.json` with `status=ready`
 
 ## Preconditions
 
-- LXD installed, current user in `lxd` group (both set up by
-  `neil_install.sh`).
-- `~/.neil/keys/peer_ed25519[.pub]` exists (created at install time,
-  never regenerated).
+- LXD installed, current user in `lxd` group
+- `~/.neil/keys/peer_ed25519[.pub]` exists
+- `~/.neil/services/vault/spawn_vm.key` exists (placeholder fine)
 
 ## Post-conditions (create)
 
-- Peer reachable: `ssh -i ~/.neil/keys/peer_ed25519 root@<ip>`.
+- Peer reachable: `ssh -i ~/.neil/keys/peer_ed25519 neil@<ip>`
+- Peer has `~/.neil/state/ready.md` describing its understanding of role
 - Entry in `~/.neil/state/peers.json`:
   ```json
-  {
-    "<name>": {
-      "ip": "10.x.y.z",
-      "image": "ubuntu:24.04",
-      "status": "ready",
-      "created_at": "2026-..."
-    }
-  }
+  {"<name>": {"ip": "10.x.y.z", "image": "ubuntu:24.04", "status": "ready", "created_at": "2026-..."}}
   ```
 
 ## Tunables
 
-- `NEIL_VM_IMAGE` env var overrides the default `ubuntu:24.04`.
-- `NEIL_HOME` env var overrides `$HOME/.neil`.
+- `NEIL_VM_IMAGE` env var overrides default `ubuntu:24.04`
+- `NEIL_HOME` env var overrides `$HOME/.neil`
+- `PEER_USER` env var (default `neil`) overrides the non-root user name
 
-## Phase notes
+## Example — correct CALL for a humanizer implementer peer
 
-Phase 3 = real `lxc launch`, not dry-run. Cross-host SSH is **not** used
-during setup; bootstrap rides the privileged LXD socket (`lxc exec` /
-`lxc file push`). Dispatch to an already-created peer uses the injected
-keypair over normal SSH.
+```
+CALL: service=spawn_vm action=create name=humanizer-a persona=implementer memory_mode=scoped initial_intention="You are the Implementer in a paired-Neil humanizer cluster. Read ~/.neil/projects/humanizer/SPEC.md. Produce Phase 1.1 (detector bench) first. Your counterpart is humanizer-b; reach it via CALL: peer_send peer=humanizer-b message=\"...\". Role lock: ship code, not orchestration."
+```
 
-Phase 4 (future): push Neil substrate (essence, neil_agent.py, SDK venv,
-credentials) into a freshly-created peer so it can run its own
-heartbeat -- turning "peer VM" into "peer Neil".
+Note the single `initial_intention="..."` containing the full role brief. Do NOT split this into multiple params like `role=implementer spec=SPEC.md phase=1.1` — those param names are not recognized.
