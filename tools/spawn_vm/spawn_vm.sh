@@ -556,7 +556,7 @@ You MUST write ready.md before closing this heartbeat. That is the signal to you
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o BatchMode=yes -o ConnectTimeout=15 \
         -i "$KEY_PRIV" "$PEER_USER@$ip" \
-        "NEIL_HOME=$PEER_HOME/.neil nohup $PEER_HOME/.neil/tools/autoPrompter/agent/.venv/bin/python $PEER_HOME/.neil/tools/autoPrompter/agent/neil_agent.py --system-prompt '$sys_prompt' -p '$user_prompt' > $PEER_HOME/.neil/state/kickoff.log 2>&1 &" >/dev/null 2>&1 &
+        "NEIL_HOME=$PEER_HOME/.neil NEIL_MAX_TURNS=50 nohup $PEER_HOME/.neil/tools/autoPrompter/agent/.venv/bin/python $PEER_HOME/.neil/tools/autoPrompter/agent/neil_agent.py --system-prompt '$sys_prompt' -p '$user_prompt' > $PEER_HOME/.neil/state/kickoff.log 2>&1 &" >/dev/null 2>&1 &
     local ssh_pid=$!
 
     # Poll for ready.md, up to 180s (agent typically finishes in 30-90s)
