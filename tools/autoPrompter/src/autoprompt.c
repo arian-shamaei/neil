@@ -1758,7 +1758,7 @@ static char *execute_service_calls(const char *output) {
 
         /* Parse service= and action= */
         char service[64] = "", action[64] = "";
-        char params[2048] = "";
+        char params[16384] = "";   /* was 2048; bumped for long initial_intention values */
         size_t pi = 0;
 
         /* Tokenize, respecting quoted values */
@@ -1767,7 +1767,7 @@ static char *execute_service_calls(const char *output) {
             while (*s == ' ') s++;
             if (!*s) break;
 
-            char key[64] = "", val[512] = "";
+            char key[64] = "", val[8192] = "";   /* was 512; prevents value-truncation re-parse */
             /* parse key= */
             size_t ki = 0;
             while (*s && *s != '=' && *s != ' ' && ki < sizeof(key) - 1)
@@ -1781,6 +1781,12 @@ static char *execute_service_calls(const char *output) {
                     s++;
                     while (*s && *s != '"' && vi < sizeof(val) - 1)
                         val[vi++] = *s++;
+                    /* GUARD: if val buffer filled before close quote,
+                     * skip past the remainder of the quoted content so
+                     * we do not re-tokenize value-interior as new key=val
+                     * pairs (e.g. embedded "service=peer_send" in a long
+                     * initial_intention would overwrite the outer service). */
+                    while (*s && *s != '"') s++;
                     if (*s == '"') s++;
                 } else {
                     while (*s && *s != ' ' && vi < sizeof(val) - 1)
@@ -1843,7 +1849,7 @@ static char *execute_service_calls(const char *output) {
             cred[--cred_len] = '\0';
 
         /* Dispatch to service handler via shell script */
-        char handler_cmd[8192];
+        char handler_cmd[32768];   /* was 8192; room for bumped params */
         snprintf(handler_cmd, sizeof(handler_cmd),
             "NEIL_SERVICE='%s' NEIL_ACTION='%s' NEIL_CRED='%s' NEIL_PARAMS='%s' "
             "%s/services/handler.sh 2>&1",
