@@ -362,6 +362,127 @@ HB_TIMER
 }
 
 
+setup_relay() {
+    # Install autoprompt daemon + event-driven watchers on a peer.
+    # Called only when archetype=relay. Peer wakes on events (file drops,
+    # webhooks, etc.) — NOT on a periodic timer. Good for: notification
+    # relays, file pipeline stages, webhook reactors.
+    local name="$1"
+    local watchers_raw="${PARAM_watchers:-filesystem}"
+    log "  relay setup: installing autoprompt daemon + watchers [$watchers_raw] (no heartbeat timer)..."
+
+    # --- 1. Directory skeleton ---
+    LXC exec "$name" -- bash -c "
+        mkdir -p $PEER_HOME/.neil/tools/autoPrompter/queue \
+                 $PEER_HOME/.neil/tools/autoPrompter/active \
+                 $PEER_HOME/.neil/tools/autoPrompter/history \
+                 $PEER_HOME/.neil/inputs/watchers \
+                 $PEER_HOME/.neil/inputs/relay_inbox \
+                 $PEER_HOME/.neil/outputs
+    "
+
+    # --- 2. inotify-tools (required for filesystem watcher) ---
+    LXC exec "$name" -- bash -c "
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get install -y -qq inotify-tools >/dev/null 2>&1 || true
+    "
+
+    # --- 3. Push autoprompt binary + supporting scripts (same as autonomous) ---
+    local ap="$NEIL_HOME/tools/autoPrompter"
+    [ -x "$ap/autoprompt" ] && \
+        LXC file push "$ap/autoprompt" "$name$PEER_HOME/.neil/tools/autoPrompter/autoprompt" --mode 0755 >/dev/null 2>&1
+    for s in heartbeat.sh observe.sh adaptive_gate.sh; do
+        [ -f "$ap/$s" ] && \
+            LXC file push "$ap/$s" "$name$PEER_HOME/.neil/tools/autoPrompter/$s" --mode 0755 >/dev/null 2>&1
+    done
+
+    # --- 4. Peer-local config.toml (same as autonomous) ---
+    LXC exec "$name" -- bash -c "cat > $PEER_HOME/.neil/config.toml" <<'RELAYCFG'
+[ai]
+provider = "agent-sdk"
+command = "/home/neil/.neil/tools/autoPrompter/agent/.venv/bin/python"
+args = "/home/neil/.neil/tools/autoPrompter/agent/neil_agent.py"
+system_prompt_flag = "--system-prompt"
+prompt_flag = "-p"
+
+[heartbeat]
+interval = 0
+
+[services]
+max_react_turns = 3
+RELAYCFG
+
+    # --- 5. autoprompt systemd unit (same as autonomous) ---
+    LXC exec "$name" -- bash -c "cat > /etc/systemd/system/neil-autoprompt.service" <<'AP_UNIT'
+[Unit]
+Description=Neil autoprompt daemon
+After=network.target
+
+[Service]
+Type=simple
+User=neil
+WorkingDirectory=/home/neil
+ExecStart=/home/neil/.neil/tools/autoPrompter/autoprompt
+Restart=always
+RestartSec=5
+Environment=HOME=/home/neil
+Environment=NEIL_HOME=/home/neil/.neil
+Environment=PATH=/home/neil/.local/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+AP_UNIT
+
+    # --- 6. Push named watchers + systemd units for each ---
+    local watchers=$(printf '%s' "$watchers_raw" | tr ',' ' ')
+    local installed_watchers=""
+    for w in $watchers; do
+        local src="$NEIL_HOME/inputs/watchers/$w.sh"
+        if [ ! -f "$src" ]; then
+            log "  relay: watcher '$w' not found at $src, skipping"
+            continue
+        fi
+        LXC file push "$src" "$name$PEER_HOME/.neil/inputs/watchers/$w.sh" --mode 0755 >/dev/null 2>&1
+
+        # Each watcher gets a unit. Default arg = relay_inbox; watchers that need
+        # different args should be tuned post-spawn or the unit rewritten.
+        LXC exec "$name" -- bash -c "cat > /etc/systemd/system/neil-${w}-watcher.service" <<WATCHER_UNIT
+[Unit]
+Description=Neil ${w} watcher (relay archetype)
+After=network.target neil-autoprompt.service
+
+[Service]
+Type=simple
+User=neil
+WorkingDirectory=/home/neil
+ExecStart=/home/neil/.neil/inputs/watchers/${w}.sh /home/neil/.neil/inputs/relay_inbox
+Restart=always
+RestartSec=10
+Environment=HOME=/home/neil
+Environment=NEIL_HOME=/home/neil/.neil
+
+[Install]
+WantedBy=multi-user.target
+WATCHER_UNIT
+        installed_watchers="$installed_watchers $w"
+    done
+
+    # --- 7. Chown + enable + start ---
+    LXC exec "$name" -- chown -R neil:neil "$PEER_HOME/.neil"
+    LXC exec "$name" -- bash -c "
+        systemctl daemon-reload
+        systemctl enable --now neil-autoprompt.service 2>&1 | tail -1
+        for w in$installed_watchers; do
+            systemctl enable --now neil-\${w}-watcher.service 2>&1 | tail -1
+        done
+    " 2>&1 | tail -5
+
+    log "  relay setup: complete. watchers:$installed_watchers (event-driven, no timer)"
+}
+
+
 transfer_paths_to_peer() {
     # Copy any operator-supplied paths from parent to peer BEFORE kickoff.
     # Used for: project data (SPEC.md, corpus), scope-filtered memory notes,
@@ -533,9 +654,10 @@ cmd_create() {
     log "pushing Neil substrate..."
     push_substrate "$name"
     transfer_paths_to_peer "$name" "$ip"
-    if [ "${PARAM_archetype:-worker}" = "autonomous" ]; then
-        setup_autonomous "$name"
-    fi
+    case "${PARAM_archetype:-worker}" in
+        autonomous) setup_autonomous "$name" ;;
+        relay)      setup_relay "$name" ;;
+    esac
 
     registry_set "$name" "$ip" "$IMAGE" "ready"
     kickoff_peer "$name" "$ip"
