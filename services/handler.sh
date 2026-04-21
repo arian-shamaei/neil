@@ -318,6 +318,73 @@ LOG
 
 
 
+    peer_transfer)
+        # CALL: peer_transfer peer=<name> direction=push|pull source=<path> dest=<path> [recursive=true]
+        PEER="$PARAM_peer"
+        DIR="${PARAM_direction:-push}"
+        SRC="$PARAM_source"
+        DST="$PARAM_dest"
+        REC="${PARAM_recursive:-false}"
+        if [ -z "$PEER" ] || [ -z "$SRC" ] || [ -z "$DST" ]; then
+            echo "{\"service\":\"peer_transfer\",\"error\":\"missing peer/source/dest\"}" >&2
+            exit 1
+        fi
+        PEER_IP=$(python3 -c "import json; d=json.load(open('$HOME/.neil/state/peers.json')); rec=d.get('$PEER',{}); print(rec.get('ip','') if rec.get('status')=='ready' else '')" 2>/dev/null)
+        if [ -z "$PEER_IP" ]; then
+            echo "{\"service\":\"peer_transfer\",\"error\":\"peer '$PEER' not ready or not found\"}" >&2
+            exit 1
+        fi
+        SENDER="${NEIL_NODE_ID:-$(hostname)}"
+        FLAGS="-q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i $HOME/.neil/keys/peer_ed25519"
+        [ "$REC" = "true" ] && FLAGS="$FLAGS -r"
+
+        case "$DIR" in
+            push)
+                scp $FLAGS "$SRC" "neil@$PEER_IP:$DST"
+                SCP_RC=$?
+                ;;
+            pull)
+                scp $FLAGS "neil@$PEER_IP:$SRC" "$DST"
+                SCP_RC=$?
+                ;;
+            *)
+                echo "{\"service\":\"peer_transfer\",\"error\":\"bad direction '$DIR' (want push|pull)\"}" >&2
+                exit 1
+                ;;
+        esac
+
+        # Best-effort byte count
+        BYTES=0
+        if [ $SCP_RC -eq 0 ]; then
+            if [ "$DIR" = "push" ]; then
+                BYTES=$(du -sb "$SRC" 2>/dev/null | awk '{print $1}')
+            else
+                BYTES=$(du -sb "$DST" 2>/dev/null | awk '{print $1}')
+            fi
+        fi
+        [ -z "$BYTES" ] && BYTES=0
+
+        python3 - "$HOME/.neil/state/cluster_activity.jsonl" "$SENDER" "$PEER" "$PEER_IP" "$DIR" "$SRC" "$DST" "$BYTES" "$SCP_RC" <<'LOG'
+import json, pathlib, sys, datetime
+p, sender, peer, ip, direction, src, dst, bytes_, rc = sys.argv[1:10]
+pp = pathlib.Path(p); pp.parent.mkdir(parents=True, exist_ok=True)
+with pp.open("a") as f:
+    f.write(json.dumps({
+        "ts":         datetime.datetime.utcnow().isoformat(timespec="seconds")+"Z",
+        "event":      f"peer_transfer_{direction}" if rc == "0" else f"peer_transfer_{direction}_fail",
+        "sender":     sender, "peer": peer, "peer_ip": ip,
+        "source":     src, "dest": dst,
+        "bytes":      int(bytes_), "rc": int(rc),
+    }) + "\n")
+LOG
+
+        if [ $SCP_RC -ne 0 ]; then
+            echo "{\"service\":\"peer_transfer\",\"peer\":\"$PEER\",\"direction\":\"$DIR\",\"error\":\"scp rc=$SCP_RC\",\"source\":\"$SRC\",\"dest\":\"$DST\"}" >&2
+            exit 1
+        fi
+        echo "{\"service\":\"peer_transfer\",\"peer\":\"$PEER\",\"direction\":\"$DIR\",\"bytes\":$BYTES,\"source\":\"$SRC\",\"dest\":\"$DST\"}"
+        ;;
+
     *)
         echo "ERROR: no handler for service '$NEIL_SERVICE'"
         exit 1
