@@ -184,26 +184,126 @@ push_substrate() {
     # 7. State seed + role config + .claude.json stub
     local persona="${PARAM_persona:-minimal}"
     local memory_mode="${PARAM_memory_mode:-read_only_parent}"
+    local archetype="${PARAM_archetype:-worker}"
     local parent_node="${NEIL_NODE_ID:-$(hostname)}"
     local initial="${PARAM_initial_intention:-}"
+    local spawn_ts
+    spawn_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # Validate archetype against implemented set. Unimplemented fall back to worker
+    # with a log note — do not silently change semantics.
+    case "$archetype" in
+        worker|autonomous|relay) : ;;
+        *)
+            log "  WARN: unknown archetype '$archetype', falling back to worker"
+            archetype=worker
+            ;;
+    esac
+    if [ "$archetype" = "autonomous" ] || [ "$archetype" = "relay" ]; then
+        log "  NOTE: archetype=$archetype not yet implemented in Phase 1; running as worker"
+        # keep spawn_config archetype as-requested so later beat can upgrade in place
+    fi
+
+    # Build structured seeded content as JSON files on the parent, then push.
+    # intentions.json: one entry carrying the initial_intention as a proper intent
+    # heartbeat_log.json: one entry for the kickoff beat
+    local seed_intent_id
+    seed_intent_id="spawn_$(date +%s)_$(tr -dc a-z0-9 </dev/urandom | head -c 6)"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    python3 - "$tmpdir" "$name" "$parent_node" "$persona" "$memory_mode" "$archetype" "$initial" "$spawn_ts" "$seed_intent_id" <<'PY'
+import json, sys, pathlib
+d, name, parent, persona, mem, arch, intent, ts, iid = sys.argv[1:10]
+p = pathlib.Path(d)
+(p / "intentions.json").write_text(json.dumps([{
+    "id":          iid,
+    "created":     ts,
+    "priority":    "high",
+    "status":      "in_progress",
+    "description": intent if intent else f"Operate as peer Neil {name!r} per spawn_config",
+    "source":      "spawn_config.initial_intention",
+}], indent=2))
+(p / "heartbeat_log.json").write_text(json.dumps([{
+    "timestamp": ts,
+    "prompt":    "peer_kickoff",
+    "status":    "spawned",
+    "summary":   f"Peer {name} spawned by {parent}; archetype={arch}, persona={persona}, memory_mode={mem}",
+    "action":    "Read spawn_config + essence, then execute initial_intention",
+}], indent=2))
+(p / "spawn_config.json").write_text(json.dumps({
+    "node_name":         name,
+    "parent_node":       parent,
+    "persona":           persona,
+    "memory_mode":       mem,
+    "archetype":         arch,
+    "initial_intention": intent,
+    "spawned_at":        ts,
+}, indent=2))
+(p / "peers.json").write_text("{}")
+(p / "proposed_memories.json").write_text("[]")
+PY
+
+    LXC exec "$name" -- mkdir -p "$PEER_HOME/.neil/state"
+    for f in intentions.json heartbeat_log.json spawn_config.json peers.json proposed_memories.json; do
+        LXC file push "$tmpdir/$f" "$name$PEER_HOME/.neil/state/$f" --mode 0644 >/dev/null 2>&1 || true
+    done
+    rm -rf "$tmpdir"
+
     LXC exec "$name" -- bash -c "
-        [ -f $PEER_HOME/.neil/state/intentions.json ]    || echo '[]' > $PEER_HOME/.neil/state/intentions.json
-        [ -f $PEER_HOME/.neil/state/heartbeat_log.json ] || echo '[]' > $PEER_HOME/.neil/state/heartbeat_log.json
-        [ -f $PEER_HOME/.neil/state/peers.json ]         || echo '{}' > $PEER_HOME/.neil/state/peers.json
-        [ -f $PEER_HOME/.neil/state/proposed_memories.json ] || echo '[]' > $PEER_HOME/.neil/state/proposed_memories.json
-        [ -f $PEER_HOME/.claude.json ]                   || echo '{}' > $PEER_HOME/.claude.json
-        cat > $PEER_HOME/.neil/state/spawn_config.json <<EOF
-{
-  \"node_name\":         \"$name\",
-  \"parent_node\":       \"$parent_node\",
-  \"persona\":           \"$persona\",
-  \"memory_mode\":       \"$memory_mode\",
-  \"initial_intention\": \"$initial\",
-  \"spawned_at\":        \"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
-}
-EOF
+        [ -f $PEER_HOME/.claude.json ] || echo '{}' > $PEER_HOME/.claude.json
         chown -R $PEER_USER:$PEER_USER $PEER_HOME
     "
+}
+
+transfer_paths_to_peer() {
+    # Copy any operator-supplied paths from parent to peer BEFORE kickoff.
+    # Used for: project data (SPEC.md, corpus), scope-filtered memory notes,
+    # anything the peer's initial_intention will reference.
+    #
+    # Comma- or space-separated list in PARAM_transfer_paths; each path is
+    # scp -r'd to the same absolute path under the peer's /home/neil tree if
+    # the path starts with /home/seal, else to /home/neil/<basename>.
+    local name="$1" ip="$2"
+    local raw="${PARAM_transfer_paths:-}"
+    [ -z "$raw" ] && return 0
+
+    # Normalize separators (comma → space)
+    raw=$(printf '%s' "$raw" | tr ',' ' ')
+    local count=0
+    for src in $raw; do
+        # Skip empty tokens
+        [ -z "$src" ] && continue
+        if [ ! -e "$src" ]; then
+            log "  transfer_paths: WARN '$src' does not exist on parent; skipping"
+            continue
+        fi
+        # Destination path: map /home/seal/... → /home/neil/... so peer sees same layout
+        local dst
+        case "$src" in
+            /home/seal/*) dst="/home/neil/${src#/home/seal/}" ;;
+            /*)           dst="/home/neil/$(basename "$src")" ;;
+            *)            dst="/home/neil/$(basename "$src")" ;;
+        esac
+        # Ensure parent dir exists on peer
+        local parent_dir
+        parent_dir=$(dirname "$dst")
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o BatchMode=yes -o ConnectTimeout=5 \
+            -i "$KEY_PRIV" "$PEER_USER@$ip" \
+            "mkdir -p '$parent_dir'" >/dev/null 2>&1
+        # scp (recursive since most use cases are directories; files work too)
+        log "  transfer_paths: $src → neil@$name:$dst"
+        scp -q -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o BatchMode=yes -o ConnectTimeout=10 \
+            -i "$KEY_PRIV" "$src" "$PEER_USER@$ip:$dst"
+        local rc=$?
+        if [ $rc -ne 0 ]; then
+            log "  transfer_paths: FAILED rc=$rc for '$src'"
+        else
+            count=$((count + 1))
+        fi
+    done
+    log "  transfer_paths: $count paths transferred"
 }
 
 kickoff_peer() {
@@ -325,6 +425,7 @@ cmd_create() {
 
     log "pushing Neil substrate..."
     push_substrate "$name"
+    transfer_paths_to_peer "$name" "$ip"
 
     registry_set "$name" "$ip" "$IMAGE" "ready"
     kickoff_peer "$name" "$ip"
