@@ -199,10 +199,6 @@ push_substrate() {
             archetype=worker
             ;;
     esac
-    if [ "$archetype" = "autonomous" ] || [ "$archetype" = "relay" ]; then
-        log "  NOTE: archetype=$archetype not yet implemented in Phase 1; running as worker"
-        # keep spawn_config archetype as-requested so later beat can upgrade in place
-    fi
 
     # Build structured seeded content as JSON files on the parent, then push.
     # intentions.json: one entry carrying the initial_intention as a proper intent
@@ -254,6 +250,117 @@ PY
         chown -R $PEER_USER:$PEER_USER $PEER_HOME
     "
 }
+
+setup_autonomous() {
+    # Install the autoprompt daemon + heartbeat timer on a peer container.
+    # Called only when archetype=autonomous. Turns a bare worker peer into
+    # a full Neil that ticks on its own without parent prompting.
+    local name="$1"
+    log "  autonomous setup: installing autoprompt daemon + heartbeat timer..."
+
+    # 1. Directory skeleton for autoprompt queue/active/history
+    LXC exec "$name" -- bash -c "
+        mkdir -p $PEER_HOME/.neil/tools/autoPrompter/queue \
+                 $PEER_HOME/.neil/tools/autoPrompter/active \
+                 $PEER_HOME/.neil/tools/autoPrompter/history \
+                 $PEER_HOME/.neil/outputs
+    "
+
+    # 2. Push autoprompt binary + supporting scripts
+    local ap="$NEIL_HOME/tools/autoPrompter"
+    [ -x "$ap/autoprompt" ] && \
+        LXC file push "$ap/autoprompt" "$name$PEER_HOME/.neil/tools/autoPrompter/autoprompt" --mode 0755 >/dev/null 2>&1
+    for s in heartbeat.sh observe.sh adaptive_gate.sh; do
+        [ -f "$ap/$s" ] && \
+            LXC file push "$ap/$s" "$name$PEER_HOME/.neil/tools/autoPrompter/$s" --mode 0755 >/dev/null 2>&1
+    done
+
+    # 3. Write peer-local config.toml with /home/neil paths (NOT /home/seal)
+    LXC exec "$name" -- bash -c "cat > $PEER_HOME/.neil/config.toml" <<'PEERCFG'
+[ai]
+provider = "agent-sdk"
+command = "/home/neil/.neil/tools/autoPrompter/agent/.venv/bin/python"
+args = "/home/neil/.neil/tools/autoPrompter/agent/neil_agent.py"
+system_prompt_flag = "--system-prompt"
+prompt_flag = "-p"
+
+[heartbeat]
+interval = 30
+
+[services]
+max_react_turns = 3
+PEERCFG
+
+    # 4. Write systemd unit for autoprompt (system-level; peer has root)
+    LXC exec "$name" -- bash -c "cat > /etc/systemd/system/neil-autoprompt.service" <<'AUTOPROMPT_UNIT'
+[Unit]
+Description=Neil autoprompt daemon
+After=network.target
+
+[Service]
+Type=simple
+User=neil
+WorkingDirectory=/home/neil
+ExecStart=/home/neil/.neil/tools/autoPrompter/autoprompt
+Restart=always
+RestartSec=5
+Environment=HOME=/home/neil
+Environment=NEIL_HOME=/home/neil/.neil
+Environment=PATH=/home/neil/.local/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+AUTOPROMPT_UNIT
+
+    # 5. Write systemd service + timer for periodic heartbeats
+    LXC exec "$name" -- bash -c "cat > /etc/systemd/system/neil-heartbeat.service" <<'HB_UNIT'
+[Unit]
+Description=Neil heartbeat trigger
+
+[Service]
+Type=oneshot
+User=neil
+Environment=HOME=/home/neil
+Environment=NEIL_HOME=/home/neil/.neil
+Environment=PATH=/home/neil/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/neil/.neil/tools/autoPrompter/heartbeat.sh
+HB_UNIT
+
+    LXC exec "$name" -- bash -c "cat > /etc/systemd/system/neil-heartbeat.timer" <<'HB_TIMER'
+[Unit]
+Description=Neil heartbeat every 30 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+HB_TIMER
+
+    # 6. Chown peer substrate (LXC file push lands as root, fix ownership)
+    LXC exec "$name" -- chown -R neil:neil "$PEER_HOME/.neil"
+
+    # 7. Reload systemd, enable + start both units
+    LXC exec "$name" -- bash -c "
+        systemctl daemon-reload
+        systemctl enable --now neil-autoprompt.service 2>&1
+        systemctl enable --now neil-heartbeat.timer 2>&1
+    " 2>&1 | tail -3
+
+    # 8. Seed an immediate heartbeat into queue so peer ticks RIGHT AWAY
+    #    (not waiting 2 min for the first timer fire)
+    LXC exec "$name" -- sudo -u neil bash -c "
+        cp $PEER_HOME/.neil/essence/heartbeat.md \
+           $PEER_HOME/.neil/tools/autoPrompter/queue/$(date +%Y%m%dT%H%M%S)_kickoff_heartbeat.md 2>/dev/null || true
+    "
+
+    log "  autonomous setup: complete. Peer should tick within 5s."
+}
+
 
 transfer_paths_to_peer() {
     # Copy any operator-supplied paths from parent to peer BEFORE kickoff.
@@ -426,6 +533,9 @@ cmd_create() {
     log "pushing Neil substrate..."
     push_substrate "$name"
     transfer_paths_to_peer "$name" "$ip"
+    if [ "${PARAM_archetype:-worker}" = "autonomous" ]; then
+        setup_autonomous "$name"
+    fi
 
     registry_set "$name" "$ip" "$IMAGE" "ready"
     kickoff_peer "$name" "$ip"
