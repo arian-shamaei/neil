@@ -37,6 +37,50 @@ for t in tokens:
 }
 eval_params
 
+# validate_params: compare PARAM_* env names against key= tokens declared
+# anywhere in registry/$NEIL_SERVICE.md. Unknown params produce a loud FAIL
+# line in outputs/neil.log but do NOT abort dispatch (preserves backward
+# compatibility; goal is detection, not enforcement).
+validate_params() {
+    REG="$HOME/.neil/services/registry/${NEIL_SERVICE}.md"
+    [ -f "$REG" ] || return 0
+    VALID_PARAMS=$(REG_FILE="$REG" python3 -c '
+import re, os, sys
+try:
+    content = open(os.environ["REG_FILE"]).read()
+except Exception:
+    sys.exit(0)
+found = set()
+# Any bare "ident=" token anywhere in the registry file. Excludes dispatch
+# keys (service, action) and the service: / phase: / category: YAML header
+# keys. This is the union across every CALL example, table row, and prose
+# reference in the file.
+for m in re.finditer(r"\b([a-z_][a-z0-9_]*)=", content):
+    found.add(m.group(1))
+for skip in ("service", "action", "category", "phase", "status"):
+    found.discard(skip)
+print(" ".join(sorted(found)))
+' 2>/dev/null || echo "")
+    [ -z "$VALID_PARAMS" ] && return 0
+    UNKNOWN=""
+    for ENTRY in $(set | grep "^PARAM_" | sed "s/=.*//"); do
+        PNAME=$(echo "$ENTRY" | sed "s/^PARAM_//")
+        PNAME_LC=$(echo "$PNAME" | tr "[:upper:]" "[:lower:]")
+        case " $VALID_PARAMS " in
+            *" $PNAME_LC "*) ;;
+            *) UNKNOWN="$UNKNOWN $PNAME" ;;
+        esac
+    done
+    if [ -n "$UNKNOWN" ]; then
+        TS=$(date -Iseconds 2>/dev/null || date)
+        MSG="validate_params service=$NEIL_SERVICE action=$NEIL_ACTION unknown:$UNKNOWN declared=($VALID_PARAMS)"
+        mkdir -p "$HOME/.neil/outputs"
+        echo "[$TS] FAIL source=handler severity=medium | $MSG" >> "$HOME/.neil/outputs/neil.log"
+        echo "[handler] $MSG" >&2
+    fi
+}
+validate_params
+
 case "$NEIL_SERVICE" in
     spawn_temp)
         case "$NEIL_ACTION" in
