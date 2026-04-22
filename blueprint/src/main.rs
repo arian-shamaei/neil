@@ -58,6 +58,47 @@ impl BenchRecorder {
     }
 }
 
+// ── Cluster background refresher ─────────────────────────────────────────
+// Spawns once at startup; re-runs neil-cluster status --json --compact
+// every 2s into a shared Mutex. cluster_lines() reads non-blocking.
+// Eliminates the 365ms/frame render-thread stall that was the cluster
+// panel's smoothness bottleneck.
+static CLUSTER_CACHE: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Option<String>>>> =
+    std::sync::OnceLock::new();
+
+fn cluster_cache() -> &'static std::sync::Arc<std::sync::Mutex<Option<String>>> {
+    CLUSTER_CACHE.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(None)))
+}
+
+fn spawn_cluster_refresher(neil_home: PathBuf) {
+    let bin = neil_home.join("bin/neil-cluster");
+    if !bin.exists() { return; }
+    let cache = cluster_cache().clone();
+    std::thread::spawn(move || {
+        loop {
+            let output = std::process::Command::new(&bin)
+                .arg("status").arg("--json").arg("--compact")
+                .env("NEIL_HOME", &neil_home)
+                .output();
+            match output {
+                Ok(o) if o.status.success() => {
+                    let json = String::from_utf8_lossy(&o.stdout).to_string();
+                    if let Ok(mut g) = cache.lock() { *g = Some(json); }
+                }
+                Ok(o) => {
+                    let msg = format!("__ERROR__stderr:{}", String::from_utf8_lossy(&o.stderr));
+                    if let Ok(mut g) = cache.lock() { *g = Some(msg); }
+                }
+                Err(e) => {
+                    let msg = format!("__ERROR__spawn:{}", e);
+                    if let Ok(mut g) = cache.lock() { *g = Some(msg); }
+                }
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
+}
+
 
 #[derive(Debug, Clone, PartialEq)]
 enum View {
@@ -104,6 +145,10 @@ fn main() -> anyhow::Result<()> {
             let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
             PathBuf::from(home).join(".neil")
         });
+
+    // Start async cluster refresher (populates CLUSTER_CACHE every 2s off
+    // the render thread). Cluster panel reads non-blocking from the cache.
+    spawn_cluster_refresher(neil_home.clone());
 
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1894,38 +1939,30 @@ fn render_cluster_panel_selectable(_state: &NeilState, selection: usize) -> Vec<
 }
 
 fn cluster_lines(selection: usize) -> Vec<Line<'static>> {
-    // Invoke neil-cluster to get current cluster state
-    let neil_home = env::var("NEIL_HOME").map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(env::var("HOME").unwrap_or("/tmp".into())).join(".neil"));
-    let bin = neil_home.join("bin/neil-cluster");
-    if !bin.exists() {
-        return vec![
-            Line::from(Span::styled("  neil-cluster not installed", Style::default().fg(Color::Red))),
-            Line::from(""),
-            Line::from(Span::styled(format!("  expected at: {}", bin.display()), Style::default().fg(Color::DarkGray))),
-        ];
-    }
-
-    let output = std::process::Command::new(&bin)
-        .arg("status")
-        .arg("--json")
-        .arg("--compact")
-        .env("NEIL_HOME", &neil_home)
-        .output();
-
-    let json_text = match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        Ok(o) => {
+    // Read cluster data from the background-refreshed cache. The refresher
+    // thread (spawn_cluster_refresher) runs neil-cluster every 2s off the
+    // render thread — this function is non-blocking.
+    let cached = cluster_cache().lock().ok().and_then(|g| g.clone());
+    let json_text = match cached {
+        None => {
+            return vec![
+                Line::from(Span::styled("  Cluster data loading...", Style::default().fg(Color::DarkGray))),
+                Line::from(""),
+                Line::from(Span::styled("  (first refresh in progress; ~2s)", Style::default().fg(Color::DarkGray))),
+            ];
+        }
+        Some(ref s) if s.starts_with("__ERROR__stderr:") => {
             return vec![
                 Line::from(Span::styled("  neil-cluster failed", Style::default().fg(Color::Red))),
-                Line::from(Span::styled(format!("  stderr: {}", String::from_utf8_lossy(&o.stderr)), Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled(format!("  {}", &s["__ERROR__stderr:".len()..]), Style::default().fg(Color::DarkGray))),
             ];
         }
-        Err(e) => {
+        Some(ref s) if s.starts_with("__ERROR__spawn:") => {
             return vec![
-                Line::from(Span::styled(format!("  error: {}", e), Style::default().fg(Color::Red))),
+                Line::from(Span::styled(format!("  error: {}", &s["__ERROR__spawn:".len()..]), Style::default().fg(Color::Red))),
             ];
         }
+        Some(s) => s,
     };
 
     // Parse JSON (handwritten; we already have serde in deps but avoid extra coupling here)
