@@ -12,6 +12,7 @@ FAILURES="$NEIL_HOME/self/failures.json"
 HB_LOG="$NEIL_HOME/heartbeat_log.json"
 ROTATION="$NEIL_HOME/self/study_rotation.txt"
 APPROVALS_DIR="$NEIL_HOME/approvals"
+ACTIVE_DIR="$NEIL_HOME/tools/autoPrompter/active"
 
 # Check config flag; silently exit if disabled
 if grep -q '^mode_routing = false' "$NEIL_HOME/config.toml" 2>/dev/null; then
@@ -24,6 +25,23 @@ fi
 if grep -qE '^neil_os_enabled[[:space:]]*=[[:space:]]*(false|0)' "$NEIL_HOME/config.toml" 2>/dev/null; then
     # Flag is explicitly disabled; skip directive emission entirely
     exit 0
+fi
+
+# ---- detect prompt origin (cron heartbeat vs user chat) ----
+# A cron heartbeat has a filename matching *_heartbeat.md in active/.
+# Chat prompts use *_chat.md (or any other suffix). Intentions/failures
+# marked "requires_chat_override":true are chat-gated and MUST NOT be
+# selected when this beat is cron-originated -- their precondition
+# (operator-authored OVERRIDE + CALL block) is structurally unavailable
+# from cron context per guardrails.md.
+is_cron_heartbeat=0
+if [ -d "$ACTIVE_DIR" ]; then
+    for f in "$ACTIVE_DIR"/*.md; do
+        [ -e "$f" ] || continue
+        case "$(basename "$f")" in
+            *_heartbeat.md) is_cron_heartbeat=1 ;;
+        esac
+    done
 fi
 
 # ---- gather state ----
@@ -40,10 +58,11 @@ if [ -d "$APPROVALS_DIR" ]; then
     done
 fi
 
-# Pending intentions (skipping approval-gated ones when no signal present)
+# Pending intentions (skipping approval-gated and chat-gated when not applicable)
 pending_count=0
 oldest_pending=""
 skipped_approval=0
+skipped_chat_gated=0
 if [ -f "$INTENTIONS" ]; then
     while IFS= read -r line; do
         [ -z "$line" ] && continue
@@ -55,6 +74,16 @@ if [ -f "$INTENTIONS" ]; then
                     skipped_approval=$((skipped_approval + 1))
                     continue
                 fi
+                # Skip chat-gated intentions from cron heartbeats. Precondition
+                # (operator OVERRIDE + CALL block) cannot be met in cron context.
+                case "$line" in
+                    *'"requires_chat_override":true'*|*'"requires_chat_override": true'*)
+                        if [ "$is_cron_heartbeat" -eq 1 ]; then
+                            skipped_chat_gated=$((skipped_chat_gated + 1))
+                            continue
+                        fi
+                        ;;
+                esac
                 pending_count=$((pending_count + 1))
                 if [ -z "$oldest_pending" ]; then
                     oldest_pending=$(echo "$line" | sed 's/.*"description":"\([^"]*\)".*/\1/' | cut -c1-100)
@@ -64,11 +93,12 @@ if [ -f "$INTENTIONS" ]; then
     done < "$INTENTIONS"
 fi
 
-# Unresolved failures (highest severity wins; skip approval-tagged when no signal)
+# Unresolved failures (highest severity wins; skip approval-tagged and chat-gated)
 failure_count=0
 top_failure=""
 top_severity="low"
 skipped_approval_fail=0
+skipped_chat_gated_fail=0
 if [ -f "$FAILURES" ]; then
     sev_rank() {
         case "$1" in
@@ -92,6 +122,15 @@ if [ -f "$FAILURES" ]; then
                     skipped_approval_fail=$((skipped_approval_fail + 1))
                     continue
                 fi
+                # Skip chat-gated failures from cron heartbeats.
+                case "$line" in
+                    *'"requires_chat_override":true'*|*'"requires_chat_override": true'*)
+                        if [ "$is_cron_heartbeat" -eq 1 ]; then
+                            skipped_chat_gated_fail=$((skipped_chat_gated_fail + 1))
+                            continue
+                        fi
+                        ;;
+                esac
                 failure_count=$((failure_count + 1))
                 sev=$(echo "$line" | sed 's/.*"severity":"\([^"]*\)".*/\1/')
                 rank=$(sev_rank "$sev")
@@ -145,14 +184,26 @@ target=""
 required=""
 forbidden=""
 
+# Build a combined "skipped" tail for human-readable reasons
+skip_tail=""
+if [ "$skipped_approval" -gt 0 ] || [ "$skipped_chat_gated" -gt 0 ]; then
+    skip_tail=" (skipped"
+    [ "$skipped_approval" -gt 0 ]   && skip_tail="$skip_tail $skipped_approval approval-gated"
+    [ "$skipped_chat_gated" -gt 0 ] && skip_tail="$skip_tail $skipped_chat_gated chat-gated"
+    skip_tail="$skip_tail)"
+fi
+skip_tail_fail=""
+if [ "$skipped_approval_fail" -gt 0 ] || [ "$skipped_chat_gated_fail" -gt 0 ]; then
+    skip_tail_fail=" (skipped"
+    [ "$skipped_approval_fail" -gt 0 ]   && skip_tail_fail="$skip_tail_fail $skipped_approval_fail approval-gated"
+    [ "$skipped_chat_gated_fail" -gt 0 ] && skip_tail_fail="$skip_tail_fail $skipped_chat_gated_fail chat-gated"
+    skip_tail_fail="$skip_tail_fail)"
+fi
+
 if [ "$pending_count" -gt 0 ]; then
     # Rule 1: pending intention
     mode="CREATIVITY"
-    if [ "$skipped_approval" -gt 0 ]; then
-        reason="$pending_count pending intention(s) -- execute oldest (skipped $skipped_approval approval-gated)"
-    else
-        reason="$pending_count pending intention(s) -- execute oldest"
-    fi
+    reason="$pending_count pending intention(s) -- execute oldest$skip_tail"
     target="$oldest_pending"
     required="DONE: (completed) or FAIL: (blocked) or INTEND: (refined followup)"
     forbidden="starting new initiative work while intentions pending"
@@ -160,11 +211,7 @@ if [ "$pending_count" -gt 0 ]; then
 elif [ "$failure_count" -gt 0 ]; then
     # Rule 2: unresolved failure
     mode="CREATIVITY"
-    if [ "$skipped_approval_fail" -gt 0 ]; then
-        reason="$failure_count unresolved FAIL(s); highest severity: $top_severity (skipped $skipped_approval_fail approval-gated)"
-    else
-        reason="$failure_count unresolved FAIL(s); highest severity: $top_severity"
-    fi
+    reason="$failure_count unresolved FAIL(s); highest severity: $top_severity$skip_tail_fail"
     target="$top_failure"
     required="DONE: (fixed) or FAIL: (still broken + diagnosis) or INTEND: (specific fix plan)"
     forbidden="ignoring the failure; starting unrelated initiative work"
@@ -188,9 +235,9 @@ elif [ "$last_mode" = "CONFIGURATION" ]; then
 else
     # Default: configuration + rotation
     mode="CONFIGURATION"
-    total_skipped=$((skipped_approval + skipped_approval_fail))
+    total_skipped=$((skipped_approval + skipped_approval_fail + skipped_chat_gated + skipped_chat_gated_fail))
     if [ "$total_skipped" -gt 0 ]; then
-        reason="no pending non-approval work ($total_skipped awaiting operator); grounding before acting"
+        reason="no pending non-gated work ($total_skipped awaiting operator/chat); grounding before acting"
     else
         reason="no pending work; grounding before acting"
     fi
