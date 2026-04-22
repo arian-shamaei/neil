@@ -2647,19 +2647,49 @@ static void dedup_record(unsigned long hash, const char *filename) {
     }
 }
 
-/* Drain any .md files already in queue/ on startup. */
+/* Drain any .md files already in queue/ on startup.
+ *
+ * IMPORTANT: Snapshot filenames before processing. process_prompt() renames
+ * files from queue/ to active/ as its very first step, which mutates the
+ * directory being iterated. On ext4 hash-tree dirs, readdir() may skip or
+ * duplicate entries when the dir mutates mid-iteration — which caused
+ * pre-existing heartbeat prompts to get stuck in queue/ forever on peer
+ * spawn (the first file drained ok, subsequent readdir calls missed the
+ * rest). Fix: collect names first, close the dir handle, then process.
+ * Sorted oldest-first (timestamp-prefixed filenames) for FIFO fairness. */
 static void drain_existing(void) {
+    #define DRAIN_MAX 128
+    #define DRAIN_NAME_MAX 256
+    char names[DRAIN_MAX][DRAIN_NAME_MAX];
+    int count = 0;
+
     DIR *d = opendir(g_queue_dir);
     if (!d) return;
-
     struct dirent *ent;
-    while ((ent = readdir(d)) != NULL) {
+    while ((ent = readdir(d)) != NULL && count < DRAIN_MAX) {
         size_t len = strlen(ent->d_name);
-        if (len > 3 && strcmp(ent->d_name + len - 3, ".md") == 0) {
-            process_prompt(ent->d_name);
+        if (len > 3 && len < DRAIN_NAME_MAX
+            && strcmp(ent->d_name + len - 3, ".md") == 0) {
+            strncpy(names[count], ent->d_name, DRAIN_NAME_MAX - 1);
+            names[count][DRAIN_NAME_MAX - 1] = '\0';
+            count++;
         }
     }
     closedir(d);
+
+    /* Simple insertion sort — n is small (peers rarely > 3 queued). */
+    for (int i = 1; i < count; i++) {
+        for (int j = i; j > 0 && strcmp(names[j-1], names[j]) > 0; j--) {
+            char tmp[DRAIN_NAME_MAX];
+            strncpy(tmp, names[j-1], DRAIN_NAME_MAX);
+            strncpy(names[j-1], names[j], DRAIN_NAME_MAX);
+            strncpy(names[j], tmp, DRAIN_NAME_MAX);
+        }
+    }
+
+    for (int i = 0; i < count; i++) {
+        process_prompt(names[i]);
+    }
 }
 
 /* Recover any files left in active/ (crash recovery). */
@@ -2773,10 +2803,16 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Process any files already in queue/ (including wake-up) */
-    drain_existing();
-
-    /* Set up inotify */
+    /* Set up inotify BEFORE draining.
+     *
+     * Race fix: heartbeat.sh (a separate systemd service) may create files
+     * in queue/ during peer spawn, racing with autoprompt's startup. If we
+     * drain first and then inotify_init, files created in that window are
+     * invisible to both the snapshot and the watcher — they get stuck in
+     * queue/ forever. By starting inotify first, those events buffer in
+     * the kernel and get delivered after drain completes via the event
+     * loop below. Files already present when inotify starts are picked up
+     * by drain_existing. */
     int ifd = inotify_init1(IN_CLOEXEC);
     if (ifd < 0) {
         perror("[autoprompt] inotify_init1");
@@ -2789,6 +2825,11 @@ int main(int argc, char **argv) {
         close(ifd);
         return 1;
     }
+
+    /* Process any files already in queue/ (including wake-up).
+     * Any files created DURING drain will queue as inotify events
+     * and be processed once we enter the event loop below. */
+    drain_existing();
 
     printf("[autoprompt] watching %s/ for prompts...\n", g_queue_dir);
     set_seal_pose("open", "smile", "float", "none", "~ neil ~");
