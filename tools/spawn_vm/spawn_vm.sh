@@ -240,7 +240,13 @@ p = pathlib.Path(d)
 PY
 
     LXC exec "$name" -- mkdir -p "$PEER_HOME/.neil/state"
-    for f in intentions.json heartbeat_log.json spawn_config.json peers.json proposed_memories.json; do
+    # intentions.json + heartbeat_log.json live at .neil/ top-level (matches
+    # parent layout + what observe.sh reads as $HOME/.neil/intentions.json).
+    # Peer-scoped config/registry files stay in state/.
+    for f in intentions.json heartbeat_log.json; do
+        LXC file push "$tmpdir/$f" "$name$PEER_HOME/.neil/$f" --mode 0644 >/dev/null 2>&1 || true
+    done
+    for f in spawn_config.json peers.json proposed_memories.json; do
         LXC file push "$tmpdir/$f" "$name$PEER_HOME/.neil/state/$f" --mode 0644 >/dev/null 2>&1 || true
     done
     rm -rf "$tmpdir"
@@ -607,6 +613,27 @@ LOG
     else
         log "  kickoff TIMEOUT ($name — no ready.md after ${max_wait}s; peer may still be processing)"
     fi
+
+    # LIFECYCLE: kickoff phase is over (ready.md written or timed out).
+    # Flip the seed intention from in_progress → pending so the peer's next
+    # heartbeat picks it up via observe.sh's pending filter. The peer will then
+    # resume the initial_intention work on its own via the 3C beat loop.
+    # Silent on failure — heartbeat loop will eventually reconcile on its own.
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null         -o BatchMode=yes -o ConnectTimeout=5         -i "$KEY_PRIV" "$PEER_USER@$ip"         "python3 -" <<'PY_STATUS' 2>/dev/null || true
+import json, pathlib, os
+p = pathlib.Path(os.path.expanduser("~/.neil/intentions.json"))
+if not p.exists():
+    raise SystemExit(0)
+xs = json.loads(p.read_text())
+changed = False
+for x in xs:
+    if x.get("source") == "spawn_config.initial_intention" and x.get("status") == "in_progress":
+        x["status"] = "pending"
+        changed = True
+if changed:
+    p.write_text(json.dumps(xs, indent=2))
+PY_STATUS
+    log "  intention handoff: $name seed intent → status=pending (heartbeat will pick up)"
 }
 
 cmd_create() {
@@ -658,6 +685,18 @@ cmd_create() {
         autonomous) setup_autonomous "$name" ;;
         relay)      setup_relay "$name" ;;
     esac
+
+    # SUBSTRATE-VERIFY GATE: don't emit ready until substrate actually landed.
+    # Prevents "spawn_vm lies about READY" failure mode where push_substrate
+    # silently fails leaving an empty container. See failures.json
+    # 2026-04-20T21-10 and 2026-04-21 humanizer-b substrate-push incidents.
+    log "verifying substrate on $name..."
+    if ! LXC exec "$name" -- test -d "$PEER_HOME/.neil/essence" 2>/dev/null \
+        || ! LXC exec "$name" -- test -f "$PEER_HOME/.neil/essence/identity.md" 2>/dev/null; then
+        registry_set "$name" "$ip" "$IMAGE" "substrate-missing"
+        die "substrate verification failed on $name: essence dir or identity.md missing inside container"
+    fi
+    log "  substrate OK ($PEER_HOME/.neil/essence/identity.md present)"
 
     registry_set "$name" "$ip" "$IMAGE" "ready"
     kickoff_peer "$name" "$ip"
