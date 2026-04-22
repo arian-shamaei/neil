@@ -108,3 +108,35 @@ Patterns and gotchas discovered through experience. Read on every invocation.
   intention claiming to use or fix that tool. Essence files can reference
   phantom paths just as beats can claim phantom ships. Audit via a periodic
   CONFIGURATION beat.
+## Action Prefix in Prose (learned 2026-04-22, notify-dispatch-docs arc)
+
+The parser does `strncmp(line, "NOTIFY:", 7)` from column 0 with ZERO
+awareness of surrounding context. A documentation example, a quoted
+README snippet, or an illustrative line starting at column 0 WILL be
+parsed as a real action and executed. This is the mirror image of the
+"no bold, no backticks" rule for genuine actions: the same exactness
+that makes parsing reliable makes prose-quoted examples dangerous.
+
+Concrete failure (2026-04-22 09:00 CONFIGURATION beat on outputs/):
+Beat output quoted essence/actions.md syntax examples verbatim:
+
+  NOTIFY: channel=<name> [param=value ...] | <message body>
+  NOTIFY: channel=terminal | System disk is 90% full. Investigate.
+  NOTIFY: channel=email to=seal@example.com ...
+  NOTIFY: channel=slack room=general | Heartbeat report: all systems nominal.
+
+Result: 1 "unknown channel=<name>" failure, 1 failed email to
+example.com, 1 false "disk 90% full" terminal log entry, 1 false
+slack dispatch. Operator could have acted on any of these as if real.
+
+Rule: when quoting action-prefix examples in beat output (NOTIFY:,
+CALL:, BASH:, WRITE:, READ:, MEMORY:, INTEND:, DONE:, FAIL:,
+HEARTBEAT:, PROMPT:, MODE_OVERRIDE:), INDENT them by at least two
+spaces. The parser requires column-0 to trigger; indenting reliably
+neutralizes. Example:
+
+    NOTIFY: channel=terminal | Example text
+
+Corollary: NEVER quote genuine-looking dispatches in prose just to
+describe them. Say "a NOTIFY with channel=email" rather than
+rendering the full syntax at column 0.

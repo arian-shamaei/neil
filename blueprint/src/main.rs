@@ -24,6 +24,41 @@ use ratatui::Terminal;
 use state::{NeilState, CommandLogEntry, load_command_log};
 use stream::{StreamEntry, EntryKind, RichBlock, DiffLine};
 
+// ── Smoothness bench ─────────────────────────────────────────────────────
+// When NEIL_BLUEPRINT_BENCH=1, per-section render durations are appended
+// as JSONL to NEIL_BLUEPRINT_BENCH_FILE (default /tmp/neil_bench.jsonl).
+// Aggregator: blueprint/bench_report.py
+struct BenchRecorder {
+    file: Option<std::fs::File>,
+    start: Instant,
+}
+
+impl BenchRecorder {
+    fn new() -> Self {
+        let file = if std::env::var("NEIL_BLUEPRINT_BENCH").is_ok() {
+            let path = std::env::var("NEIL_BLUEPRINT_BENCH_FILE")
+                .unwrap_or_else(|_| "/tmp/neil_bench.jsonl".into());
+            std::fs::OpenOptions::new()
+                .create(true).append(true).open(path).ok()
+        } else { None };
+        Self { file, start: Instant::now() }
+    }
+
+    fn record(&mut self, section: &str, dur: Duration) {
+        if let Some(ref mut f) = self.file {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                r#"{{"t_ms":{},"s":"{}","us":{}}}"#,
+                self.start.elapsed().as_millis(),
+                section,
+                dur.as_micros()
+            );
+        }
+    }
+}
+
+
 #[derive(Debug, Clone, PartialEq)]
 enum View {
     Chat,
@@ -136,6 +171,7 @@ fn main() -> anyhow::Result<()> {
         prompt_history.reverse(); // oldest first, newest last (Up arrow starts from end)
     }
     let mut fps = FpsTracker::new();
+    let mut bench = BenchRecorder::new();
 
     // Cache: only reload state on timed intervals
     let mut cached_state: Option<NeilState> = None;
@@ -172,8 +208,10 @@ fn main() -> anyhow::Result<()> {
     loop {
         // Reload state from disk every 5 seconds (time-gated, not tick-gated)
         if last_state_reload.elapsed() >= Duration::from_secs(5) || cached_state.is_none() {
+            let __reload_t0 = Instant::now();
             cached_state = Some(NeilState::load(&neil_home));
             cached_pose = seal::SealPose::load(&cached_state.as_ref().unwrap().neil_home);
+            bench.record("state.reload", __reload_t0.elapsed());
             last_state_reload = Instant::now();
             needs_redraw = true;
         }
@@ -347,6 +385,26 @@ fn main() -> anyhow::Result<()> {
                 cached_chat_wrap_width = wrap_width;
             }
 
+            let __render_section: &'static str = match &view {
+                View::Chat => "render.chat",
+                View::PanelSelector => "render.panel_selector",
+                View::Panel(pidx) => {
+                    if *pidx == 1 && hb_expanded { "render.heartbeat_expanded" }
+                    else if *pidx == 7 && cluster_expanded { "render.cluster_expanded" }
+                    else { match *pidx {
+                        0 => "render.memory",
+                        1 => "render.heartbeat",
+                        2 => "render.intentions",
+                        3 => "render.system",
+                        4 => "render.services",
+                        5 => "render.failures",
+                        6 => "render.logs",
+                        7 => "render.cluster",
+                        _ => "render.unknown",
+                    } }
+                }
+            };
+            let __render_t0 = Instant::now();
             terminal.draw(|frame| {
                 let size = frame.area();
                 match &view {
@@ -380,6 +438,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             })?;
+            bench.record(__render_section, __render_t0.elapsed());
             last_render = Instant::now();
             needs_redraw = false;
             tick += 1; // only increment on actual renders for smooth animation timing
