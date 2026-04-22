@@ -2083,14 +2083,31 @@ fn cluster_lines(selection: usize) -> Vec<Line<'static>> {
             )));
         }
 
-        // Arrow row: ▼ at each card center
+        // Arrow row: ▼ at each card center. The arrow pointing at the
+        // currently-selected child is highlighted (bright cyan, bold);
+        // other arrows stay dim grey. Built as per-position spans so
+        // each arrow can carry its own style.
         {
-            let mut buf: Vec<char> = vec![' '; card_centers[card_centers.len()-1] + 1];
-            for c in &card_centers { buf[*c] = '▼'; }
-            lines.push(Line::from(Span::styled(
-                buf.into_iter().collect::<String>(),
-                Style::default().fg(Color::Rgb(120, 120, 120)),
-            )));
+            let row_end = card_centers[card_centers.len()-1] + 1;
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut cursor = 0usize;
+            let dim = Style::default().fg(Color::Rgb(120, 120, 120));
+            let hot = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+            for (i, center) in card_centers.iter().enumerate() {
+                if *center > cursor {
+                    spans.push(Span::raw(" ".repeat(*center - cursor)));
+                }
+                // selection==0 is MAIN (no arrow); children are 1..=n_first
+                // for the first row we render here. card_centers[i] maps to
+                // child index i (global index i+1).
+                let is_selected = selection == i + 1;
+                spans.push(Span::styled("▼".to_string(), if is_selected { hot } else { dim }));
+                cursor = *center + 1;
+            }
+            if cursor < row_end {
+                spans.push(Span::raw(" ".repeat(row_end - cursor)));
+            }
+            lines.push(Line::from(spans));
         }
 
         // Children cards (all rows use the same card_indent)
@@ -2568,7 +2585,7 @@ fn build_main_box(
     up: &str, task: &str, pending: &str, selected: bool,
 ) -> Vec<Line<'static>> {
     let inner = 46;
-    let border_color = if selected { Color::Cyan } else { Color::Rgb(100, 100, 140) };
+    let border_color = if selected { Color::Cyan } else { Color::DarkGray };
     let border_mod = if selected { Modifier::BOLD } else { Modifier::empty() };
     let bs = Style::default().fg(border_color).add_modifier(border_mod);
 
@@ -2632,8 +2649,7 @@ fn build_main_box(
 fn build_child_box(c: &ChildCard, selected: bool, width: usize) -> Vec<Line<'static>> {
     let inner = width - 2;
     let border_color = if selected { Color::Cyan }
-        else if c.kind == "peer" { Color::Rgb(100, 200, 200) }
-        else { Color::Rgb(200, 180, 80) };
+        else { Color::DarkGray };
     let border_mod = if selected { Modifier::BOLD } else { Modifier::empty() };
     let bs = Style::default().fg(border_color).add_modifier(border_mod);
 
