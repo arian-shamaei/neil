@@ -70,6 +70,21 @@ fn cluster_cache() -> &'static std::sync::Arc<std::sync::Mutex<Option<String>>> 
     CLUSTER_CACHE.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(None)))
 }
 
+/// Number of children cards per row in the cluster panel layout.
+/// Must stay in sync with PER_ROW inside cluster_lines().
+const CLUSTER_PER_ROW: usize = 3;
+
+/// Total live children (temps + peers) currently in the cluster cache.
+/// Used by key handlers to bound-check row/col navigation.
+fn cluster_children_count() -> usize {
+    let cached = cluster_cache().lock().ok().and_then(|g| g.clone());
+    match cached {
+        Some(ref t) if t.starts_with("__ERROR__") => 0,
+        Some(ref t) => parse_temps(t).len() + parse_peers(t).len(),
+        None => 0,
+    }
+}
+
 fn spawn_cluster_refresher(neil_home: PathBuf) {
     let bin = neil_home.join("bin/neil-cluster");
     if !bin.exists() { return; }
@@ -807,16 +822,51 @@ fn main() -> anyhow::Result<()> {
                             KeyCode::Up if *pidx == 7 => {
                                 if cluster_expanded {
                                     if cluster_scroll > 0 { cluster_scroll = cluster_scroll.saturating_sub(1); }
-                                } else if cluster_selection > 0 {
-                                    cluster_selection -= 1;
+                                } else {
+                                    // Row-based: jump up by PER_ROW; from first row go to MAIN.
+                                    // selection==0 is MAIN; 1..=N are children in row-major order.
+                                    if cluster_selection == 0 {
+                                        // already at MAIN
+                                    } else if cluster_selection <= CLUSTER_PER_ROW {
+                                        cluster_selection = 0;
+                                    } else {
+                                        cluster_selection -= CLUSTER_PER_ROW;
+                                    }
                                 }
                             }
                             KeyCode::Down if *pidx == 7 => {
                                 if cluster_expanded {
                                     cluster_scroll += 1;
                                 } else {
-                                    // Bounded by snapshot size at render time; allow overshoot and clamp in render.
-                                    cluster_selection += 1;
+                                    // From MAIN enter the first child; otherwise jump down by PER_ROW.
+                                    // Clamp so we never land past the last child.
+                                    let total = cluster_children_count();
+                                    if total == 0 {
+                                        // no children; nothing to do
+                                    } else if cluster_selection == 0 {
+                                        cluster_selection = 1;
+                                    } else {
+                                        let next = cluster_selection + CLUSTER_PER_ROW;
+                                        if next <= total { cluster_selection = next; }
+                                    }
+                                }
+                            }
+                            KeyCode::Left if *pidx == 7 => {
+                                // Column-based: step one card left, stopping at row start.
+                                if !cluster_expanded && cluster_selection > 1 {
+                                    let col = (cluster_selection - 1) % CLUSTER_PER_ROW;
+                                    if col > 0 { cluster_selection -= 1; }
+                                }
+                            }
+                            KeyCode::Right if *pidx == 7 => {
+                                // Column-based: step one card right, stopping at row end
+                                // or the last existing child.
+                                if !cluster_expanded && cluster_selection >= 1 {
+                                    let total = cluster_children_count();
+                                    let col = (cluster_selection - 1) % CLUSTER_PER_ROW;
+                                    if col < CLUSTER_PER_ROW - 1 && cluster_selection < total {
+                                        cluster_selection += 1;
+                                    }
                                 }
                             }
                             KeyCode::Enter if *pidx == 7 => {
