@@ -211,14 +211,17 @@ push_substrate() {
 import json, sys, pathlib
 d, name, parent, persona, mem, arch, intent, ts, iid = sys.argv[1:10]
 p = pathlib.Path(d)
-(p / "intentions.json").write_text(json.dumps([{
+# IMPORTANT: compact JSON (no indent). observe.sh's grep requires exactly
+# "status":"pending" with no whitespace; pretty-printed seed is invisible
+# to the heartbeat observation path. See 2026-04-22 humanizer peer off-task bug.
+(p / "intentions.json").write_text("[" + json.dumps({
     "id":          iid,
     "created":     ts,
     "priority":    "high",
     "status":      "in_progress",
     "description": intent if intent else f"Operate as peer Neil {name!r} per spawn_config",
     "source":      "spawn_config.initial_intention",
-}], indent=2))
+}, separators=(',', ':')) + "]")
 (p / "heartbeat_log.json").write_text(json.dumps([{
     "timestamp": ts,
     "prompt":    "peer_kickoff",
@@ -631,7 +634,7 @@ for x in xs:
         x["status"] = "pending"
         changed = True
 if changed:
-    p.write_text(json.dumps(xs, indent=2))
+    p.write_text("[" + ",".join(json.dumps(x, separators=(',', ':')) for x in xs) + "]")
 PY_STATUS
     log "  intention handoff: $name seed intent → status=pending (heartbeat will pick up)"
 }
