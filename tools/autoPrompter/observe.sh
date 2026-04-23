@@ -96,9 +96,9 @@ echo ""
 echo "=== Unresolved Failures ==="
 if [ -f "$HOME/.neil/self/failures.json" ] && [ -s "$HOME/.neil/self/failures.json" ]; then
     grep '"pending"' "$HOME/.neil/self/failures.json" 2>/dev/null | while IFS= read -r line; do
-        SEV=$(echo "$line" | sed 's/.*"severity":"\([^"]*\)".*/\1/')
-        SRC=$(echo "$line" | sed 's/.*"source":"\([^"]*\)".*/\1/')
-        ERR=$(echo "$line" | sed 's/.*"error":"\([^"]*\)".*/\1/')
+        SEV=$(echo "$line" | sed 's/.*"severity": *"\([^"]*\)".*/\1/')
+        SRC=$(echo "$line" | sed 's/.*"source": *"\([^"]*\)".*/\1/')
+        ERR=$(echo "$line" | sed 's/.*"error": *"\([^"]*\)".*/\1/')
         echo "  [$SEV] $SRC: $ERR"
     done
     UNRESOLVED=$(grep -c '"pending"' "$HOME/.neil/self/failures.json" 2>/dev/null || echo 0)
