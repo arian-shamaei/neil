@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""neil-session-scan — rebuild ~/.neil/state/sessions.json from peer message history.
+
+A "session" is a thread of peer_send messages tagged with a session marker:
+  [HANDSHAKE REQUEST] session=<id> ...
+  [HANDSHAKE ACK]     session=<id> ...
+  [SESSION <id>]      ...
+  [SESSION <id> CLOSE] ...
+
+This script walks:
+  - the LOCAL peer_send outbound events in state/cluster_activity.jsonl
+  - incoming message files in autoPrompter/{queue,active,history}/*_from_<peer>.md
+
+and produces a single state/sessions.json of the form:
+
+  {
+    "sess_1776978080": {
+      "partner":     "humanizer-b",
+      "topic":       "detector-bench-acceptance",   # from the first message
+      "opened_at":   "2026-04-23T21:01:32Z",
+      "last_msg_at": "2026-04-23T21:01:32Z",
+      "last_direction":   "outbound",                # inbound|outbound
+      "ball_in_my_court": false,                     # last msg was inbound
+      "message_count":    1,
+      "status":           "active",                  # active|closed
+      "last_message_head": "…"
+    }
+  }
+
+`ball_in_my_court` flips each time a message is sent or received. It's the signal
+observe.sh uses to nudge the beat-router toward sessions that need a reply.
+
+Usage:
+    neil-session-scan              # rebuild sessions.json from history
+    neil-session-scan --print      # also echo the table to stdout
+"""
+from __future__ import annotations
+import json, os, re, sys
+from datetime import datetime
+from pathlib import Path
+
+NEIL_HOME = Path(os.environ.get("NEIL_HOME", Path.home() / ".neil"))
+STATE     = NEIL_HOME / "state"
+HISTORY   = NEIL_HOME / "tools/autoPrompter/history"
+ACTIVE    = NEIL_HOME / "tools/autoPrompter/active"
+QUEUE     = NEIL_HOME / "tools/autoPrompter/queue"
+ACTIVITY  = STATE / "cluster_activity.jsonl"
+OUT       = STATE / "sessions.json"
+
+# Regexes for session markers. Order matters — check CLOSE before plain SESSION.
+# Session IDs are alphanumeric + underscore/hyphen; tighter than \S+ to avoid
+# capturing trailing punctuation or stray \n-Opening escape sequences.
+R_ID    = r"(sess_[A-Za-z0-9_-]+)"
+R_CLOSE = re.compile(rf"\[SESSION\s+{R_ID}\s+CLOSE\]", re.I)
+R_SESS  = re.compile(rf"\[SESSION\s+{R_ID}\]", re.I)
+R_ACK   = re.compile(rf"\[HANDSHAKE\s+ACK\][^\n]*?session\s*=\s*{R_ID}", re.I)
+R_REQ   = re.compile(rf"\[HANDSHAKE\s+REQUEST\][^\n]*?session\s*=\s*{R_ID}", re.I)
+R_TOPIC = re.compile(r"topic\s*=\s*[\"']?([^\"'\n]+)", re.I)
+
+
+def session_markers(body: str) -> tuple[str | None, bool, str | None]:
+    """Return (session_id, is_close, topic). session_id=None if no markers."""
+    m = R_CLOSE.search(body)
+    if m:
+        return m.group(1), True, None
+    for rx in (R_SESS, R_ACK, R_REQ):
+        m = rx.search(body)
+        if m:
+            topic = None
+            tm = R_TOPIC.search(body)
+            if tm:
+                topic = tm.group(1).strip()
+            return m.group(1), False, topic
+    return None, False, None
+
+
+def iso_from_epoch_or_iso(ts) -> str:
+    if isinstance(ts, (int, float)):
+        return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return str(ts)
+
+
+def scan_outbound() -> list[dict]:
+    """Read cluster_activity.jsonl for peer_send_queued / peer_send_sent events
+    where sender == this node. Return a list of {ts, peer, body_snippet}.
+    We need the body to extract session markers — body isn't stored in the
+    activity log itself, so we'll look at /tmp/peer_send_<ts>.md (transient)
+    if present, otherwise match by dest path to the scp'd file on the peer
+    (which we can't read from this side). Fallback: no body → treat as empty."""
+    out = []
+    if not ACTIVITY.exists():
+        return out
+    node = os.environ.get("NEIL_NODE_ID") or os.uname().nodename
+    for line in ACTIVITY.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        evt = d.get("event", "")
+        if evt not in ("peer_send_queued", "peer_send_sent"):
+            continue
+        if d.get("sender") != node:
+            continue
+        dest = d.get("dest") or ""
+        out.append({
+            "ts":   d.get("ts", ""),
+            "peer": d.get("peer", ""),
+            "dest": dest,
+        })
+    return out
+
+
+def scan_inbound() -> list[dict]:
+    """List .md files in history/active/queue whose name matches *_from_<peer>.md.
+    Return [{ts, peer, path, body}]."""
+    out = []
+    for d in (HISTORY, ACTIVE, QUEUE):
+        if not d.exists():
+            continue
+        for p in d.glob("*_from_*.md"):
+            # skip result files
+            if p.name.endswith(".result.md"):
+                continue
+            # parse peer from filename
+            m = re.search(r"_from_([^.]+)\.md$", p.name)
+            peer = m.group(1) if m else "unknown"
+            try:
+                body = p.read_text(errors="replace")
+            except Exception:
+                body = ""
+            try:
+                st = p.stat()
+                ts = datetime.utcfromtimestamp(st.st_mtime).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except Exception:
+                ts = ""
+            out.append({"ts": ts, "peer": peer, "path": str(p), "body": body})
+    return out
+
+
+def rebuild() -> dict:
+    sessions: dict[str, dict] = {}
+
+    def touch(sid, *, direction, peer, ts, body, topic=None, close=False):
+        s = sessions.setdefault(sid, {
+            "partner":         peer,
+            "topic":           topic or "",
+            "opened_at":       ts,
+            "last_msg_at":     ts,
+            "last_direction":  direction,
+            "ball_in_my_court": direction == "inbound",
+            "message_count":    0,
+            "status":           "active",
+            "last_message_head": "",
+        })
+        s["message_count"] += 1
+        if not s["topic"] and topic:
+            s["topic"] = topic
+        # keep the earliest ts as opened_at, latest as last_msg_at
+        if ts and (not s["opened_at"] or ts < s["opened_at"]):
+            s["opened_at"] = ts
+        if ts and ts > s["last_msg_at"]:
+            s["last_msg_at"] = ts
+            s["last_direction"] = direction
+            s["ball_in_my_court"] = (direction == "inbound")
+        s["last_message_head"] = (body or "").strip().splitlines()[0][:140] if body else ""
+        if close:
+            s["status"] = "closed"
+            s["ball_in_my_court"] = False
+
+    # Inbound (files on disk, body readable → reliable session markers)
+    for rec in scan_inbound():
+        sid, close, topic = session_markers(rec["body"])
+        if not sid:
+            continue
+        touch(sid, direction="inbound", peer=rec["peer"], ts=rec["ts"],
+              body=rec["body"], topic=topic, close=close)
+
+    # Outbound: peer_send_queued events in cluster_activity.jsonl where
+    # sender is this node. Body isn't in the log, but the ts + peer let us
+    # update `ball_in_my_court` — if there's an outbound AFTER the last
+    # inbound for a given session's partner, we already replied. This
+    # catches the "peer reasoned about it but didn't dispatch" false-alarm
+    # where the agent is convinced it answered when it only wrote a
+    # heartbeat-log entry.
+    if ACTIVITY.exists():
+        node = os.environ.get("NEIL_NODE_ID") or os.uname().nodename
+        for line in ACTIVITY.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if d.get("event") not in ("peer_send_queued", "peer_send_sent"):
+                continue
+            if d.get("sender") != node:
+                continue
+            ts = d.get("ts", "")
+            peer = d.get("peer", "")
+            # Find any session whose partner matches AND whose last inbound
+            # was older than this outbound. Flip ball to outbound.
+            for sid, s in sessions.items():
+                if s.get("partner") != peer:
+                    continue
+                if s.get("status") == "closed":
+                    continue
+                # If this outbound is newer than last_msg_at, it IS the reply
+                if ts and ts > s.get("last_msg_at", ""):
+                    s["last_msg_at"] = ts
+                    s["last_direction"] = "outbound"
+                    s["ball_in_my_court"] = False
+                    s["message_count"] = s.get("message_count", 0) + 1
+
+    return sessions
+
+
+def record_outbound(sid: str, partner: str, body: str, topic: str | None, close: bool):
+    """Called by handler.sh after a successful queue-send. Adds/updates the
+    outbound side of a session in sessions.json."""
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    data = {}
+    if OUT.exists():
+        try:
+            data = json.loads(OUT.read_text())
+        except json.JSONDecodeError:
+            data = {}
+    ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    s = data.setdefault(sid, {
+        "partner": partner,
+        "topic": topic or "",
+        "opened_at": ts,
+        "last_msg_at": ts,
+        "last_direction": "outbound",
+        "ball_in_my_court": False,
+        "message_count": 0,
+        "status": "active",
+        "last_message_head": "",
+    })
+    s["message_count"] += 1
+    s["last_msg_at"] = ts
+    s["last_direction"] = "outbound"
+    s["ball_in_my_court"] = False
+    if topic and not s["topic"]:
+        s["topic"] = topic
+    s["last_message_head"] = (body or "").strip().splitlines()[0][:140] if body else ""
+    if close:
+        s["status"] = "closed"
+    OUT.write_text(json.dumps(data, indent=2))
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] == "--record-outbound":
+        # CLI: --record-outbound <session_id> <partner> <message-file> [--close]
+        if len(args) < 4:
+            sys.stderr.write("usage: --record-outbound <sid> <peer> <msg_file> [--close]\n")
+            sys.exit(2)
+        sid, peer, mfile = args[1], args[2], args[3]
+        body = Path(mfile).read_text(errors="replace") if Path(mfile).exists() else ""
+        _, close, topic = session_markers(body)
+        record_outbound(sid, peer, body, topic, close)
+        print(f"recorded outbound sid={sid} peer={peer} close={close}")
+        return
+
+    sessions = rebuild()
+    # Preserve prior outbound entries that scan won't see (outbound body is
+    # not on local disk once handler's tmpfile is rm'd). Merge with existing.
+    if OUT.exists():
+        try:
+            prior = json.loads(OUT.read_text())
+        except json.JSONDecodeError:
+            prior = {}
+        for sid, old in prior.items():
+            if sid not in sessions:
+                sessions[sid] = old
+            else:
+                # merge: keep higher message_count, later last_msg_at, etc.
+                new = sessions[sid]
+                new["message_count"] = max(new["message_count"],
+                                            old.get("message_count", 0))
+                if old.get("last_msg_at", "") > new["last_msg_at"]:
+                    new["last_msg_at"] = old["last_msg_at"]
+                    new["last_direction"] = old.get("last_direction", new["last_direction"])
+                    new["ball_in_my_court"] = old.get("ball_in_my_court",
+                                                      new["ball_in_my_court"])
+                if old.get("status") == "closed":
+                    new["status"] = "closed"
+
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text(json.dumps(sessions, indent=2))
+    if "--print" in args:
+        active = {k: v for k, v in sessions.items() if v.get("status") == "active"}
+        print(f"Sessions: {len(sessions)} total ({len(active)} active)")
+        for sid, s in sessions.items():
+            mark = "<<" if s.get("ball_in_my_court") else "  "
+            print(f"  {mark} {sid}  partner={s['partner']}  "
+                  f"topic={s.get('topic','')[:30]}  "
+                  f"msgs={s['message_count']}  status={s['status']}  "
+                  f"last_dir={s['last_direction']}")
+
+
+if __name__ == "__main__":
+    main()

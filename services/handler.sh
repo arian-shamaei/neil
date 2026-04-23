@@ -293,11 +293,17 @@ case "$NEIL_SERVICE" in
         ;;
 
     peer_send)
-        # CALL: peer_send peer=<name> message=<text>
-        # Runs neil_agent.py on the peer synchronously over SSH, captures reply,
-        # logs to cluster_activity.jsonl.
+        # CALL: peer_send peer=<name> message=<text> [action=queue|exec]
+        # action=exec (default): Runs neil_agent.py on peer synchronously over
+        #                        SSH, captures reply, emits as PROMPT:.
+        # action=queue:          Drops a prompt .md file into the peer's
+        #                        autoPrompter queue via scp and returns
+        #                        immediately. Peer processes on next autoprompt
+        #                        cycle. Organic-conversation primitive.
         PEER="$PARAM_peer"
         MSG="$PARAM_message"
+        # Action source: explicit PARAM_action wins over NEIL_ACTION env.
+        ACTION="${PARAM_action:-${NEIL_ACTION:-exec}}"
         if [ -z "$PEER" ] || [ -z "$MSG" ]; then
             echo "{\"service\":\"peer_send\",\"error\":\"missing peer or message\"}" >&2
             exit 1
@@ -308,6 +314,41 @@ case "$NEIL_SERVICE" in
             exit 1
         fi
         SENDER="${NEIL_NODE_ID:-$(hostname)}"
+
+        # ── async queue-drop branch ──
+        if [ "$ACTION" = "queue" ]; then
+            TS=$(date -u +%Y%m%dT%H%M%S)
+            TMP=$(mktemp --suffix=.md)
+            printf '%s\n' "$MSG" > "$TMP"
+            DEST="/home/neil/.neil/tools/autoPrompter/queue/${TS}_from_${SENDER}.md"
+            scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                -o BatchMode=yes -o ConnectTimeout=5 \
+                -i "$HOME/.neil/keys/peer_ed25519" \
+                "$TMP" "neil@$PEER_IP:$DEST"
+            SCP_RC=$?
+            BYTES=$(stat -c '%s' "$TMP" 2>/dev/null || echo 0)
+            rm -f "$TMP"
+            python3 - "$HOME/.neil/state/cluster_activity.jsonl" "$SENDER" "$PEER" "$PEER_IP" "$SCP_RC" "$BYTES" "$DEST" <<'LOG'
+import json, pathlib, sys, datetime
+p, sender, peer, ip, rc, bytes_, dest = sys.argv[1:8]
+pp = pathlib.Path(p); pp.parent.mkdir(parents=True, exist_ok=True)
+with pp.open("a") as f:
+    f.write(json.dumps({
+        "ts":     datetime.datetime.utcnow().isoformat(timespec="seconds")+"Z",
+        "event":  "peer_send_queued" if rc == "0" else "peer_send_queue_fail",
+        "sender": sender, "peer": peer, "peer_ip": ip,
+        "dest":   dest,
+        "bytes":  int(bytes_),
+        "rc":     int(rc),
+    }) + "\n")
+LOG
+            if [ "$SCP_RC" -ne 0 ]; then
+                echo "{\"service\":\"peer_send\",\"action\":\"queue\",\"error\":\"scp rc=$SCP_RC\"}" >&2
+                exit 1
+            fi
+            echo "{\"service\":\"peer_send\",\"action\":\"queue\",\"peer\":\"$PEER\",\"peer_ip\":\"$PEER_IP\",\"dest\":\"$DEST\",\"bytes\":$BYTES}"
+            exit 0
+        fi
 
         # Escape the message for embedding in a single-quoted ssh arg.
         MSG_ESC=$(printf '%s' "$MSG" | sed "s/'/'\\\\''/g")

@@ -89,6 +89,36 @@ else
 fi
 
 echo ""
+# Open peer-to-peer sessions. Rebuilt from history+activity by
+# neil-session-scan; updated outbound by handler.sh peer_send queue branch.
+# 'ball' signal means this peer should reply next beat if the session's
+# topic overlaps its current work.
+echo ""
+echo "=== Open Peer Sessions ==="
+SESS_FILE="$HOME/.neil/state/sessions.json"
+if [ -x "$HOME/.neil/bin/neil-session-scan" ]; then
+    "$HOME/.neil/bin/neil-session-scan" 2>/dev/null
+fi
+if [ -s "$SESS_FILE" ]; then
+    python3 - <<PY_SESS
+import json, pathlib
+d = json.loads(pathlib.Path("$SESS_FILE").read_text())
+active = [(k, v) for k, v in d.items() if v.get("status") == "active"]
+if not active:
+    print("  (no open sessions)")
+for sid, s in sorted(active, key=lambda kv: kv[1].get("last_msg_at",""), reverse=True):
+    ball = "<< BALL IN YOUR COURT" if s.get("ball_in_my_court") else "waiting"
+    topic = s.get("topic", "") or "(no topic)"
+    print(f"  [{ball:<22s}] {sid}  peer={s.get('partner','?')}  topic={topic[:60]}  msgs={s.get('message_count',0)}  last={s.get('last_msg_at','')}")
+    head = s.get("last_message_head", "")
+    if head:
+        print(f"      last: {head[:100]}")
+PY_SESS
+else
+    echo "  (no sessions file)"
+fi
+
+echo ""
 echo "=== Self Check ==="
 $HOME/.neil/self/self_check.sh 2>/dev/null | grep -E 'FAIL|FAILED|ALL CHECKS'
 
