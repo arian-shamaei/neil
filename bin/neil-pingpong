@@ -1,0 +1,108 @@
+#!/bin/bash
+# neil-pingpong — A prompts B, B prompts A, A prompts B, ...
+#
+# Simple turn-alternating driver. Main Neil seeds the first message to A,
+# captures A's reply, feeds it to B as the next prompt, captures B's reply,
+# feeds it to A, and so on for N turns. Prints each turn inline. If any
+# reply begins with DONE: the loop stops early.
+#
+# Usage:
+#   neil-pingpong <A> <B> <seed_topic> [--turns N] [--dry-run]
+
+set -u
+
+A=${1:-}; B=${2:-}; SEED=${3:-}
+TURNS=4
+DRY=0
+shift 3 2>/dev/null || { echo "usage: neil-pingpong <A> <B> <seed> [--turns N] [--dry-run]"; exit 2; }
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --turns) TURNS="$2"; shift 2 ;;
+        --dry-run) DRY=1; shift ;;
+        *) echo "unknown arg: $1" >&2; exit 2 ;;
+    esac
+done
+[ -z "$A" ] || [ -z "$B" ] || [ -z "$SEED" ] && { echo 'missing A/B/seed'; exit 2; }
+
+NEIL_HOME=${NEIL_HOME:-$HOME/.neil}
+KEY=$NEIL_HOME/keys/peer_ed25519
+PEERS=$NEIL_HOME/state/peers.json
+
+ip_of() {
+    python3 -c "
+import json
+d = json.load(open('$PEERS'))
+rec = d.get('$1', {})
+print(rec.get('ip','') if rec.get('status')=='ready' else '')
+"
+}
+
+IP_A=$(ip_of "$A"); IP_B=$(ip_of "$B")
+[ -z "$IP_A" ] && { echo "peer $A not ready"; exit 3; }
+[ -z "$IP_B" ] && { echo "peer $B not ready"; exit 3; }
+
+# One hop: send message to peer, return its reply text.
+# The system prompt + message are base64-encoded JSON, SSHed to the peer
+# as a single-quoted command-line arg. Remote python decodes and runs the
+# agent. No bash quote-escaping, no env var forwarding, no heredoc-vs-stdin
+# conflict.
+send_hop() {
+    local peer=$1 ip=$2 sender=$3 msg=$4
+    local sys="You are peer Neil $peer in an ongoing conversation with $sender. Reply concisely in 1-3 sentences. Do NOT prepend labels or markdown; just the reply text. If the conversation has reached a natural conclusion, begin your reply with DONE:"
+
+    local b64
+    b64=$(python3 -c '
+import base64, json, sys
+payload = {"sys": sys.argv[1], "msg": sys.argv[2]}
+print(base64.b64encode(json.dumps(payload).encode()).decode())
+' "$sys" "$msg")
+
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o BatchMode=yes -o ConnectTimeout=10 \
+        -i "$KEY" "neil@$ip" \
+        "python3 - '$b64'" <<'REMOTE_PY'
+import base64, json, os, subprocess, sys
+d = json.loads(base64.b64decode(sys.argv[1]).decode())
+env = os.environ.copy()
+env['NEIL_HOME'] = '/home/neil/.neil'
+env['NEIL_MAX_TURNS'] = '3'
+p = subprocess.run([
+    '/home/neil/.neil/tools/autoPrompter/agent/.venv/bin/python',
+    '/home/neil/.neil/tools/autoPrompter/agent/neil_agent.py',
+    '--system-prompt', d['sys'],
+    '-p', d['msg'],
+], env=env, capture_output=True, text=True)
+sys.stdout.write(p.stdout)
+sys.stdout.write(p.stderr)
+REMOTE_PY
+}
+
+current_msg="$SEED"
+sender='main'
+target=$A; target_ip=$IP_A
+
+for k in $(seq 1 $TURNS); do
+    echo "=== turn $k [$sender->$target] ==="
+    echo "  send: $(printf '%s' "$current_msg" | head -c 300)"
+    if [ $DRY = 1 ]; then
+        reply='(mock reply)'
+    else
+        reply=$(send_hop "$target" "$target_ip" "$sender" "$current_msg")
+    fi
+    # Strip SSH banners + blanks, take last non-empty chunk as the "final" reply
+    reply_clean=$(printf '%s' "$reply" | grep -v 'Warning: Permanently added' | grep -v '^$' || true)
+    reply_final=$(printf '%s' "$reply_clean" | tail -3)
+    echo "  reply: $reply_final"
+    # End loop early on DONE:
+    if printf '%s' "$reply_final" | grep -q '^DONE:'; then
+        echo '  [conversation ended with DONE:]'
+        break
+    fi
+    # Swap roles
+    if [ "$target" = "$A" ]; then
+        sender=$A; target=$B; target_ip=$IP_B
+    else
+        sender=$B; target=$A; target_ip=$IP_A
+    fi
+    current_msg="$reply_final"
+done
