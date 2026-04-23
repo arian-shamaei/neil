@@ -1,0 +1,77 @@
+#!/bin/bash
+# neil-creds-sync — push main Neil's fresh Claude credentials to every
+# ready peer in ~/.neil/state/peers.json. Intended to run on a short timer
+# (e.g. every 15 min via cron) so peer Claude agents never stall on a
+# 401 from stale OAuth tokens.
+#
+# Mechanism: for each peer, scp ~/.claude/.credentials.json to
+# neil@<peer_ip>:/home/neil/.claude/.credentials.json over the peer SSH key.
+# Logs every attempt to ~/.neil/state/cluster_activity.jsonl as a
+# peer_transfer_push event (rc=0 on success, rc!=0 on failure; same schema
+# as manual peer_transfer calls).
+
+set -u
+NEIL_HOME=${NEIL_HOME:-$HOME/.neil}
+CREDS_SRC=$HOME/.claude/.credentials.json
+CREDS_DST=/home/neil/.claude/.credentials.json
+PEERS_JSON=$NEIL_HOME/state/peers.json
+KEY=$NEIL_HOME/keys/peer_ed25519
+ACTIVITY=$NEIL_HOME/state/cluster_activity.jsonl
+LOG=$NEIL_HOME/logs/creds_sync.log
+
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+log() { printf '[%s] %s\n' "$(ts)" "$*" >> "$LOG"; }
+
+[ -f "$CREDS_SRC" ] || { log "missing $CREDS_SRC; skip"; exit 0; }
+[ -f "$PEERS_JSON" ] || { log "missing $PEERS_JSON; skip"; exit 0; }
+[ -f "$KEY" ] || { log "missing $KEY; skip"; exit 0; }
+
+SENDER=${NEIL_NODE_ID:-$(hostname)}
+BYTES=$(stat -c '%s' "$CREDS_SRC" 2>/dev/null || echo 0)
+
+# Parse peers.json (only status=ready) with Python
+PEERS=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open('$PEERS_JSON'))
+except Exception:
+    sys.exit(0)
+for name, rec in d.items():
+    if rec.get('status') == 'ready':
+        ip = rec.get('ip', '')
+        if ip:
+            print(f'{name} {ip}')
+")
+
+if [ -z "$PEERS" ]; then
+    log 'no ready peers; skip'
+    exit 0
+fi
+
+echo "$PEERS" | while IFS=' ' read -r name ip; do
+    [ -n "$ip" ] || continue
+    scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null         -o BatchMode=yes -o ConnectTimeout=5         -i "$KEY" "$CREDS_SRC" "neil@$ip:$CREDS_DST"
+    RC=$?
+    if [ "$RC" -eq 0 ]; then
+        EVT=peer_transfer_push
+        log "push ok -> $name ($ip) $BYTES bytes"
+    else
+        EVT=peer_transfer_push_fail
+        log "push FAIL -> $name ($ip) rc=$RC"
+    fi
+    python3 - "$ACTIVITY" "$SENDER" "$name" "$ip" "$CREDS_SRC" "$CREDS_DST" "$BYTES" "$RC" "$EVT" <<'PY'
+import json, pathlib, sys, datetime
+p, sender, peer, ip, src, dst, bytes_, rc, evt = sys.argv[1:10]
+pp = pathlib.Path(p); pp.parent.mkdir(parents=True, exist_ok=True)
+with pp.open('a') as f:
+    f.write(json.dumps({
+        'ts':       datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+        'event':    evt,
+        'sender':   sender, 'peer': peer, 'peer_ip': ip,
+        'source':   src, 'dest': dst,
+        'bytes':    int(bytes_),
+        'rc':       int(rc),
+        'subject':  'credentials-sync',
+    }) + '\n')
+PY
+done
