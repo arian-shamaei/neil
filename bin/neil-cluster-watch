@@ -1,206 +1,80 @@
-#!/usr/bin/env python3
-"""neil-cluster-watch — live view of peer-to-peer messaging.
+#!/bin/bash
+# neil-cluster-watch — merged live stream of prompt activity across main
+# Neil and every ready peer. Each source gets a [tag] prefix; lines
+# interleave in real time. Ctrl+C to stop.
+#
+# Sources:
+#   [main]      sealserver autoprompt daemon (CALL/BASH/READ/WRITE/INTEND/DONE/etc.)
+#   [<peer>]    each ready peer's autoprompt daemon (same line types)
+#   [activity]  ~/.neil/state/cluster_activity.jsonl (peer_send/peer_transfer)
+#
+# Usage:
+#   neil-cluster-watch            # live stream, interesting lines only
+#   neil-cluster-watch --all      # do not filter; everything
+#   neil-cluster-watch --help
 
-Tails ~/.neil/state/cluster_activity.jsonl and shows:
-  - live stream of peer_send events as they happen (sender → peer, bytes, ssh_rc)
-  - rolling stats: per-pair message count + mean interval + last-seen
-  - relationship graph: directional edges between instances
+set -u
+NEIL_HOME=${NEIL_HOME:-$HOME/.neil}
+PEERS_JSON=$NEIL_HOME/state/peers.json
+ACTIVITY=$NEIL_HOME/state/cluster_activity.jsonl
 
-Usage:
-    neil-cluster-watch              # live tail, Ctrl+C to exit
-    neil-cluster-watch --stats      # one-shot: print current stats + exit
-    neil-cluster-watch --since 10m  # stream events from last 10 min + continue tailing
+FILT='\[autoprompt\] (CALL|BASH|READ|WRITE|INTEND|DONE|MEMORY|executing|done):|intention handoff|peer_send|peer_transfer|\[peer='
+SHOW_ALL=0
+for arg in "$@"; do
+    case "$arg" in
+        --help|-h) sed -n '2,16p' "$0" | sed 's|^# \?||'; exit 0 ;;
+        --all)     SHOW_ALL=1 ;;
+    esac
+done
+[ "$SHOW_ALL" = 1 ] && FILT='.*'
 
-No external deps — stdlib only.
-"""
-import argparse
+PIDS=""
+cleanup() { kill $PIDS 2>/dev/null || true; wait 2>/dev/null; exit 0; }
+trap cleanup INT TERM
+
+tag_prefix() { printf '[%-12s] ' "$1"; }
+
+# [main] tailer
+(
+    sudo journalctl -u autoprompt.service -f -n 0 --output=cat 2>/dev/null         | grep --line-buffered -E "$FILT"         | awk -v t="main" '{ printf "[%-12s] %s\n", t, $0; fflush(); }'
+) & PIDS="$PIDS $!"
+
+# [<peer>] tailers
+if [ -f "$PEERS_JSON" ]; then
+    while IFS= read -r peer; do
+        [ -z "$peer" ] && continue
+        (
+            /snap/bin/lxc exec "$peer" -- journalctl -u neil-autoprompt.service -f -n 0 --output=cat 2>/dev/null                 | grep --line-buffered -E "$FILT"                 | awk -v t="$peer" '{ printf "[%-12s] %s\n", t, $0; fflush(); }'
+        ) & PIDS="$PIDS $!"
+    done < <(python3 -c "
 import json
-import os
-import pathlib
-import re
-import sys
-import time
-from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+try: d = json.load(open('$PEERS_JSON'))
+except Exception: exit(0)
+for k, v in d.items():
+    if v.get('status') == 'ready': print(k)
+")
+fi
 
-NEIL_HOME = pathlib.Path(os.environ.get("NEIL_HOME", os.path.expanduser("~/.neil")))
-LOG = NEIL_HOME / "state" / "cluster_activity.jsonl"
-
-C = {
-    "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m",
-    "green": "\033[32m", "red": "\033[31m", "yellow": "\033[33m",
-    "blue": "\033[34m", "cyan": "\033[36m", "magenta": "\033[35m",
-}
-
-
-def parse_ts(s):
-    """Parse one of: ISO8601 Z, `YYYY-MM-DDThh-mm-ss` (hyphenated), or fall back."""
-    if not s:
-        return None
+# [activity] tailer with JSON → summary extraction
+(
+    tail -F "$ACTIVITY" 2>/dev/null         | python3 -u -c "
+import sys, json
+for line in sys.stdin:
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except ValueError:
-        pass
-    m = re.match(r"(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})", s)
-    if m:
-        return datetime.fromisoformat(f"{m.group(1)}T{m.group(2)}:{m.group(3)}:{m.group(4)}+00:00")
-    return None
+        d = json.loads(line)
+    except Exception:
+        continue
+    ts    = d.get('ts', '')
+    evt   = d.get('event', '')
+    peer  = d.get('peer', '')
+    extras = []
+    for k in ('bytes', 'ssh_rc', 'rc', 'waited_sec', 'subject'):
+        if k in d: extras.append(f'{k}={d[k]}')
+    rh = d.get('reply_head') or d.get('ready_head') or ''
+    if rh: extras.append('head=' + repr(rh[:80]))
+    sys.stdout.write(f\"[activity    ] {ts} {evt} peer={peer} {' '.join(extras)}\n\")
+    sys.stdout.flush()
+"
+) & PIDS="$PIDS $!"
 
-
-def format_event(e):
-    """One-line colored summary of a cluster-activity event."""
-    ts = (e.get("ts") or "?")[:19]
-    ev = e.get("event", "?")
-    sender = e.get("sender", e.get("parent", "?"))
-    peer = e.get("peer", e.get("id", "?"))
-    if ev == "peer_send_sent":
-        return f"{C['dim']}{ts}{C['reset']}  {C['cyan']}{sender:>16}{C['reset']} {C['bold']}→{C['reset']} {C['magenta']}{peer:<16}{C['reset']}  {C['yellow']}send{C['reset']}  {e.get('bytes', 0)}b"
-    if ev == "peer_send_complete":
-        rc = e.get("ssh_rc", 0)
-        ok = C["green"] + "ok" + C["reset"] if rc == 0 else C["red"] + f"rc={rc}" + C["reset"]
-        rh = (e.get("reply_head") or "")[:60].replace("\n", " ")
-        return f"{C['dim']}{ts}{C['reset']}  {C['cyan']}{sender:>16}{C['reset']} {C['bold']}←{C['reset']} {C['magenta']}{peer:<16}{C['reset']}  {ok}  {C['dim']}reply={e.get('reply_chars', 0)}c{C['reset']}  {rh}"
-    if ev == "peer_send_fail":
-        return f"{C['dim']}{ts}{C['reset']}  {C['cyan']}{sender:>16}{C['reset']} {C['bold']}✗{C['reset']} {C['magenta']}{peer:<16}{C['reset']}  {C['red']}FAIL{C['reset']}  rc={e.get('ssh_rc', '?')}"
-    if ev == "peer_kickoff_complete":
-        return f"{C['dim']}{ts}{C['reset']}  {C['bold']}[spawn kickoff]{C['reset']}  {C['magenta']}{peer:<16}{C['reset']}  {C['green']}ok{C['reset']}  reply={e.get('reply_chars', 0)}c"
-    if ev == "spawn":
-        return f"{C['dim']}{ts}{C['reset']}  {C['bold']}[spawn]{C['reset']}  {C['magenta']}{peer:<16}{C['reset']}  {e.get('detail','')[:60]}"
-    if ev == "complete":
-        return f"{C['dim']}{ts}{C['reset']}  {C['bold']}[complete]{C['reset']}  {C['magenta']}{peer:<16}{C['reset']}  {e.get('detail','')[:60]}"
-    return f"{C['dim']}{ts}{C['reset']}  {ev:<22}  {peer}"
-
-
-def compute_stats(events):
-    """Given a list of events, compute per-pair cadence."""
-    pair_events = defaultdict(list)
-    for e in events:
-        if e.get("event", "").startswith("peer_send"):
-            sender = e.get("sender", "?")
-            peer = e.get("peer", "?")
-            ts = parse_ts(e.get("ts", ""))
-            if ts:
-                pair_events[(sender, peer)].append((ts, e))
-    out = []
-    for (a, b), evs in sorted(pair_events.items()):
-        sent = sum(1 for _, e in evs if e["event"] == "peer_send_sent")
-        ok = sum(1 for _, e in evs if e["event"] == "peer_send_complete" and e.get("ssh_rc") == 0)
-        fail = sum(1 for _, e in evs if e["event"] == "peer_send_fail")
-        ts_sorted = sorted(t for t, _ in evs)
-        if len(ts_sorted) >= 2:
-            intervals = [(ts_sorted[i+1] - ts_sorted[i]).total_seconds() for i in range(len(ts_sorted)-1)]
-            mean_int = sum(intervals) / len(intervals)
-        else:
-            mean_int = None
-        last_seen = ts_sorted[-1] if ts_sorted else None
-        out.append({
-            "from": a, "to": b, "sent": sent, "ok": ok, "fail": fail,
-            "mean_interval_s": mean_int, "last_seen": last_seen,
-        })
-    return out
-
-
-def print_stats(events):
-    """Print per-pair stats table + relationship graph."""
-    stats = compute_stats(events)
-    if not stats:
-        print(f"{C['dim']}(no peer_send activity yet){C['reset']}")
-        return
-    print(f"{C['bold']}Pair cadence:{C['reset']}")
-    print(f"  {'FROM':>16} → {'TO':<16}  {'sent':>6}  {'ok':>4}  {'fail':>4}  {'mean Δs':>9}  last-seen")
-    print(f"  {'-'*16}   {'-'*16}  {'-'*6}  {'-'*4}  {'-'*4}  {'-'*9}  {'-'*22}")
-    now = datetime.now(timezone.utc)
-    for s in stats:
-        mi = f"{s['mean_interval_s']:.1f}" if s["mean_interval_s"] else "—"
-        ls = s["last_seen"]
-        ago = f"{(now - ls).total_seconds():.0f}s ago" if ls else "—"
-        color = C["green"] if s["fail"] == 0 else C["yellow"] if s["ok"] > s["fail"] else C["red"]
-        print(f"  {C['cyan']}{s['from']:>16}{C['reset']} → {C['magenta']}{s['to']:<16}{C['reset']}  {color}{s['sent']:>6}{C['reset']}  {s['ok']:>4}  {s['fail']:>4}  {mi:>9}  {ls.isoformat(timespec='seconds') if ls else '—'} ({ago})")
-    print()
-    print(f"{C['bold']}Relationship graph:{C['reset']}")
-    peers = sorted({s["from"] for s in stats} | {s["to"] for s in stats})
-    for p in peers:
-        outs = [s for s in stats if s["from"] == p]
-        for o in outs:
-            bar = "━" * min(o["sent"], 30)
-            print(f"  {C['cyan']}{p:>16}{C['reset']}  {bar} {o['sent']}→  {C['magenta']}{o['to']}{C['reset']}")
-
-
-def read_all(path):
-    events = []
-    if not path.exists():
-        return events
-    with path.open() as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return events
-
-
-def since_filter(events, since_spec):
-    """Filter events to last N minutes/hours."""
-    m = re.match(r"(\d+)([smhd])", since_spec)
-    if not m:
-        return events
-    n, unit = int(m.group(1)), m.group(2)
-    seconds = n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=seconds)
-    return [e for e in events if (t := parse_ts(e.get("ts", ""))) and t >= cutoff]
-
-
-def tail(path, since=None):
-    events = read_all(path)
-    if since:
-        events = since_filter(events, since)
-    for e in events:
-        print(format_event(e))
-    print(f"{C['dim']}─── tailing new events (Ctrl+C to exit) ───{C['reset']}")
-    if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch()
-    with path.open() as f:
-        f.seek(0, 2)
-        while True:
-            line = f.readline()
-            if not line:
-                time.sleep(0.5)
-                continue
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                e = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            print(format_event(e))
-
-
-def main():
-    ap = argparse.ArgumentParser(description="neil-cluster-watch — live peer-to-peer message monitor")
-    ap.add_argument("--stats", action="store_true", help="print stats table + exit")
-    ap.add_argument("--since", default=None, help="show history from last N (s|m|h|d), e.g. --since 10m")
-    args = ap.parse_args()
-
-    if not LOG.exists():
-        print(f"{C['yellow']}note:{C['reset']} {LOG} does not exist yet — will be created when first event logs")
-
-    if args.stats:
-        events = read_all(LOG)
-        if args.since:
-            events = since_filter(events, args.since)
-        print_stats(events)
-        return
-
-    try:
-        tail(LOG, since=args.since)
-    except KeyboardInterrupt:
-        print()
-
-
-if __name__ == "__main__":
-    main()
+wait
