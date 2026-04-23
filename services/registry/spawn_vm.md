@@ -90,3 +90,12 @@ CALL: service=spawn_vm action=create name=humanizer-a persona=implementer memory
 ```
 
 Note the single `initial_intention="..."` containing the full role brief. Do NOT split this into multiple params like `role=implementer spec=SPEC.md phase=1.1` — those param names are not recognized.
+
+## Additional declared params (substrate-consumed)
+
+These params ARE consumed by `tools/spawn_vm/spawn_vm.sh` but were not declared above. Listing them here lets `handler.sh validate_params` see them as valid key tokens and prevents false-positive unknown-param FAILs in `outputs/neil.log`.
+
+- `archetype=worker` — behavioral archetype for the peer. Consumed at `spawn_vm.sh:187` and branched at `spawn_vm.sh:687`. Valid: `worker`, `autonomous`, `relay`. Unknown values fall back to `worker`.
+- `transfer_paths=/path/a,/path/b` — comma- or space-separated parent-host paths to rsync into the peer at matching destinations. Consumed at `spawn_vm.sh:504` via `transfer_paths_to_peer()`. Paths missing on parent are skipped with a WARN log.
+
+Both params remain optional; omitting them retains the defaults above.
