@@ -75,6 +75,38 @@ static void log_internal_failure(const char *source, const char *severity, const
 static void set_seal_pose(const char *eyes, const char *mouth, const char *body, const char *indicator, const char *label);static void stream_write(const char *data, size_t len);static int run_claude(const char *prompt, const char *system_prompt, char **out, size_t *out_len);static void extract_memories(const char *output);
 static char *execute_tool_actions(const char *output);
 static unsigned long djb2_hash(const char *str, size_t len);
+
+/*
+ * sh_escape_sq — escape single quotes in a string so the result can be
+ * safely embedded inside single-quoted bash literals. Replaces every '
+ * with the classic close-escape-reopen sequence '\''.
+ *
+ * Needed when building NEIL_PARAMS='...' for handler.sh dispatch: if the
+ * agent emits a CALL whose message contains apostrophes (e.g. "isn't")
+ * or parens, bash parses the unescaped single-quote as the end of the
+ * literal, then the rest of the message becomes shell code — causing
+ * "Syntax error: '(' unexpected" when parens appear after an apostrophe.
+ *
+ * Returns a newly-malloc'd string; caller must free.
+ */
+static char *sh_escape_sq(const char *in) {
+    if (!in) return strdup("");
+    size_t n = strlen(in);
+    /* Worst case: every byte is a quote → each expands to 4 bytes. */
+    char *out = malloc(n * 4 + 1);
+    if (!out) return NULL;
+    char *q = out;
+    for (const char *p = in; *p; p++) {
+        if (*p == '\'') {
+            *q++ = '\''; *q++ = '\\'; *q++ = '\''; *q++ = '\'';
+        } else {
+            *q++ = *p;
+        }
+    }
+    *q = '\0';
+    return out;
+}
+
 static int dedup_check(unsigned long hash);
 static void dedup_record(unsigned long hash, const char *filename);
 
@@ -1848,12 +1880,24 @@ static char *execute_service_calls(const char *output) {
         while (cred_len > 0 && (cred[cred_len-1] == '\n' || cred[cred_len-1] == '\r'))
             cred[--cred_len] = '\0';
 
-        /* Dispatch to service handler via shell script */
+        /* Dispatch to service handler via shell script.
+         * Escape single quotes in every interpolated value so apostrophes
+         * in agent-emitted CALL messages don't close the single-quoted
+         * bash literals and expose parens/text to shell parsing.  */
+        char *_esc_svc  = sh_escape_sq(service);
+        char *_esc_act  = sh_escape_sq(action);
+        char *_esc_cred = sh_escape_sq(cred);
+        char *_esc_pars = sh_escape_sq(params);
         char handler_cmd[32768];   /* was 8192; room for bumped params */
         snprintf(handler_cmd, sizeof(handler_cmd),
             "NEIL_SERVICE='%s' NEIL_ACTION='%s' NEIL_CRED='%s' NEIL_PARAMS='%s' "
             "%s/services/handler.sh 2>&1",
-            service, action, cred, params, g_neil_home);
+            _esc_svc ? _esc_svc : service,
+            _esc_act ? _esc_act : action,
+            _esc_cred ? _esc_cred : cred,
+            _esc_pars ? _esc_pars : params,
+            g_neil_home);
+        free(_esc_svc); free(_esc_act); free(_esc_cred); free(_esc_pars);
 
         fprintf(stderr, "[autoprompt] CALL: service=%s action=%s\n", service, action);
         char *call_result = run_command(handler_cmd);

@@ -1,0 +1,5 @@
+$ grep -n 'node_id' /home/seal/.neil/config.toml && echo "---" && python3 -c "import tomllib; c=tomllib.load(open('/home/seal/.neil/config.toml','rb')); print('node_id=',repr(c['os']['node_id']),' enabled=',c['os']['neil_os_enabled'])"
+70:# node_id: currently dead config (zero live readers in .sh/.py/.c/.rs as of 2026-04-24).
+76:node_id = "sealserver"
+---
+node_id= 'sealserver'  enabled= True
