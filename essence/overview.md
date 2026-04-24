@@ -17,7 +17,7 @@
 Orchestrator. C daemon using Linux inotify to watch queue/ for .md files.
 Loads essence as system prompt. Runs observe.sh for live state. Searches
 mempalace for relevant memories. Invokes claude --print. Parses output
-via ReAct loop (max 3 turns): MEMORY/CALL/PROMPT/HEARTBEAT lines.
+via ReAct loop (max 10 turns): MEMORY/CALL/PROMPT/HEARTBEAT lines.
 systemd managed, auto-restart, crash recovery.
 
 ### zettel (~/.neil/memory/zettel/)
@@ -52,7 +52,7 @@ HTTP webhooks, scheduled tasks. Each watcher is decoupled from Claude.
                     search mempalace (relevant memories)
                     load heartbeat_log.json (recent activity)
                            │
-                    claude --print (ReAct loop, max 3 turns)
+                    claude --print (ReAct loop, max 10 turns)
                            │
                     parse output:
                       MEMORY: → zettel new → mempalace mine
