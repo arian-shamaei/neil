@@ -1,0 +1,47 @@
+#!/bin/bash
+# neil-auth-refresh — periodic forced refresh of Claude OAuth access token.
+#
+# The Claude SDK auto-refreshes its access token whenever it makes a
+# successful API call, so as long as SOMETHING runs an agent invocation
+# before the access token's ~1h TTL elapses, the refresh-token chain
+# stays alive indefinitely. neil-creds-sync then propagates the refreshed
+# token to every peer.
+#
+# This script just fires a minimal-cost agent invocation (1 turn, tiny
+# prompt) every ~30 minutes via cron. If main is otherwise idle for
+# hours, this keeps the cluster authenticated without any other beats.
+#
+# If this script ever returns rc!=0 with an authentication_error in the
+# captured output, the refresh token itself is expired — that requires a
+# human to run an interactive 'claude login' on the server.
+set -u
+NEIL_HOME=${NEIL_HOME:-$HOME/.neil}
+LOG=$NEIL_HOME/logs/auth_refresh.log
+CREDS=$HOME/.claude/.credentials.json
+mkdir -p $NEIL_HOME/logs
+
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+log() { printf '[%s] %s\n' "$(ts)" "$*" >> "$LOG"; }
+
+[ -f "$CREDS" ] || { log 'no credentials file; skip'; exit 0; }
+
+PRE_MTIME=$(stat -c '%Y' "$CREDS" 2>/dev/null || echo 0)
+
+# Minimal cost: 1 turn, no tools used, agent just echoes back.
+OUT=$(NEIL_HOME=$NEIL_HOME NEIL_MAX_TURNS=1 timeout 30     $NEIL_HOME/tools/autoPrompter/agent/.venv/bin/python     $NEIL_HOME/tools/autoPrompter/agent/neil_agent.py     --system-prompt 'Respond with exactly: ok'     -p 'ping' 2>&1)
+RC=$?
+
+POST_MTIME=$(stat -c '%Y' "$CREDS" 2>/dev/null || echo 0)
+DELTA=$((POST_MTIME - PRE_MTIME))
+
+if echo "$OUT" | grep -q 'authentication_error\|401'; then
+    log "FAIL auth (rc=$RC) — refresh token may be expired; needs interactive 'claude' login"
+    exit 1
+fi
+
+if [ "$DELTA" -gt 0 ]; then
+    log "refresh wrote new token (rc=$RC, mtime+$DELTA s)"
+else
+    log "ping ok, token unchanged (rc=$RC, still within TTL)"
+fi
+exit $RC

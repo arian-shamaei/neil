@@ -239,6 +239,55 @@ case "$NEIL_SERVICE" in
         esac
         ;;
 
+    # --- service: gstack ---
+    # Bridge to gstack skill prompts (see services/registry/gstack.md).
+    # action = skill name (e.g. retro, plan-eng-review)
+    # params: context="<text passed as user prompt>"
+    gstack)
+        SKILL=$NEIL_ACTION
+        CONTEXT="${PARAM_context:-}"
+        SKILL_FILE="$HOME/.neil/skills/gstack/$SKILL/SKILL.md"
+        if [ ! -f "$SKILL_FILE" ]; then
+            echo "{\"service\":\"gstack\",\"error\":\"skill '$SKILL' not installed at $SKILL_FILE\"}" >&2
+            exit 1
+        fi
+        if [ -z "$CONTEXT" ]; then
+            echo "{\"service\":\"gstack\",\"error\":\"missing context param\"}" >&2
+            exit 1
+        fi
+        # Run neil_agent.py with the gstack skill as system prompt and
+        # caller's context as user prompt. Capture output verbatim.
+        SYS=$(cat "$SKILL_FILE")
+        OUT=$(NEIL_HOME="$HOME/.neil" NEIL_MAX_TURNS=15 \
+            "$HOME/.neil/tools/autoPrompter/agent/.venv/bin/python" \
+            "$HOME/.neil/tools/autoPrompter/agent/neil_agent.py" \
+            --system-prompt "$SYS" -p "$CONTEXT" 2>&1)
+        AGENT_RC=$?
+        # Log invocation
+        python3 - "$HOME/.neil/state/cluster_activity.jsonl" "$SKILL" "$AGENT_RC" "$OUT" <<'LOG'
+import json, pathlib, sys, datetime
+p, skill, rc, out = sys.argv[1:5]
+pp = pathlib.Path(p); pp.parent.mkdir(parents=True, exist_ok=True)
+with pp.open("a") as f:
+    f.write(json.dumps({
+        "ts":          datetime.datetime.utcnow().isoformat(timespec="seconds")+"Z",
+        "event":       "gstack_invoke" if rc == "0" else "gstack_invoke_fail",
+        "skill":       skill,
+        "agent_rc":    int(rc),
+        "out_chars":   len(out),
+        "out_head":    out[:300],
+    }) + "\n")
+LOG
+        if [ $AGENT_RC -ne 0 ]; then
+            echo "{\"service\":\"gstack\",\"skill\":\"$SKILL\",\"error\":\"agent rc=$AGENT_RC\"}" >&2
+            printf '%s\n' "$OUT" >&2
+            exit 1
+        fi
+        echo "{\"service\":\"gstack\",\"skill\":\"$SKILL\",\"out_chars\":$(printf '%s' "$OUT" | wc -c)}"
+        # Emit the skill's output so Neil can continue reasoning on it
+        printf '\n=== gstack/%s output ===\n%s\n' "$SKILL" "$OUT"
+        ;;
+
     # --- plugin: web-search ---
     web-search)
         MAX="${PARAM_max:-5}"
