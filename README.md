@@ -4,6 +4,8 @@
 
 Thinks. Remembers. Acts. Learns from mistakes. Expresses itself. **Spawns copies of itself when work benefits from parallelism.** All from a single portable directory.
 
+> **April 2026 — Neil now reviews its own commits.** Every 30 minutes, Neil spawns a peer copy of itself, hands it the latest commits, and files every finding back as a fulfillment-contract `INTEND:`. Two role-conditioned peers (`eng-mgr` and `cso`) independently rejected the same dangerous webhook proposal with characteristically distinct reasoning. Real transcripts: **[`docs/SHOWCASE.md`](docs/SHOWCASE.md)**.
+
 ```
  NEIL  12:57 | Tab:panels Ctrl+S:sidebar Esc:quit               ┌──────────────────────────┐
                                                                 │ NEIL        beats: 10/50 │
