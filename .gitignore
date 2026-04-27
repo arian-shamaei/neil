@@ -10,6 +10,7 @@ tools/autoPrompter/active/
 memory/zettel/zettel
 memory/zettel/index/
 memory/zettel/notes/
+blueprint/target/
 
 # Runtime state (ephemeral)
 tools/autoPrompter/queue/
