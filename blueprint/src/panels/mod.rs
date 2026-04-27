@@ -6,3 +6,4 @@ pub mod system;
 pub mod status;
 pub mod seal;
 pub mod services;
+pub mod graph;

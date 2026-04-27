@@ -131,6 +131,7 @@ const PANEL_NAMES: &[(&str, &str)] = &[
     ("Failures", "Unresolved errors and lessons"),
     ("Logs", "Raw history browser"),
     ("Cluster", "Live Neil instances and their connections"),
+    ("Graph", "Force-directed topology of every note in the palace"),
 ];
 
 struct FpsTracker {
@@ -164,6 +165,10 @@ fn main() -> anyhow::Result<()> {
     // Start async cluster refresher (populates CLUSTER_CACHE every 2s off
     // the render thread). Cluster panel reads non-blocking from the cache.
     spawn_cluster_refresher(neil_home.clone());
+
+    // Same pattern for the Graph panel: re-runs `zettel list --json` every
+    // 30s into a shared cache. Render thread steps physics each frame.
+    panels::graph::spawn_graph_refresher(neil_home.clone());
 
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1259,7 +1264,7 @@ fn render_stream_cached(
         Span::styled(" NEIL ", Style::default().fg(Color::Black).bg(Color::Cyan)),
         status_span,
         Span::styled(format!("{} ", time_str), Style::default().fg(Color::DarkGray)),
-        Span::styled("Alt+1-8:panels Ctrl+S:sidebar Esc:quit ", Style::default().fg(Color::Rgb(60, 60, 60))),
+        Span::styled("Alt+1-9:panels Ctrl+S:sidebar Esc:quit ", Style::default().fg(Color::Rgb(60, 60, 60))),
     ]);
     frame.render_widget(Paragraph::new(header), chunks[0]);
 
@@ -1564,8 +1569,13 @@ fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: 
         format!(" {} | Up/Down:select Enter:expand Esc:close ", name)
     } else if idx == 7 {
         format!(" {} | Up/Down:select Enter:open Esc:close ", name)
+    } else if idx == 8 {
+        format!(" {} | {} notes · {} edges | Esc:close 1-9:switch ",
+                name,
+                crate::panels::graph::node_count(),
+                crate::panels::graph::edge_count())
     } else {
-        format!(" {} | Esc:close 1-8:switch ", name)
+        format!(" {} | Esc:close 1-9:switch ", name)
     };
     let block = Block::default().borders(Borders::ALL).title(title).border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
@@ -1580,6 +1590,7 @@ fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: 
         5 => render_failures_panel(state),
         6 => render_logs_panel(),
         7 => render_cluster_panel_selectable(state, cluster_sel),
+        8 => crate::panels::graph::render_lines(inner.width, inner.height),
         _ => vec![Line::from("Unknown panel")],
     };
     frame.render_widget(Paragraph::new(lines), inner);

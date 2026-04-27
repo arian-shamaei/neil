@@ -656,16 +656,57 @@ static int cmd_graph(int argc, char **argv) {
     return 0;
 }
 
+/* Escape a string for JSON output: standard escapes for ASCII, validate
+ * UTF-8 multi-byte sequences and emit � for malformed ones (note
+ * bodies can contain mojibake from arbitrary clipboard input). Streams
+ * straight to FILE* so we don't have to build a buffer. */
+static void json_escape(FILE *f, const char *s) {
+    if (!s) return;
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        unsigned char c = *p;
+        if (c == '"')  { fputs("\\\"", f); p++; continue; }
+        if (c == '\\') { fputs("\\\\", f); p++; continue; }
+        if (c == '\n') { fputs("\\n",  f); p++; continue; }
+        if (c == '\r') { fputs("\\r",  f); p++; continue; }
+        if (c == '\t') { fputs("\\t",  f); p++; continue; }
+        if (c < 0x20)  { fprintf(f, "\\u%04x", c); p++; continue; }
+        if (c < 0x80)  { fputc(c, f); p++; continue; }
+
+        /* Multi-byte UTF-8 — validate length + continuation bytes. */
+        int n_bytes;
+        if      ((c & 0xE0) == 0xC0) n_bytes = 2;
+        else if ((c & 0xF0) == 0xE0) n_bytes = 3;
+        else if ((c & 0xF8) == 0xF0) n_bytes = 4;
+        else { fputs("\\ufffd", f); p++; continue; }
+
+        int valid = 1;
+        for (int k = 1; k < n_bytes; k++) {
+            if (p[k] == '\0' || (p[k] & 0xC0) != 0x80) { valid = 0; break; }
+        }
+        if (!valid) { fputs("\\ufffd", f); p++; continue; }
+
+        for (int k = 0; k < n_bytes; k++) fputc(p[k], f);
+        p += n_bytes;
+    }
+}
+
 static int cmd_list(int argc, char **argv) {
     const char *wing_filter = NULL;
+    int as_json = 0;
 
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--wing") == 0 && i + 1 < argc)
             wing_filter = argv[++i];
+        else if (strcmp(argv[i], "--json") == 0)
+            as_json = 1;
     }
 
     DIR *d = opendir(g_notes);
-    if (!d) return 1;
+    if (!d) {
+        if (as_json) printf("{\"notes\":[]}\n");
+        return 1;
+    }
 
     char ids[4096][MAX_ID];
     int count = 0;
@@ -688,6 +729,47 @@ static int cmd_list(int argc, char **argv) {
                 memcpy(ids[i], ids[j], MAX_ID);
                 memcpy(ids[j], tmp, MAX_ID);
             }
+
+    if (as_json) {
+        printf("{\"notes\":[");
+        int emitted = 0;
+        for (int i = 0; i < count; i++) {
+            if (wing_filter && !note_in_scope(ids[i], wing_filter, NULL))
+                continue;
+
+            Note n;
+            if (load_note(ids[i], &n) < 0) continue;
+
+            char preview[120] = "";
+            if (n.body) {
+                snprintf(preview, sizeof(preview), "%s", n.body);
+                char *nl = strchr(preview, '\n');
+                if (nl) *nl = '\0';
+            }
+
+            if (emitted) fputc(',', stdout);
+            emitted++;
+
+            fputs("{\"id\":\"", stdout);          json_escape(stdout, n.id);
+            fputs("\",\"wing\":\"", stdout);      json_escape(stdout, n.wing);
+            fputs("\",\"room\":\"", stdout);      json_escape(stdout, n.room);
+            fputs("\",\"preview\":\"", stdout);   json_escape(stdout, preview);
+            fputs("\",\"tags\":[", stdout);
+            for (int t = 0; t < n.ntags; t++) {
+                if (t) fputc(',', stdout);
+                fputc('"', stdout); json_escape(stdout, n.tags[t]); fputc('"', stdout);
+            }
+            fputs("],\"links\":[", stdout);
+            for (int t = 0; t < n.nlinks; t++) {
+                if (t) fputc(',', stdout);
+                fputc('"', stdout); json_escape(stdout, n.links[t]); fputc('"', stdout);
+            }
+            fputs("]}", stdout);
+            free_note(&n);
+        }
+        printf("]}\n");
+        return 0;
+    }
 
     for (int i = 0; i < count; i++) {
         if (wing_filter && !note_in_scope(ids[i], wing_filter, NULL))
