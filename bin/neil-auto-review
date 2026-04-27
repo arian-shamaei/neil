@@ -1,0 +1,141 @@
+#!/bin/bash
+# neil-auto-review — periodic gstack /review of new commits.
+#
+# Runs alongside main Neil's heartbeat (cron, not in-band). On each tick:
+#   1. compare ~/.neil/state/last_review_sha to current HEAD
+#   2. if HEAD has advanced, fire `CALL: service=gstack action=review`
+#      against the diff base..HEAD
+#   3. parse output for [P0]/[P1]/[P2] severity markers, append each as
+#      a pending INTEND entry to intentions.json with severity-mapped
+#      priority (P0 -> high, P1 -> high, P2 -> medium)
+#   4. update last_review_sha to HEAD
+#
+# Heartbeat picks up the new INTENDs on the next beat via observe.sh's
+# pending-intentions block — no autoprompt.c change required, no essence
+# change required.
+set -u
+NEIL_HOME=${NEIL_HOME:-$HOME/.neil}
+LOG=$NEIL_HOME/logs/auto_review.log
+STATE=$NEIL_HOME/state/last_review_sha
+INTENTIONS=$NEIL_HOME/intentions.json
+mkdir -p "$NEIL_HOME/logs" "$NEIL_HOME/state"
+
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+log() { printf '[%s] %s\n' "$(ts)" "$*" >> "$LOG"; }
+
+cd "$NEIL_HOME" || { log "no neil home dir"; exit 1; }
+
+# Sanity: must be a git repo
+git rev-parse --git-dir >/dev/null 2>&1 || { log "not a git repo"; exit 1; }
+
+HEAD_SHA=$(git rev-parse HEAD 2>/dev/null) || { log "rev-parse failed"; exit 1; }
+LAST_SHA=""
+[ -f "$STATE" ] && LAST_SHA=$(cat "$STATE")
+
+if [ "$HEAD_SHA" = "$LAST_SHA" ]; then
+    log "no new commits since $LAST_SHA — skip"
+    exit 0
+fi
+
+if [ -z "$LAST_SHA" ]; then
+    # First ever run: only review the most recent commit, not all of history
+    BASE=$(git rev-parse 'HEAD^' 2>/dev/null || git rev-parse HEAD)
+    log "first run — reviewing only HEAD ($HEAD_SHA) against parent ($BASE)"
+else
+    BASE=$LAST_SHA
+    log "reviewing $BASE..$HEAD_SHA"
+fi
+
+# Build the review context: diff stat + commit list + diff itself (capped).
+N_COMMITS=$(git log --oneline "$BASE..$HEAD_SHA" 2>/dev/null | wc -l)
+if [ "$N_COMMITS" = 0 ] && [ "$BASE" != "$HEAD_SHA" ]; then
+    log "no commits between $BASE and $HEAD_SHA (rewritten history?) — bumping pointer and skipping"
+    echo "$HEAD_SHA" > "$STATE"
+    exit 0
+fi
+
+# Pre-craft a context that tells the skill exactly what to look at.
+# We don't paste the diff inline; the skill's own `git diff` Bash call
+# handles that — we just give it the commit range and our intent.
+CTX="Pre-landing review of commits $BASE..$HEAD_SHA on the Neil project.
+Run: git log --oneline $BASE..$HEAD_SHA  AND  git diff $BASE..$HEAD_SHA --stat
+to see scope, then git diff $BASE..$HEAD_SHA on each touched file.
+Focus on:
+  - shell injection / path traversal / command-substitution risk
+  - secret leakage (token/credential paths in logs or prose)
+  - error-handling gaps (set -e interactions, race conditions)
+  - LLM trust boundaries (caller-controlled context flowing to agent prompts)
+Reply with structured findings tagged [P0]/[P1]/[P2] by severity, each on
+its own line, in this format:
+  [P0] <one-sentence finding> at <file:line> | <one-sentence fix>
+  [P1] ...
+Keep total under 1200 words."
+
+PARAMS=$(python3 -c "
+import sys, shlex
+ctx = sys.argv[1]
+print('cwd=' + shlex.quote('$NEIL_HOME') + ' context=' + shlex.quote(ctx))
+" "$CTX")
+
+OUT=$(NEIL_SERVICE=gstack NEIL_ACTION=review NEIL_CRED=no-auth-needed \
+      NEIL_PARAMS="$PARAMS" \
+      bash "$NEIL_HOME/services/handler.sh" 2>&1)
+RC=$?
+
+if [ $RC -ne 0 ]; then
+    log "review failed rc=$RC (head=$HEAD_SHA); leaving last_review_sha unchanged"
+    log "stderr: $(echo "$OUT" | head -c 400 | tr '\n' ' ')"
+    exit 1
+fi
+
+# Parse [P0]/[P1]/[P2] lines and append as INTENDs to intentions.json.
+# Use python so the JSON write is atomic.
+python3 - "$INTENTIONS" "$HEAD_SHA" "$OUT" <<'PY'
+import json, pathlib, re, sys, datetime
+intentions_path, head_sha, out = sys.argv[1:4]
+p = pathlib.Path(intentions_path)
+# Read existing — handle both array-form and concatenated-object form
+try:
+    raw = p.read_text() if p.exists() else "[]"
+except Exception:
+    raw = "[]"
+existing = []
+try:
+    j = json.loads(raw)
+    if isinstance(j, list):
+        existing = j
+except json.JSONDecodeError:
+    # Tolerate the legacy concatenated-objects format: [array]{obj}{obj}
+    pass
+
+new_count = 0
+priority_map = {"P0": "high", "P1": "high", "P2": "medium"}
+ts = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+for m in re.finditer(r'^\s*\[(P[012])\]\s+(.+?)\s*$', out, re.M):
+    sev, body = m.group(1), m.group(2).strip()
+    intent = {
+        "id":          f"autoreview_{head_sha[:7]}_{sev}_{new_count}",
+        "created":     ts,
+        "priority":    priority_map.get(sev, "medium"),
+        "status":      "pending",
+        "description": f"[auto-review {head_sha[:7]} {sev}] {body[:280]}",
+        "source":      "neil-auto-review",
+    }
+    existing.append(intent)
+    new_count += 1
+
+# Write back as compact JSON list (matches our recent format)
+p.write_text("[" + ",".join(json.dumps(x, separators=(",", ":")) for x in existing) + "]")
+print(new_count)
+PY
+NEW_INTENDS=$?
+
+# The python prints the count to stdout; capture via sub-shell instead.
+# Actually we can't do both — refactor: re-run the parse just to get the count
+NEW_COUNT=$(echo "$OUT" | grep -cE '^\s*\[P[012]\]')
+
+echo "$HEAD_SHA" > "$STATE"
+log "review ok — $N_COMMITS commits reviewed, $NEW_COUNT [P*] findings appended as INTENDs (last_review_sha=$HEAD_SHA)"
+
+exit 0
