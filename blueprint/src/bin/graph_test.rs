@@ -126,7 +126,51 @@ fn main() {
         eprintln!("FAIL: no red-flashed cells found after zettel show");
         std::process::exit(5);
     }
-    let _ = last_lines; // suppress unused-mut warning
+
+    // ── Phase 5: trail mode ─────────────────────────────────────────────
+    // In flash mode (3s window), an access from 5s ago is invisible.
+    // In trail mode (60s window), the same access should still render
+    // somewhere in the orange-to-amber gradient (R high, G mid, B low).
+    println!("--- access trail: aging the flash, then toggling l ---");
+    // Wait long enough that the live 3s flash has decayed to invisible.
+    std::thread::sleep(Duration::from_millis(3500));
+
+    // Re-render in flash mode — should be no red cells now.
+    let flash_decayed = graph::render_lines(w, h);
+    let mut still_flashing = 0usize;
+    for line in &flash_decayed {
+        for span in &line.spans {
+            if let Some(ratatui::style::Color::Rgb(r, g, b)) = span.style.fg {
+                if r > 200 && g < 100 && b < 100 {
+                    still_flashing += span.content.chars().count();
+                }
+            }
+        }
+    }
+    println!("flash_mode_after_3.5s_decay = {} red cells (expect 0)", still_flashing);
+
+    // Toggle trail and render. The previously-flashed node should
+    // re-appear with a fade color (orange/amber: R 180-220, G 90-150).
+    let new = graph::toggle_trail();
+    println!("trail_enabled now = {}", new);
+    let trail_view = graph::render_lines(w, h);
+    let mut trail_cells = 0usize;
+    for line in &trail_view {
+        for span in &line.spans {
+            if let Some(ratatui::style::Color::Rgb(r, g, b)) = span.style.fg {
+                // Mid-trail color: warm but not bright red.
+                if r > 180 && r <= 230 && g >= 80 && g <= 160 && b < 130 {
+                    trail_cells += span.content.chars().count();
+                }
+            }
+        }
+    }
+    println!("trail_mode_warm_cells = {} (expect ≥1)", trail_cells);
+    if trail_cells == 0 {
+        eprintln!("FAIL: trail mode shows no warm-colored aged accesses");
+        std::process::exit(6);
+    }
+    let _ = last_lines;
 
     // Sanity: line count == panel height.
     if last_lines.len() != h as usize {

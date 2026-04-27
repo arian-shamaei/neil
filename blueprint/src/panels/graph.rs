@@ -88,12 +88,25 @@ static GRAPH_CACHE: OnceLock<Arc<Mutex<(u64, Option<String>)>>> = OnceLock::new(
 /// flashes; deleted notes leave dead entries that decay naturally).
 static ACCESS_TIMES: OnceLock<Arc<Mutex<HashMap<String, Instant>>>> = OnceLock::new();
 
-/// Decay window after a `zettel show`/`new`/`link` event. The node
-/// renders red at access, lerps back to its wing color over this many
-/// seconds. 3.0 s is long enough to catch the eye on any reasonable
-/// glance interval; longer would muddy "what is Neil thinking about
-/// RIGHT NOW" with stale signals.
+/// Decay window after a `zettel show`/`new`/`link` event in flash mode.
+/// The node renders red at access, lerps back to its wing color over
+/// this many seconds. 3.0 s is long enough to catch the eye on any
+/// reasonable glance interval; longer would muddy "what is Neil
+/// thinking about RIGHT NOW" with stale signals.
 const FLASH_DURATION_S: f32 = 3.0;
+
+/// Decay window in trail mode (`l` toggle). The node stays visible
+/// across the whole window with a smooth color gradient: bright red at
+/// access, through orange and amber, fading to wing color at the
+/// horizon. Lets you see the *path* of Neil's recent thinking — which
+/// notes were touched and in what order — not just the most-recent
+/// flash. 60 s ≈ a single Neil beat's worth of attention.
+const TRAIL_DURATION_S: f32 = 60.0;
+
+/// Toggle: when true, accesses leave a 60-second fade trail; when
+/// false (default), only the live 3-second flash. Atomic so it can be
+/// flipped from the key handler without acquiring the GraphState mutex.
+static TRAIL_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn graph_state() -> &'static Arc<Mutex<GraphState>> {
     GRAPH_STATE.get_or_init(|| Arc::new(Mutex::new(GraphState::default())))
@@ -578,6 +591,50 @@ pub fn toggle_anchors() -> f32 {
     0.0
 }
 
+/// Whether the 60-second access trail overlay is on.
+pub fn trail_enabled() -> bool {
+    TRAIL_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Toggle the access trail overlay. When ON, every access leaves a
+/// 60-second fade behind it (color gradient from bright red at the
+/// access moment through orange/amber to the node's wing color at the
+/// horizon). Returns the new state.
+pub fn toggle_trail() -> bool {
+    let new_state = !trail_enabled();
+    TRAIL_ENABLED.store(new_state, std::sync::atomic::Ordering::Relaxed);
+    new_state
+}
+
+/// Piecewise-linear color gradient over elapsed time since access.
+/// Stops chosen so flash mode (3 s window) shows only the bright-red
+/// segment, while trail mode (60 s window) walks through red → orange →
+/// amber → faded. Returns (r, g, b).
+fn flash_color(elapsed_s: f32) -> (u8, u8, u8) {
+    // (t_seconds, r, g, b)
+    const STOPS: &[(f32, f32, f32, f32)] = &[
+        ( 0.0, 255.0,  60.0,  60.0),  // bright red — just accessed
+        ( 3.0, 220.0,  90.0,  90.0),  // end of flash, still distinctly red
+        (10.0, 210.0, 130.0,  70.0),  // red-orange
+        (25.0, 180.0, 150.0,  90.0),  // amber
+        (60.0, 140.0, 140.0, 110.0),  // faded — close to wing color
+    ];
+    for w in STOPS.windows(2) {
+        if elapsed_s <= w[1].0 {
+            let (t0, r0, g0, b0) = w[0];
+            let (t1, r1, g1, b1) = w[1];
+            let phase = ((elapsed_s - t0) / (t1 - t0)).clamp(0.0, 1.0);
+            return (
+                (r0 + (r1 - r0) * phase) as u8,
+                (g0 + (g1 - g0) * phase) as u8,
+                (b0 + (b1 - b0) * phase) as u8,
+            );
+        }
+    }
+    // Past the last stop — caller should have already filtered by window.
+    (140, 140, 110)
+}
+
 /// Re-randomize all node positions from a fresh seed. Useful when
 /// physics gets stuck in a poor local minimum — the global structure
 /// (cluster count, modularity) is determined by the edge weights, but
@@ -700,18 +757,36 @@ pub fn render_lines(area_w: u16, area_h: u16) -> Vec<Line<'static>> {
         Err(_) => HashMap::new(),
     };
 
+    // Active visibility window — flash mode shows the most recent 3s,
+    // trail mode shows 60s with a fade gradient.
+    let trail = trail_enabled();
+    let window = if trail { TRAIL_DURATION_S } else { FLASH_DURATION_S };
+
     // Render lower-degree first so hubs paint on top. Then within each
-    // wing-color layer, currently-flashing nodes paint last so they
-    // visually pop above stationary neighbors.
+    // wing-color layer, accessed nodes paint last so they visually pop
+    // above stationary neighbors. Within accessed, fresher accesses
+    // paint over older ones (so a recently-touched node always wins
+    // its cell).
     let mut order: Vec<usize> = (0..state.nodes.len()).collect();
     order.sort_by_key(|&i| {
         let nd = &state.nodes[i];
-        // Two-key sort: (flash_priority, degree). Flashing nodes get
-        // higher rank so they paint after — and over — non-flashing.
-        let flashing = access_snap.get(&nd.id)
-            .map(|t| now.duration_since(*t).as_secs_f32() < FLASH_DURATION_S)
-            .unwrap_or(false);
-        (flashing as u8, nd.degree)
+        // Sort tuple (in ascending paint order):
+        //   (-1 - elapsed_int) negated so older = lower priority
+        // For non-accessed: priority = (0, degree).
+        // For accessed: priority = (1, neg_elapsed_int, degree).
+        // We use a single i64 so the sort is total.
+        let access_priority: i64 = match access_snap.get(&nd.id) {
+            Some(t) => {
+                let elapsed = now.duration_since(*t).as_secs_f32();
+                if elapsed < window {
+                    // Range: 1_000_000 (just-accessed) .. 0 (window edge).
+                    // Adding 1 so it's strictly > 0.
+                    1 + ((1.0 - elapsed / window) * 1_000_000.0) as i64
+                } else { 0 }
+            }
+            None => 0,
+        };
+        (access_priority, nd.degree as i64)
     });
 
     for &i in &order {
@@ -721,33 +796,28 @@ pub fn render_lines(area_w: u16, area_h: u16) -> Vec<Line<'static>> {
         let intensity = if max_degree == 0 { 0.0 }
                         else { nd.degree as f32 / max_degree as f32 };
 
-        // Flash intensity: 1.0 at access moment, lerps to 0 over
-        // FLASH_DURATION_S.
-        let flash = access_snap.get(&nd.id)
-            .map(|t| {
-                let elapsed = now.duration_since(*t).as_secs_f32();
-                if elapsed < FLASH_DURATION_S {
-                    1.0 - (elapsed / FLASH_DURATION_S)
-                } else { 0.0 }
-            })
-            .unwrap_or(0.0);
+        // Time since last access (∞ if never).
+        let elapsed_s = access_snap.get(&nd.id)
+            .map(|t| now.duration_since(*t).as_secs_f32())
+            .unwrap_or(f32::INFINITY);
 
-        // Glyph: bold ● when actively flashing, otherwise degree-based.
-        let glyph = if flash > 0.05 { '●' }
-                    else if intensity >= 0.55 { '●' }
-                    else if intensity >= 0.20 { '•' }
-                    else { '·' };
-        grid[idx].glyph = glyph;
-        if flash > 0.05 {
-            // Lerp wing fg toward bright red. Encode as direct RGB so
-            // the gradient is smooth across the 3-second decay window
-            // — no terminal palette quantization.
-            let red = (220.0 + 35.0 * flash).clamp(0.0, 255.0) as u8;
-            let green = ((1.0 - flash) * 80.0).clamp(0.0, 255.0) as u8;
-            let blue = ((1.0 - flash) * 80.0).clamp(0.0, 255.0) as u8;
-            grid[idx].fg = Color::Rgb(red, green, blue);
-            grid[idx].bold = true;
+        if elapsed_s < window {
+            // Accessed within visibility window — apply the gradient.
+            // Color comes from absolute time-since-access (so a 4s-old
+            // node looks the same in both modes); glyph and bold are
+            // also driven by absolute elapsed so trail mode degrades
+            // visibly: ● bold (≤1.5s) → ● (≤3s) → • (≤20s) → · (≤60s).
+            let (r, g, b) = flash_color(elapsed_s);
+            grid[idx].fg = Color::Rgb(r, g, b);
+            grid[idx].bold = elapsed_s < 1.5;
+            grid[idx].glyph = if elapsed_s < 3.0 { '●' }
+                              else if elapsed_s < 20.0 { '•' }
+                              else { '·' };
         } else {
+            // Stationary — degree-based glyph and the wing color.
+            grid[idx].glyph = if intensity >= 0.55 { '●' }
+                              else if intensity >= 0.20 { '•' }
+                              else { '·' };
             grid[idx].fg = wing_color(&nd.wing);
             grid[idx].bold = intensity >= 0.55;
         }

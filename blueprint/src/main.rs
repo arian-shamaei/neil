@@ -878,14 +878,16 @@ fn main() -> anyhow::Result<()> {
                                 }
                             }
                             // Graph panel (idx 8): `s` cycles wing-anchor
-                            // strength, `r` re-seeds the layout. Both
-                            // re-arm the cooling schedule so the change
-                            // animates instead of snapping.
+                            // strength, `r` re-seeds the layout, `l`
+                            // toggles the 60-second access trail overlay.
                             KeyCode::Char('s') if *pidx == 8 => {
                                 let _ = crate::panels::graph::toggle_anchors();
                             }
                             KeyCode::Char('r') if *pidx == 8 => {
                                 crate::panels::graph::reseed();
+                            }
+                            KeyCode::Char('l') if *pidx == 8 => {
+                                let _ = crate::panels::graph::toggle_trail();
                             }
                             KeyCode::Enter if *pidx == 7 => {
                                 // If the selection lands on a peer card, suspend
@@ -1587,13 +1589,16 @@ fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: 
         let anchor_label = if a < 0.15 { "free" }
                            else if a < 0.45 { "soft-anchor" }
                            else { "wing-anchor" };
-        format!(" {} | {} notes · {} links · {} orphans · Q={:.2} · [{}] | s:toggle r:reseed Esc:close ",
+        let trail_label = if crate::panels::graph::trail_enabled() { "trail-60s" }
+                          else { "flash-3s" };
+        format!(" {} | {} notes · {} links · {} orphans · Q={:.2} · [{} · {}] | s:anchor l:trail r:reseed Esc:close ",
                 name,
                 crate::panels::graph::node_count(),
                 crate::panels::graph::explicit_count(),
                 crate::panels::graph::orphan_count(),
                 crate::panels::graph::modularity(),
-                anchor_label)
+                anchor_label,
+                trail_label)
     } else {
         format!(" {} | Esc:close 1-9:switch ", name)
     };
