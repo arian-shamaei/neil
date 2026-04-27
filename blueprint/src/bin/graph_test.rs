@@ -170,6 +170,42 @@ fn main() {
         eprintln!("FAIL: trail mode shows no warm-colored aged accesses");
         std::process::exit(6);
     }
+
+    // ── Phase 6: matrix view ────────────────────────────────────────────
+    println!("--- matrix view ---");
+    let _ = graph::toggle_matrix_view();
+    let matrix_lines = graph::render_matrix_lines(80, 30);
+    println!("matrix line count = {}", matrix_lines.len());
+    let mut blue_cells = 0usize;
+    for line in &matrix_lines {
+        for span in &line.spans {
+            if let Some(ratatui::style::Color::Rgb(r, g, b)) = span.style.bg {
+                // Heatmap cells: blue-dominant
+                if b > r && b > g {
+                    blue_cells += span.content.chars().count();
+                }
+            }
+        }
+    }
+    println!("blue_heatmap_cells = {} (expect > 0)", blue_cells);
+    if blue_cells == 0 {
+        eprintln!("FAIL: matrix view rendered no heatmap cells");
+        std::process::exit(7);
+    }
+    if let Some((a, b, w)) = graph::top_cross_wing_pair() {
+        println!("top_cross_wing_pair: {} ↔ {} (weight={:.2})", a, b, w);
+    } else {
+        println!("(no cross-wing pairs)");
+    }
+    println!("--- matrix rendered (text only) ---");
+    for line in &matrix_lines {
+        let s: String = line.spans.iter()
+            .flat_map(|sp| sp.content.chars())
+            .collect();
+        println!("{}", s);
+    }
+    let _ = graph::toggle_matrix_view();  // back to graph view
+
     let _ = last_lines;
 
     // Sanity: line count == panel height.

@@ -889,6 +889,9 @@ fn main() -> anyhow::Result<()> {
                             KeyCode::Char('l') if *pidx == 8 => {
                                 let _ = crate::panels::graph::toggle_trail();
                             }
+                            KeyCode::Char('m') if *pidx == 8 => {
+                                let _ = crate::panels::graph::toggle_matrix_view();
+                            }
                             KeyCode::Enter if *pidx == 7 => {
                                 // If the selection lands on a peer card, suspend
                                 // the TUI and SSH into that peer (Phase 4 hook).
@@ -1585,20 +1588,35 @@ fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: 
     } else if idx == 7 {
         format!(" {} | Up/Down:select Enter:open Esc:close ", name)
     } else if idx == 8 {
-        let a = crate::panels::graph::anchor_strength();
-        let anchor_label = if a < 0.15 { "free" }
-                           else if a < 0.45 { "soft-anchor" }
-                           else { "wing-anchor" };
-        let trail_label = if crate::panels::graph::trail_enabled() { "trail-60s" }
-                          else { "flash-3s" };
-        format!(" {} | {} notes · {} links · {} orphans · Q={:.2} · [{} · {}] | s:anchor l:trail r:reseed Esc:close ",
-                name,
-                crate::panels::graph::node_count(),
-                crate::panels::graph::explicit_count(),
-                crate::panels::graph::orphan_count(),
-                crate::panels::graph::modularity(),
-                anchor_label,
-                trail_label)
+        if crate::panels::graph::matrix_view_enabled() {
+            // Matrix view: surface the strongest cross-wing pair — that's
+            // the bridge wings fail to capture, the headline diagnostic
+            // for "where Neil's filing taxonomy is wrong".
+            let pair = crate::panels::graph::top_cross_wing_pair();
+            let pair_str = match pair {
+                Some((a, b, w)) => format!("top-pair: {} ↔ {} (w={:.2})", a, b, w),
+                None => "no cross-wing edges".to_string(),
+            };
+            format!(" {} › matrix | {} · Q={:.2} | m:graph Esc:close ",
+                    name,
+                    pair_str,
+                    crate::panels::graph::modularity())
+        } else {
+            let a = crate::panels::graph::anchor_strength();
+            let anchor_label = if a < 0.15 { "free" }
+                               else if a < 0.45 { "soft-anchor" }
+                               else { "wing-anchor" };
+            let trail_label = if crate::panels::graph::trail_enabled() { "trail-60s" }
+                              else { "flash-3s" };
+            format!(" {} | {} notes · {} links · {} orphans · Q={:.2} · [{} · {}] | s:anchor l:trail m:matrix r:reseed Esc:close ",
+                    name,
+                    crate::panels::graph::node_count(),
+                    crate::panels::graph::explicit_count(),
+                    crate::panels::graph::orphan_count(),
+                    crate::panels::graph::modularity(),
+                    anchor_label,
+                    trail_label)
+        }
     } else {
         format!(" {} | Esc:close 1-9:switch ", name)
     };
@@ -1615,7 +1633,13 @@ fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: 
         5 => render_failures_panel(state),
         6 => render_logs_panel(),
         7 => render_cluster_panel_selectable(state, cluster_sel),
-        8 => crate::panels::graph::render_lines(inner.width, inner.height),
+        8 => {
+            if crate::panels::graph::matrix_view_enabled() {
+                crate::panels::graph::render_matrix_lines(inner.width, inner.height)
+            } else {
+                crate::panels::graph::render_lines(inner.width, inner.height)
+            }
+        }
         _ => vec![Line::from("Unknown panel")],
     };
     frame.render_widget(Paragraph::new(lines), inner);

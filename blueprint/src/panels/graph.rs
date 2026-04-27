@@ -108,6 +108,13 @@ const TRAIL_DURATION_S: f32 = 60.0;
 /// flipped from the key handler without acquiring the GraphState mutex.
 static TRAIL_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Toggle: when true, the panel renders a wing-by-wing adjacency-matrix
+/// heatmap instead of the force-directed graph. The matrix view is
+/// deterministic (no physics, no random seed) — same data always
+/// produces the same picture — and surfaces wing-pair coupling that
+/// the F-R layout flattens into a 2D projection.
+static MATRIX_VIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn graph_state() -> &'static Arc<Mutex<GraphState>> {
     GRAPH_STATE.get_or_init(|| Arc::new(Mutex::new(GraphState::default())))
 }
@@ -596,6 +603,38 @@ pub fn trail_enabled() -> bool {
     TRAIL_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether the panel is in adjacency-matrix mode.
+pub fn matrix_view_enabled() -> bool {
+    MATRIX_VIEW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Toggle the wing-by-wing adjacency-matrix view. Returns the new state.
+pub fn toggle_matrix_view() -> bool {
+    let s = !matrix_view_enabled();
+    MATRIX_VIEW.store(s, std::sync::atomic::Ordering::Relaxed);
+    s
+}
+
+/// Identify the strongest off-diagonal wing-pair coupling (i.e., which
+/// two distinct wings share the most edge weight). Returns
+/// `(wing_a, wing_b, total_weight)` or None if there are no cross-wing
+/// edges at all. Used by the matrix-view title bar.
+pub fn top_cross_wing_pair() -> Option<(String, String, f32)> {
+    let s = graph_state().lock().ok()?;
+    let mut by_pair: HashMap<(String, String), f32> = HashMap::new();
+    for e in &s.edges {
+        let wi = &s.nodes[e.i].wing;
+        let wj = &s.nodes[e.j].wing;
+        if wi == wj { continue; }
+        let key = if wi <= wj { (wi.clone(), wj.clone()) }
+                  else { (wj.clone(), wi.clone()) };
+        *by_pair.entry(key).or_default() += e.weight;
+    }
+    by_pair.into_iter()
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|((a, b), w)| (a, b, w))
+}
+
 /// Toggle the access trail overlay. When ON, every access leaves a
 /// 60-second fade behind it (color gradient from bright red at the
 /// access moment through orange/amber to the node's wing color at the
@@ -651,6 +690,170 @@ pub fn reseed() {
         }
         s.settle_ticks = 0;
     }
+}
+
+/// Render the wing-by-wing adjacency matrix as a heatmap. Each cell is
+/// drawn `cells_w` terminal cells wide so the matrix fills available
+/// width without crowding. Wings sort by note count descending so the
+/// dominant wing lands top-left.
+///
+/// Block-character rendering convention:
+///   • diagonal cells (within-wing edges)   → ▓ on a teal bg, intensity
+///     scaled to the within-wing edge weight relative to the matrix max
+///   • off-diagonal cells with edges         → bg color from a 5-step
+///     blue ramp scaled to weight
+///   • empty cells                            → blank
+///
+/// Above the matrix: a color legend showing the intensity ramp.
+/// Below: a row listing the strongest off-diagonal pair (the wing
+/// coupling that wing-classification fails to capture).
+pub fn render_matrix_lines(area_w: u16, area_h: u16) -> Vec<Line<'static>> {
+    let w = area_w as usize;
+    let h = area_h as usize;
+    if w < 20 || h < 8 {
+        return vec![Line::from(Span::styled(
+            "panel too small for matrix view".to_string(),
+            Style::default().fg(Color::DarkGray)))];
+    }
+
+    let state = match graph_state().lock() {
+        Ok(s) => s,
+        Err(_) => return vec![Line::from("matrix: state lock poisoned")],
+    };
+
+    if state.nodes.is_empty() {
+        return vec![Line::from(Span::styled(
+            "no notes to render".to_string(),
+            Style::default().fg(Color::DarkGray)))];
+    }
+
+    // ── Group notes by wing and sort wings by count descending ──────────
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for nd in &state.nodes {
+        let key = if nd.wing.is_empty() { "?".to_string() }
+                  else { nd.wing.clone() };
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    let mut wings: Vec<(String, usize)> = counts.into_iter().collect();
+    wings.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let n_wings = wings.len();
+    let wing_idx: HashMap<&str, usize> = wings.iter().enumerate()
+        .map(|(i, (w, _))| (w.as_str(), i))
+        .collect();
+
+    // ── Build the matrix ────────────────────────────────────────────────
+    let mut matrix: Vec<Vec<f32>> = vec![vec![0.0; n_wings]; n_wings];
+    for e in &state.edges {
+        let wi = state.nodes[e.i].wing.as_str();
+        let wj = state.nodes[e.j].wing.as_str();
+        let wi = if wi.is_empty() { "?" } else { wi };
+        let wj = if wj.is_empty() { "?" } else { wj };
+        let (Some(&i), Some(&j)) = (wing_idx.get(wi), wing_idx.get(wj)) else { continue };
+        matrix[i][j] += e.weight;
+        if i != j { matrix[j][i] += e.weight; }
+    }
+
+    // ── Sizing: allocate label margin + matrix cells ────────────────────
+    let label_w = 11usize;
+    let usable_w = w.saturating_sub(label_w + 1);
+    let cells_w = (usable_w / n_wings.max(1)).clamp(1, 4);
+    let matrix_w = cells_w * n_wings;
+    let max_val = matrix.iter().flatten().copied().fold(0.0f32, f32::max).max(0.0001);
+
+    let bg_for = |v: f32| -> Option<Color> {
+        if v == 0.0 { return None; }
+        let intensity = (v / max_val).clamp(0.0, 1.0);
+        let level = (intensity * 5.0).ceil().clamp(1.0, 5.0) as u8;
+        Some(match level {
+            1 => Color::Rgb( 18,  30,  56),
+            2 => Color::Rgb( 22,  60,  96),
+            3 => Color::Rgb( 30, 100, 140),
+            4 => Color::Rgb( 60, 150, 200),
+            _ => Color::Rgb(110, 200, 240),
+        })
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(n_wings + 5);
+
+    // ── Header row: column abbreviations (cells_w chars per column) ─────
+    let mut header = String::with_capacity(label_w + matrix_w);
+    header.push_str(&" ".repeat(label_w + 1));
+    for (w_name, _) in &wings {
+        let abbr: String = w_name.chars().take(cells_w).collect();
+        let mut padded = abbr;
+        while padded.chars().count() < cells_w { padded.push(' '); }
+        header.push_str(&padded);
+    }
+    lines.push(Line::from(Span::styled(
+        header,
+        Style::default().fg(Color::DarkGray))));
+
+    // ── Matrix rows ─────────────────────────────────────────────────────
+    for (i, (w_name, count)) in wings.iter().enumerate() {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(n_wings + 2);
+
+        // Left label: wing name truncated, padded right-aligned with count.
+        let trunc: String = w_name.chars().take(label_w - 2).collect();
+        let label = format!("{:>width$} ", trunc, width = label_w - 2);
+        spans.push(Span::styled(
+            label,
+            Style::default().fg(wing_color(w_name))));
+        // Tiny note-count badge (1-2 chars after the label name).
+        spans.push(Span::styled(
+            format!("{:>2}", (*count).min(99)),
+            Style::default().fg(Color::DarkGray)));
+
+        for j in 0..n_wings {
+            let v = matrix[i][j];
+            let mut style = Style::default();
+            if let Some(bg) = bg_for(v) { style = style.bg(bg); }
+            let glyph = if i == j {
+                // Diagonal — distinct glyph so within-wing weight is
+                // visually separable from the off-diagonal teals.
+                if v == 0.0 { " ".repeat(cells_w) }
+                else { "▓".repeat(cells_w) }
+            } else {
+                " ".repeat(cells_w)
+            };
+            // Diagonal foreground is the wing's color so the eye can
+            // pick up community identity along the diagonal.
+            if i == j && v > 0.0 {
+                style = style.fg(wing_color(w_name));
+            }
+            spans.push(Span::styled(glyph, style));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // ── Legend + summary ────────────────────────────────────────────────
+    if lines.len() + 3 <= h {
+        lines.push(Line::from(""));
+        let legend_spans: Vec<Span<'static>> = (1..=5).map(|level| {
+            let bg = match level {
+                1 => Color::Rgb( 18,  30,  56),
+                2 => Color::Rgb( 22,  60,  96),
+                3 => Color::Rgb( 30, 100, 140),
+                4 => Color::Rgb( 60, 150, 200),
+                _ => Color::Rgb(110, 200, 240),
+            };
+            Span::styled(
+                "    ",
+                Style::default().bg(bg))
+        }).collect();
+        let mut legend_line: Vec<Span<'static>> = vec![
+            Span::styled("low ".to_string(),
+                         Style::default().fg(Color::DarkGray)),
+        ];
+        legend_line.extend(legend_spans);
+        legend_line.push(Span::styled(" high   ".to_string(),
+                                       Style::default().fg(Color::DarkGray)));
+        legend_line.push(Span::styled(
+            format!("max-cell={:.1}  (diagonal=within-wing, off=cross-wing)", max_val),
+            Style::default().fg(Color::DarkGray)));
+        lines.push(Line::from(legend_line));
+    }
+
+    lines
 }
 
 /// Render the topology into `area_w × area_h` lines of styled spans.
