@@ -663,6 +663,19 @@ cmd_create() {
     [ -z "$name" ] && die "usage: spawn_vm create <name>"
     LXC info "$name" >/dev/null 2>&1 && die "$name already exists"
 
+    # Pre-flight: persona must validate before we touch lxc, otherwise an
+    # invalid persona leaves an orphan container (Level 2A Gate 2).
+    if [ -n "${PARAM_persona:-}" ]; then
+        case "$PARAM_persona" in
+            *[!a-z0-9_-]*|"")
+                die "invalid persona '$PARAM_persona' -- must match [a-z0-9_-]+"
+                ;;
+        esac
+        if [ ! -f "$NEIL_HOME/personas/$PARAM_persona.md" ]; then
+            die "persona '$PARAM_persona' not found at $NEIL_HOME/personas/$PARAM_persona.md"
+        fi
+    fi
+
     log "launching $name ($IMAGE)..."
     LXC launch "$IMAGE" "$name" >/dev/null
 

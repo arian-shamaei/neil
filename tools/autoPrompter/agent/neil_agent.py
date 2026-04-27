@@ -286,11 +286,13 @@ async def main() -> int:
     # (the file form is the only way to pass >128KB on Linux due to
     # MAX_ARG_STRLEN). Read once at startup.
     if args.get("system_prompt_file"):
-        try:
-            system_prompt = Path(args["system_prompt_file"]).read_text()
-        except Exception as e:
-            sys.stderr.write(f"[neil_agent] failed to read --system-prompt-file: {e}\n")
+        sp_path = args["system_prompt_file"]
+        if not Path(sp_path).is_file():
+            sys.stderr.write(f"[neil_agent] --system-prompt-file not found: {sp_path}\n")
             return 1
+        # SDK SystemPromptFile dict so bundled claude CLI reads via path
+        # (avoids Linux MAX_ARG_STRLEN 128KB-per-argv ceiling)
+        system_prompt = {"type": "file", "path": sp_path}
     else:
         system_prompt = args["system_prompt"] or ""
 
