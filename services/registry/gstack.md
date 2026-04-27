@@ -55,10 +55,33 @@ $(ls ~/.neil/skills/gstack/ 2>/dev/null)
 
 ## Adding more skills
 
+Skills are vendored into this repo (committed under `skills/gstack/<name>/SKILL.md`)
+so the runtime never trusts a live fetch. To add a new skill, pin to a known-good
+upstream commit SHA — do NOT pull from `main`:
+
 ```
+GSTACK_SHA=<full 40-char sha from github.com/garrytan/gstack>
 mkdir -p ~/.neil/skills/gstack/<name>
-curl -sL https://raw.githubusercontent.com/garrytan/gstack/main/<name>/SKILL.md     -o ~/.neil/skills/gstack/<name>/SKILL.md
+curl -sL "https://raw.githubusercontent.com/garrytan/gstack/$GSTACK_SHA/<name>/SKILL.md" \
+    -o ~/.neil/skills/gstack/<name>/SKILL.md
+git add skills/gstack/<name>/SKILL.md
+git commit -m "vendor: gstack/<name> @ $GSTACK_SHA"
 ```
+
+Without the SHA pin, an upstream-account compromise or repo rename could swap
+the skill body — and the body becomes the system prompt for a 15-turn agent
+with bash + read + write tools.
+
+## Trust model
+
+- `services/vault/gstack.key` exists ONLY on main Neil. Peers do not get this
+  file via spawn_vm or peer_transfer, so peers cannot dispatch service=gstack.
+- handler.sh's gstack case enforces `NEIL_CRED` non-empty as a hard gate, so
+  the segregation is checked at the choke point, not just upstream in dispatch.
+- `PARAM_cwd` is allowlisted to paths under `$HOME` (resolved with realpath),
+  capping the blast radius of any prompt injection that gets through.
+- Agent output is NOT logged to cluster_activity beyond a length count, so a
+  skill that surfaces a credential in its prose doesn't leak it into the JSONL.
 
 ## Example — ask /retro to reflect on recent cluster activity
 

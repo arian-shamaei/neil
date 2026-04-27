@@ -254,49 +254,81 @@ case "$NEIL_SERVICE" in
                 exit 1
                 ;;
         esac
-        CONTEXT="${PARAM_context:-}"
-        SKILL_FILE="$HOME/.neil/skills/gstack/$SKILL/SKILL.md"
-        # Reject symlinks: SKILL_FILE must be a regular file, not a link to elsewhere.
-        if [ -L "$SKILL_FILE" ]; then
-            echo "{\"service\":\"gstack\",\"error\":\"skill file is a symlink — refusing for safety\"}" >&2
+        # /cso P1 — enforce vault-segregation at the choke point. peers don't
+        # have services/vault/gstack.key so NEIL_CRED is empty for them.
+        # Refusing here means a compromised peer can't pivot via gstack.
+        if [ -z "${NEIL_CRED:-}" ]; then
+            echo "{\"service\":\"gstack\",\"error\":\"missing credential — only main may invoke gstack\"}" >&2
             exit 1
         fi
-        if [ ! -f "$SKILL_FILE" ]; then
-            echo "{\"service\":\"gstack\",\"error\":\"skill '$SKILL' not installed at $SKILL_FILE\"}" >&2
+        CONTEXT="${PARAM_context:-}"
+        SKILL_FILE="$HOME/.neil/skills/gstack/$SKILL/SKILL.md"
+        # Atomic read with O_NOFOLLOW closes the symlink-race / TOCTOU window
+        # noted in /cso P2. If SKILL_FILE is a symlink at open time, bail.
+        # || SH_RC=... is required: set -e otherwise kills the handler
+        # silently when python exits non-zero (no error message printed).
+        SH_RC=0
+        SYS=$(python3 - "$SKILL_FILE" <<'SH_NOFOLLOW' 2>/dev/null
+import os, sys
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW)
+except FileNotFoundError:
+    sys.exit(2)
+except OSError:
+    sys.exit(3)
+with os.fdopen(fd, 'r') as f:
+    sys.stdout.write(f.read())
+SH_NOFOLLOW
+) || SH_RC=$?
+        if [ $SH_RC -ne 0 ]; then
+            case $SH_RC in
+                2) MSG="skill '$SKILL' not installed at $SKILL_FILE" ;;
+                3) MSG="skill file is a symlink or unreadable — refusing for safety" ;;
+                *) MSG="failed to load skill (rc=$SH_RC)" ;;
+            esac
+            echo "{\"service\":\"gstack\",\"error\":\"$MSG\"}" >&2
             exit 1
         fi
         if [ -z "$CONTEXT" ]; then
             echo "{\"service\":\"gstack\",\"error\":\"missing context param\"}" >&2
             exit 1
         fi
-        # Run neil_agent.py with the gstack skill as system prompt and
-        # caller's context as user prompt. If PARAM_cwd is provided and is
-        # an existing directory, run the agent inside that directory so
-        # gstack's Bash invocations (git diff, ls, etc) see the right repo.
-        SYS=$(cat "$SKILL_FILE")
+        # /cso P2 — allowlist PARAM_cwd to $HOME or below; reject /etc, /, etc.
+        # Use realpath to defeat symlink-prefix tricks.
         CWD="${PARAM_cwd:-$HOME}"
         if [ ! -d "$CWD" ]; then
             echo "{\"service\":\"gstack\",\"error\":\"cwd '$CWD' is not a directory\"}" >&2
             exit 1
         fi
-        OUT=$(cd "$CWD" && NEIL_HOME="$HOME/.neil" NEIL_MAX_TURNS=25 \
+        REAL_CWD=$(realpath "$CWD" 2>/dev/null) || REAL_CWD=""
+        REAL_HOME=$(realpath "$HOME" 2>/dev/null) || REAL_HOME="$HOME"
+        case "$REAL_CWD" in
+            "$REAL_HOME"|"$REAL_HOME"/*) ;; # allowed
+            *)
+                echo "{\"service\":\"gstack\",\"error\":\"cwd '$REAL_CWD' must be under $REAL_HOME\"}" >&2
+                exit 1
+                ;;
+        esac
+        # Dispatch. NEIL_MAX_TURNS aligned to registry-doc value (15).
+        OUT=$(cd "$REAL_CWD" && NEIL_HOME="$HOME/.neil" NEIL_MAX_TURNS=15 \
             "$HOME/.neil/tools/autoPrompter/agent/.venv/bin/python" \
             "$HOME/.neil/tools/autoPrompter/agent/neil_agent.py" \
             --system-prompt "$SYS" -p "$CONTEXT" 2>&1)
         AGENT_RC=$?
-        # Log invocation
+        # Log invocation. /cso P2 — drop out_head from the JSONL to remove
+        # the token-leak surface (300-char prefix could capture an api key
+        # in agent traceback). out_chars alone is enough for monitoring.
         python3 - "$HOME/.neil/state/cluster_activity.jsonl" "$SKILL" "$AGENT_RC" "$OUT" <<'LOG'
 import json, pathlib, sys, datetime
 p, skill, rc, out = sys.argv[1:5]
 pp = pathlib.Path(p); pp.parent.mkdir(parents=True, exist_ok=True)
 with pp.open("a") as f:
     f.write(json.dumps({
-        "ts":          datetime.datetime.utcnow().isoformat(timespec="seconds")+"Z",
-        "event":       "gstack_invoke" if rc == "0" else "gstack_invoke_fail",
-        "skill":       skill,
-        "agent_rc":    int(rc),
-        "out_chars":   len(out),
-        "out_head":    out[:300],
+        "ts":        datetime.datetime.utcnow().isoformat(timespec="seconds")+"Z",
+        "event":     "gstack_invoke" if rc == "0" else "gstack_invoke_fail",
+        "skill":     skill,
+        "agent_rc":  int(rc),
+        "out_chars": len(out),
     }) + "\n")
 LOG
         if [ $AGENT_RC -ne 0 ]; then
@@ -458,7 +490,6 @@ with pp.open("a") as f:
         "sender":     sender, "peer": peer, "peer_ip": ip,
         "ssh_rc":     int(rc),
         "reply_chars": len(reply),
-        "reply_head":  reply[:300],
     }) + "\n")
 LOG
 
