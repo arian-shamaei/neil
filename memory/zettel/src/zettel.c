@@ -342,6 +342,36 @@ static int reindex(void) {
 
 /* ── Commands ────────────────────────────────────────────────────── */
 
+/* Append a one-line JSON event to the palace's .access.jsonl whenever a
+ * note is read or modified. Consumers (e.g. the blueprint Graph panel)
+ * tail this file to flash recently-touched nodes — it's the
+ * "what is Neil thinking about right now?" signal.
+ *
+ * Format:  {"id":"<noteid>","op":"show|new|link","ts":"<ISO8601 UTC>"}\n
+ *
+ * Best-effort: failure to log is silently ignored so primary ops always
+ * succeed. Single-line fputs is atomic for short writes on local Linux
+ * filesystems, so concurrent zettel invocations don't tear lines.
+ */
+static void log_note_access(const char *note_id, const char *op) {
+    if (!note_id || !note_id[0]) return;
+
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s/.access.jsonl", g_base);
+
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+
+    char ts[32];
+    time_t now = time(NULL);
+    struct tm tmv;
+    gmtime_r(&now, &tmv);
+    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+
+    fprintf(f, "{\"id\":\"%s\",\"op\":\"%s\",\"ts\":\"%s\"}\n", note_id, op, ts);
+    fclose(f);
+}
+
 static int cmd_new(int argc, char **argv) {
     if (argc < 1) {
         fprintf(stderr, "usage: zettel new \"content\" [--tags \"t1,t2\"]\n");
@@ -381,6 +411,7 @@ static int cmd_new(int argc, char **argv) {
     }
 
     printf("%s\n", n.id);
+    log_note_access(n.id, "new");
     free_note(&n);
     reindex();
     return 0;
@@ -417,6 +448,7 @@ static int cmd_show(int argc, char **argv) {
     if (n.body)
         printf("\n%s\n", n.body);
 
+    log_note_access(n.id, "show");
     free_note(&n);
     return 0;
 }
@@ -465,6 +497,8 @@ static int cmd_link(int argc, char **argv) {
         save_note(&b);
         reindex();
         printf("linked %s <-> %s\n", a.id, b.id);
+        log_note_access(a.id, "link");
+        log_note_access(b.id, "link");
     } else {
         printf("already linked\n");
     }

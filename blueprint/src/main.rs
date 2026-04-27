@@ -169,6 +169,9 @@ fn main() -> anyhow::Result<()> {
     // Same pattern for the Graph panel: re-runs `zettel list --json` every
     // 30s into a shared cache. Render thread steps physics each frame.
     panels::graph::spawn_graph_refresher(neil_home.clone());
+    // Access watcher tails $ZETTEL_HOME/.access.jsonl; nodes flash red
+    // when zettel reads/writes their note, decaying over 3s.
+    panels::graph::spawn_access_watcher(neil_home.clone());
 
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();

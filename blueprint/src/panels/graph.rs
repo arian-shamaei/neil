@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -81,12 +81,30 @@ pub struct GraphState {
 static GRAPH_STATE: OnceLock<Arc<Mutex<GraphState>>> = OnceLock::new();
 static GRAPH_CACHE: OnceLock<Arc<Mutex<(u64, Option<String>)>>> = OnceLock::new();
 
+/// Per-note Instant of most recent access. Populated by the access
+/// watcher thread reading `$ZETTEL_HOME/.access.jsonl`. The render
+/// thread reads this map to compute flash intensity per node. Keyed by
+/// note id so the map survives graph rebuilds (new notes auto-pick up
+/// flashes; deleted notes leave dead entries that decay naturally).
+static ACCESS_TIMES: OnceLock<Arc<Mutex<HashMap<String, Instant>>>> = OnceLock::new();
+
+/// Decay window after a `zettel show`/`new`/`link` event. The node
+/// renders red at access, lerps back to its wing color over this many
+/// seconds. 3.0 s is long enough to catch the eye on any reasonable
+/// glance interval; longer would muddy "what is Neil thinking about
+/// RIGHT NOW" with stale signals.
+const FLASH_DURATION_S: f32 = 3.0;
+
 fn graph_state() -> &'static Arc<Mutex<GraphState>> {
     GRAPH_STATE.get_or_init(|| Arc::new(Mutex::new(GraphState::default())))
 }
 
 fn graph_cache() -> &'static Arc<Mutex<(u64, Option<String>)>> {
     GRAPH_CACHE.get_or_init(|| Arc::new(Mutex::new((0, None))))
+}
+
+fn access_times() -> &'static Arc<Mutex<HashMap<String, Instant>>> {
+    ACCESS_TIMES.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
 }
 
 /// Spawn a thread that re-runs `zettel list --json` every 30 s and stores
@@ -114,6 +132,67 @@ pub fn spawn_graph_refresher(neil_home: PathBuf) {
                 }
             }
             std::thread::sleep(Duration::from_secs(30));
+        }
+    });
+}
+
+/// One JSON line in the palace's `.access.jsonl` log. zettel writes
+/// these whenever a note is read or modified. `op` and `ts` are
+/// captured for future use (tooltip distinguishing show vs new vs link)
+/// but the panel currently only consumes `id`.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct AccessEvent {
+    id: String,
+    #[serde(default)] op: String,
+    #[serde(default)] ts: String,
+}
+
+/// Spawn a thread that tails `$NEIL_HOME/memory/palace/.access.jsonl`,
+/// updating ACCESS_TIMES whenever a new event line arrives. Polls every
+/// 250 ms — fast enough that a `zettel show` at the prompt produces a
+/// red flash within one panel-frame interval.
+///
+/// On startup, seeks to end of file (skipping all historical events) so
+/// the panel only highlights notes Neil is touching from now on, not
+/// every note ever read. If the file is rotated/truncated, the watcher
+/// detects the size shrink and resets its read position.
+pub fn spawn_access_watcher(neil_home: PathBuf) {
+    let path = neil_home.join("memory/palace/.access.jsonl");
+    let access = access_times().clone();
+    std::thread::spawn(move || {
+        // Seek-to-end on startup. If file doesn't exist yet, last_pos
+        // stays at 0 — but the file gets created on first zettel access
+        // event after startup, so we'll see that event as the first.
+        let mut last_pos: u64 = std::fs::metadata(&path)
+            .map(|m| m.len()).unwrap_or(0);
+
+        loop {
+            std::thread::sleep(Duration::from_millis(250));
+            let Ok(meta) = std::fs::metadata(&path) else { continue };
+            let len = meta.len();
+            if len < last_pos {
+                // File was truncated/rotated — reset to start of the new file.
+                last_pos = 0;
+            }
+            if len <= last_pos { continue; }
+
+            use std::io::{Read, Seek, SeekFrom};
+            let Ok(mut file) = std::fs::File::open(&path) else { continue };
+            if file.seek(SeekFrom::Start(last_pos)).is_err() { continue; }
+            let mut buf = String::new();
+            if file.read_to_string(&mut buf).is_err() { continue; }
+            last_pos = len;
+
+            let now = Instant::now();
+            if let Ok(mut m) = access.lock() {
+                for line in buf.lines() {
+                    if line.trim().is_empty() { continue; }
+                    if let Ok(ev) = serde_json::from_str::<AccessEvent>(line) {
+                        m.insert(ev.id, now);
+                    }
+                }
+            }
         }
     });
 }
@@ -611,21 +690,67 @@ pub fn render_lines(area_w: u16, area_h: u16) -> Vec<Line<'static>> {
     // ── Layer 2: nodes ─────────────────────────────────────────────────
     let max_degree = state.nodes.iter().map(|n| n.degree).max().unwrap_or(0);
 
-    // Render lower-degree first so hubs paint on top.
+    // Snapshot recent-access map so render doesn't hold the mutex during
+    // the per-node loop. The watcher thread can append between snapshot
+    // and read with no harm — we just miss this frame's flash, catch it
+    // next.
+    let now = Instant::now();
+    let access_snap: HashMap<String, Instant> = match access_times().lock() {
+        Ok(m) => m.clone(),
+        Err(_) => HashMap::new(),
+    };
+
+    // Render lower-degree first so hubs paint on top. Then within each
+    // wing-color layer, currently-flashing nodes paint last so they
+    // visually pop above stationary neighbors.
     let mut order: Vec<usize> = (0..state.nodes.len()).collect();
-    order.sort_by_key(|&i| state.nodes[i].degree);
+    order.sort_by_key(|&i| {
+        let nd = &state.nodes[i];
+        // Two-key sort: (flash_priority, degree). Flashing nodes get
+        // higher rank so they paint after — and over — non-flashing.
+        let flashing = access_snap.get(&nd.id)
+            .map(|t| now.duration_since(*t).as_secs_f32() < FLASH_DURATION_S)
+            .unwrap_or(false);
+        (flashing as u8, nd.degree)
+    });
+
     for &i in &order {
         let nd = &state.nodes[i];
         let Some((x, y)) = proj(nd.pos) else { continue };
         let idx = (y as usize) * w + (x as usize);
         let intensity = if max_degree == 0 { 0.0 }
                         else { nd.degree as f32 / max_degree as f32 };
-        let glyph = if intensity >= 0.55 { '●' }
+
+        // Flash intensity: 1.0 at access moment, lerps to 0 over
+        // FLASH_DURATION_S.
+        let flash = access_snap.get(&nd.id)
+            .map(|t| {
+                let elapsed = now.duration_since(*t).as_secs_f32();
+                if elapsed < FLASH_DURATION_S {
+                    1.0 - (elapsed / FLASH_DURATION_S)
+                } else { 0.0 }
+            })
+            .unwrap_or(0.0);
+
+        // Glyph: bold ● when actively flashing, otherwise degree-based.
+        let glyph = if flash > 0.05 { '●' }
+                    else if intensity >= 0.55 { '●' }
                     else if intensity >= 0.20 { '•' }
                     else { '·' };
         grid[idx].glyph = glyph;
-        grid[idx].fg = wing_color(&nd.wing);
-        grid[idx].bold = intensity >= 0.55;
+        if flash > 0.05 {
+            // Lerp wing fg toward bright red. Encode as direct RGB so
+            // the gradient is smooth across the 3-second decay window
+            // — no terminal palette quantization.
+            let red = (220.0 + 35.0 * flash).clamp(0.0, 255.0) as u8;
+            let green = ((1.0 - flash) * 80.0).clamp(0.0, 255.0) as u8;
+            let blue = ((1.0 - flash) * 80.0).clamp(0.0, 255.0) as u8;
+            grid[idx].fg = Color::Rgb(red, green, blue);
+            grid[idx].bold = true;
+        } else {
+            grid[idx].fg = wing_color(&nd.wing);
+            grid[idx].bold = intensity >= 0.55;
+        }
     }
 
     // Hub labels: top ~5% by degree, capped 3..=8. Write to the right of

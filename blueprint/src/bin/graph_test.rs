@@ -73,6 +73,61 @@ fn main() {
         last_lines = graph::render_lines(w, h);
     }
 
+    // ── Phase 4: real-time access flash ─────────────────────────────────
+    // Spawn the access watcher, trigger a zettel show, wait long enough
+    // for the watcher to pick up the new line, render, then count cells
+    // whose fg color is in the "red flash" region (R high, G+B low).
+    println!("--- access flash: triggering zettel show ---");
+    graph::spawn_access_watcher(neil_home.clone());
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Pick the first note in the palace and zettel show it.
+    let zettel_bin = neil_home.join("memory/zettel/zettel");
+    let palace_dir = neil_home.join("memory/palace");
+    let notes_dir = palace_dir.join("notes");
+    let first_note = std::fs::read_dir(&notes_dir).ok()
+        .and_then(|d| d.filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                if n.ends_with(".md") { Some(n.trim_end_matches(".md").to_string()) }
+                else { None }
+            })
+            .next());
+    let Some(target_id) = first_note else {
+        eprintln!("FAIL: no note files in palace, can't test access flash");
+        std::process::exit(4);
+    };
+    println!("triggering: zettel show {}", target_id);
+    let _ = std::process::Command::new(&zettel_bin)
+        .arg("show").arg(&target_id)
+        .env("ZETTEL_HOME", &palace_dir)
+        .output();
+    // Watcher polls every 250ms — give it 600ms to catch up.
+    std::thread::sleep(Duration::from_millis(600));
+
+    // Render once with flash live.
+    let flashed_lines = graph::render_lines(w, h);
+
+    // Count red-flash cells: R > 200, G < 100, B < 100.
+    let mut red_cells = 0usize;
+    for line in &flashed_lines {
+        for span in &line.spans {
+            if let Some(fg) = span.style.fg {
+                if let ratatui::style::Color::Rgb(r, g, b) = fg {
+                    if r > 200 && g < 100 && b < 100 {
+                        red_cells += span.content.chars().count();
+                    }
+                }
+            }
+        }
+    }
+    println!("red_flash_cells = {}", red_cells);
+    if red_cells == 0 {
+        eprintln!("FAIL: no red-flashed cells found after zettel show");
+        std::process::exit(5);
+    }
+    let _ = last_lines; // suppress unused-mut warning
+
     // Sanity: line count == panel height.
     if last_lines.len() != h as usize {
         eprintln!("FAIL: expected {} lines, got {}", h, last_lines.len());
