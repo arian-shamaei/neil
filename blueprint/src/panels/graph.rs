@@ -43,10 +43,31 @@ struct Node {
     force: (f32, f32),
 }
 
+/// Weighted edge between two nodes. Weight is the spring stiffness scaling
+/// factor in the F-R attraction formula. Explicit `zettel link` edges
+/// carry a fixed high weight (EXPLICIT_LINK_WEIGHT); implicit tag-cooccur
+/// edges carry a smaller weight that's the sum of `1/log(tag_size+2)`
+/// over all tags shared by the two notes (so rare shared tags pull more
+/// strongly than common ones — single-note tags can't form edges, and
+/// tags with > MAX_TAG_FANOUT notes are skipped entirely as too generic
+/// to encode meaningful similarity).
+#[derive(Default, Clone, Copy)]
+struct WEdge { i: usize, j: usize, weight: f32, explicit: bool }
+
+const EXPLICIT_LINK_WEIGHT: f32 = 3.0;
+const MAX_TAG_FANOUT: usize = 30;
+
 #[derive(Default)]
 pub struct GraphState {
     nodes: Vec<Node>,
-    edges: Vec<(usize, usize)>,
+    edges: Vec<WEdge>,
+    /// Modularity Q computed with wings as the community partition,
+    /// over the weighted edge graph. Cached from last rebuild.
+    modularity: f32,
+    /// Notes with no edges at all (no shared tag, no explicit link).
+    orphan_count: usize,
+    /// Number of explicit (zettel link) edges — the rare curated bridges.
+    explicit_count: usize,
     settle_ticks: u32,
     last_load_version: u64,
     seed_state: u64,
@@ -146,24 +167,100 @@ impl GraphState {
             });
         }
 
-        let mut edges: Vec<(usize, usize)> = Vec::new();
-        let mut seen: HashSet<(usize, usize)> = HashSet::new();
+        // Combined weighted edge map keyed on (min, max) — explicit
+        // and implicit edges between the same pair accumulate weight.
+        let mut edge_weights: HashMap<(usize, usize), (f32, bool)> = HashMap::new();
+        let mut explicit_count = 0usize;
+
+        // Pass 1: explicit `zettel link` edges. These are the curated
+        // bridges Neil consciously created — fixed high weight.
         for raw in &parsed.notes {
             let Some(&i) = id_to_idx.get(&raw.id) else { continue };
             for link in &raw.links {
                 let Some(&j) = id_to_idx.get(link) else { continue };
                 if i == j { continue; }
                 let key = if i < j { (i, j) } else { (j, i) };
-                if seen.insert(key) {
-                    edges.push(key);
-                    nodes[i].degree += 1;
-                    nodes[j].degree += 1;
+                let entry = edge_weights.entry(key).or_insert((0.0, false));
+                if !entry.1 {
+                    entry.1 = true;
+                    explicit_count += 1;
+                }
+                entry.0 += EXPLICIT_LINK_WEIGHT;
+            }
+        }
+
+        // Pass 2: implicit tag-cooccurrence edges. Build tag → notes map,
+        // skip tags above MAX_TAG_FANOUT (too generic), and accumulate
+        // 1/log2(k+2) per shared tag onto each pair.
+        let mut tag_to_notes: HashMap<String, Vec<usize>> = HashMap::new();
+        for raw in &parsed.notes {
+            let Some(&i) = id_to_idx.get(&raw.id) else { continue };
+            for tag in &raw.tags {
+                if tag.is_empty() { continue; }
+                tag_to_notes.entry(tag.clone()).or_default().push(i);
+            }
+        }
+        for (_tag, members) in &tag_to_notes {
+            let k = members.len();
+            if k < 2 || k > MAX_TAG_FANOUT { continue; }
+            // Rarity weight: rare tags (small k) pull harder. log2(k+2)
+            // gives 2.0 at k=2, ~3.5 at k=10, ~5.0 at k=30.
+            let rarity = 1.0 / ((k as f32 + 2.0).log2());
+            for a in 0..k {
+                for b in (a + 1)..k {
+                    let (i, j) = if members[a] < members[b]
+                        { (members[a], members[b]) } else { (members[b], members[a]) };
+                    edge_weights.entry((i, j)).or_insert((0.0, false)).0 += rarity;
                 }
             }
         }
 
+        // Materialize the edge list and update node degrees.
+        let mut edges: Vec<WEdge> = Vec::with_capacity(edge_weights.len());
+        for (&(i, j), &(w, explicit)) in &edge_weights {
+            edges.push(WEdge { i, j, weight: w, explicit });
+            nodes[i].degree += 1;
+            nodes[j].degree += 1;
+        }
+
+        // Modularity Q with wings as the community partition.
+        // Q = Σ_c [ L_c / m  -  (D_c / 2m)² ]
+        // where L_c = sum of weights of edges entirely inside community c,
+        //       D_c = sum of weights of edges incident to community c (×2 for internal),
+        //       m   = sum of all edge weights
+        let total_w: f32 = edges.iter().map(|e| e.weight).sum::<f32>().max(0.0001);
+        let mut wing_internal: HashMap<&str, f32> = HashMap::new();
+        let mut wing_total: HashMap<&str, f32> = HashMap::new();
+        for e in &edges {
+            let wi = nodes[e.i].wing.as_str();
+            let wj = nodes[e.j].wing.as_str();
+            // Each edge contributes 2*w to the sum of degrees (once per endpoint).
+            *wing_total.entry(wi).or_default() += e.weight;
+            *wing_total.entry(wj).or_default() += e.weight;
+            if wi == wj {
+                *wing_internal.entry(wi).or_default() += e.weight;
+            }
+        }
+        let mut modularity = 0.0f32;
+        for (wing, l_c) in &wing_internal {
+            let d_c = wing_total.get(wing).copied().unwrap_or(0.0);
+            modularity += l_c / total_w - (d_c / (2.0 * total_w)).powi(2);
+        }
+        // Subtract the (D_c/2m)² term for wings that have no internal edges
+        // but still appear as endpoints — they reduce Q toward 0.
+        for (wing, d_c) in &wing_total {
+            if !wing_internal.contains_key(wing) {
+                modularity -= (d_c / (2.0 * total_w)).powi(2);
+            }
+        }
+
+        let orphan_count = nodes.iter().filter(|n| n.degree == 0).count();
+
         self.nodes = nodes;
         self.edges = edges;
+        self.modularity = modularity;
+        self.orphan_count = orphan_count;
+        self.explicit_count = explicit_count;
         self.settle_ticks = 0;
     }
 
@@ -220,24 +317,27 @@ impl GraphState {
             }
         }
 
-        // Attraction along edges — F-R formulation: F_a = d²/k toward
-        // partner. Two notes that share a link will pull together
-        // strongly enough to overcome local repulsion, forming a visible
-        // dimer. With more shared links a true cluster emerges.
-        for &(i, j) in &self.edges {
-            let pi = self.nodes[i].pos;
-            let pj = self.nodes[j].pos;
+        // Attraction along weighted edges — F-R formulation scaled by
+        // edge weight. F_a = w · d²/k toward partner. Explicit links
+        // (weight 3.0) dominate; tag-cooccurrence edges (weight ~0.1-1.0
+        // depending on tag rarity) cluster softly. The integrated
+        // result: rare-tag-pairs form tight constellations; common-tag
+        // pairs nudge toward each other; unrelated pairs only feel
+        // repulsion + gravity.
+        for e in &self.edges {
+            let pi = self.nodes[e.i].pos;
+            let pj = self.nodes[e.j].pos;
             let dx = pj.0 - pi.0;
             let dy = pj.1 - pi.1;
             let d2 = (dx * dx + dy * dy).max(0.01);
             let d = d2.sqrt();
-            let coef = d2 / k;  // |F_a| = d²/k
+            let coef = e.weight * d2 / k;
             let fx = coef * (dx / d);
             let fy = coef * (dy / d);
-            self.nodes[i].force.0 += fx;
-            self.nodes[i].force.1 += fy;
-            self.nodes[j].force.0 -= fx;
-            self.nodes[j].force.1 -= fy;
+            self.nodes[e.i].force.0 += fx;
+            self.nodes[e.i].force.1 += fy;
+            self.nodes[e.j].force.0 -= fx;
+            self.nodes[e.j].force.1 -= fy;
         }
 
         // Gravity toward origin. For an isolated node at the boundary of
@@ -319,9 +419,27 @@ pub fn node_count() -> usize {
     graph_state().lock().map(|s| s.nodes.len()).unwrap_or(0)
 }
 
-/// Total edge count — used by the panel title.
+/// Total weighted-edge count (explicit + tag-implicit).
 pub fn edge_count() -> usize {
     graph_state().lock().map(|s| s.edges.len()).unwrap_or(0)
+}
+
+/// Just the explicit `zettel link` edges. The rare ones Neil curated.
+pub fn explicit_count() -> usize {
+    graph_state().lock().map(|s| s.explicit_count).unwrap_or(0)
+}
+
+/// Modularity Q with wings as the community partition. Range [-0.5, 1.0]
+/// in theory; ≥ 0.3 is a meaningful community structure, ≥ 0.6 is
+/// strong. Negative would mean wings are anti-correlated with structure.
+pub fn modularity() -> f32 {
+    graph_state().lock().map(|s| s.modularity).unwrap_or(0.0)
+}
+
+/// Notes with no incident edge — neither linked nor sharing a tag with
+/// any other note within the MAX_TAG_FANOUT cap.
+pub fn orphan_count() -> usize {
+    graph_state().lock().map(|s| s.orphan_count).unwrap_or(0)
 }
 
 /// Render the topology into `area_w × area_h` lines of styled spans.
@@ -393,36 +511,26 @@ pub fn render_lines(area_w: u16, area_h: u16) -> Vec<Line<'static>> {
         else { Some((px, py)) }
     };
 
-    // ── Layer 1: edge density ───────────────────────────────────────────
-    let mut density: Vec<u16> = vec![0; w * h];
-    let mut max_d: u16 = 0;
-    for &(i, j) in &state.edges {
-        let Some((x0, y0)) = proj(state.nodes[i].pos) else { continue };
-        let Some((x1, y1)) = proj(state.nodes[j].pos) else { continue };
+    // ── Layer 1: explicit-link edges only ───────────────────────────────
+    // Tag-cooccurrence pulls notes together silently — its effect shows as
+    // CLUSTERING in the layout, not as drawn lines. Only the rare curated
+    // `zettel link` edges get rasterized, as bright cyan corridors that
+    // pop against the otherwise-dark canvas. This way the user can read
+    // two distinct organizational signals at the same time:
+    //   • where things group     → tag intelligence
+    //   • where bright lines run → explicit-link intelligence
+    let mut grid: Vec<Cell> = vec![Cell::default(); w * h];
+    for e in state.edges.iter().filter(|e| e.explicit) {
+        let Some((x0, y0)) = proj(state.nodes[e.i].pos) else { continue };
+        let Some((x1, y1)) = proj(state.nodes[e.j].pos) else { continue };
         bresenham(x0, y0, x1, y1, |x, y| {
             if x < 0 || y < 0 { return; }
             let xi = x as usize; let yi = y as usize;
             if xi >= w || yi >= h { return; }
             let idx = yi * w + xi;
-            density[idx] = density[idx].saturating_add(1);
-            if density[idx] > max_d { max_d = density[idx]; }
+            // Bright cyan background; node glyphs paint over endpoint cells.
+            grid[idx].bg = Some(Color::Rgb(40, 110, 150));
         });
-    }
-
-    let mut grid: Vec<Cell> = vec![Cell::default(); w * h];
-    if max_d > 0 {
-        for idx in 0..(w * h) {
-            let d = density[idx];
-            if d == 0 { continue; }
-            let level = ((d as f32 / max_d as f32) * 5.0).ceil().min(5.0) as u8;
-            grid[idx].bg = Some(match level {
-                1 => Color::Rgb(18, 22, 36),
-                2 => Color::Rgb(22, 32, 56),
-                3 => Color::Rgb(28, 50, 84),
-                4 => Color::Rgb(38, 78, 124),
-                _ => Color::Rgb(60, 110, 168),
-            });
-        }
     }
 
     // ── Layer 2: nodes ─────────────────────────────────────────────────

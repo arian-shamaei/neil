@@ -34,7 +34,12 @@ fn main() {
         std::thread::sleep(Duration::from_millis(200));
     }
 
-    println!("nodes={}  edges={}", graph::node_count(), graph::edge_count());
+    println!("nodes={}  edges={}  explicit={}  orphans={}  Q={:.3}",
+             graph::node_count(),
+             graph::edge_count(),
+             graph::explicit_count(),
+             graph::orphan_count(),
+             graph::modularity());
 
     if graph::node_count() == 0 {
         eprintln!("FAIL: graph never populated");
@@ -85,10 +90,15 @@ fn main() {
         println!("{}", s);
     }
 
-    // Floor: at least 1 cell per node should be occupied.
-    if occupied < graph::node_count() / 2 {
-        eprintln!("FAIL: too few occupied cells ({} < {} / 2)",
-                  occupied, graph::node_count());
+    // Sanity floor — settled layouts should occupy a meaningful fraction
+    // of the panel. We don't require occupied ≥ n because clustered
+    // layouts (high modularity OR strong tag co-occurrence) intentionally
+    // overlap multiple nodes onto the same cell — overlap is success,
+    // not failure. 100 cells is enough to reject "everything pinned to
+    // one corner" pathologies without rejecting clustering.
+    if occupied < 100 {
+        eprintln!("FAIL: too few occupied cells ({}); layout never settled?",
+                  occupied);
         std::process::exit(3);
     }
     println!("PASS");

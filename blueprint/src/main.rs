@@ -1570,10 +1570,12 @@ fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: 
     } else if idx == 7 {
         format!(" {} | Up/Down:select Enter:open Esc:close ", name)
     } else if idx == 8 {
-        format!(" {} | {} notes · {} edges | Esc:close 1-9:switch ",
+        format!(" {} | {} notes · {} links · {} orphans · Q={:.2} | Esc:close 1-9:switch ",
                 name,
                 crate::panels::graph::node_count(),
-                crate::panels::graph::edge_count())
+                crate::panels::graph::explicit_count(),
+                crate::panels::graph::orphan_count(),
+                crate::panels::graph::modularity())
     } else {
         format!(" {} | Esc:close 1-9:switch ", name)
     };
