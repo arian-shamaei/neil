@@ -208,13 +208,18 @@ class Streamer:
 # ─── Main driver ─────────────────────────────────────────────────────
 
 def parse_args(argv: list[str]) -> dict:
-    """Parse claude-style args: --system-prompt X -p Y"""
-    out = {"system_prompt": None, "prompt": None}
+    """Parse claude-style args: --system-prompt X -p Y
+    Also accepts --system-prompt-file <path> to read system prompt from
+    a file (avoids Linux MAX_ARG_STRLEN limit of 128KB per argv element
+    when essence + persona overlay exceeds that)."""
+    out = {"system_prompt": None, "system_prompt_file": None, "prompt": None}
     i = 0
     while i < len(argv):
         a = argv[i]
         if a in ("--system-prompt", "--system"):
             out["system_prompt"] = argv[i + 1]; i += 2
+        elif a == "--system-prompt-file":
+            out["system_prompt_file"] = argv[i + 1]; i += 2
         elif a == "-p":
             out["prompt"] = argv[i + 1]; i += 2
         elif a in ("--print", "--dangerously-skip-permissions"):
@@ -277,7 +282,17 @@ async def run_agent(prompt: str, system_prompt: str, streamer: Streamer) -> str:
 async def main() -> int:
     args = parse_args(sys.argv[1:])
     prompt = args["prompt"] or sys.stdin.read()
-    system_prompt = args["system_prompt"] or ""
+    # If --system-prompt-file was supplied, prefer it over --system-prompt
+    # (the file form is the only way to pass >128KB on Linux due to
+    # MAX_ARG_STRLEN). Read once at startup.
+    if args.get("system_prompt_file"):
+        try:
+            system_prompt = Path(args["system_prompt_file"]).read_text()
+        except Exception as e:
+            sys.stderr.write(f"[neil_agent] failed to read --system-prompt-file: {e}\n")
+            return 1
+    else:
+        system_prompt = args["system_prompt"] or ""
 
     # Find NEIL_HOME for stream file location
     neil_home = Path(os.environ.get("NEIL_HOME", os.path.expanduser("~/.neil")))

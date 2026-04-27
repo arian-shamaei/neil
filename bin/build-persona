@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""build-persona — translate a vendored gstack SKILL.md into a Neil persona file.
+
+Usage:
+    build-persona <role> <gstack-skill> [--sha <40-char>] [--out <path>]
+
+Example:
+    build-persona eng-mgr plan-eng-review --sha dde55103fcc42bd446d804ddc15567ced8455ac1
+
+Writes:
+    ~/.neil/personas/<role>.md with YAML frontmatter (gstack-source-sha,
+    role-name, allowed-tools) followed by the translated body.
+
+The pipeline (per spec at specs/level2_persona_library.md):
+  1. Read vendored skill body at ~/.neil/skills/gstack/<skill>/SKILL.md
+  2. Verify expected anchors are present (loud-fail if missing)
+  3. STRIP: preamble bash blocks, AskUserQuestion/ExitPlanMode mentions,
+     gstack-update-check / gstack-* CLI invocations, SKILL.md.tmpl footer
+  4. REMAP: Edit/Write tool calls -> write_file; Read -> read_file;
+     Bash unchanged; Agent (sub-agent spawn) -> drop with note
+  5. Quote role-voice sections AS-IS (this is the gstack value)
+  6. Prepend Neil-cluster integration header
+
+If --sha is not provided, looks up the latest gstack commit via gh api.
+"""
+from __future__ import annotations
+import argparse, os, re, subprocess, sys
+from pathlib import Path
+
+NEIL_HOME = Path(os.environ.get("NEIL_HOME", Path.home() / ".neil"))
+SKILLS_DIR = NEIL_HOME / "skills/gstack"
+PERSONAS_DIR = NEIL_HOME / "personas"
+
+# Expected anchor sections in any gstack SKILL.md. Loud-fail if any are
+# missing — that means upstream restructured and our translation pipeline
+# may produce a degraded persona.
+REQUIRED_ANCHORS = [
+    r"^---$",                       # YAML frontmatter delimiter
+    r"^name:\s*\S+",                # frontmatter name
+    r"^description:",               # frontmatter description
+    r"^##\s",                       # at least one h2 section
+]
+
+# Lines/blocks to strip wholesale.
+STRIP_PATTERNS = [
+    # gstack preamble bash block — drops the whole fenced section
+    (r"^## Preamble[^\n]*\n+```bash\n.*?\n```\n+",  re.DOTALL),
+    # gstack-update-check / gstack-* CLI references in prose
+    (r"^[^\n]*gstack-update-check[^\n]*\n",          0),
+    (r"^[^\n]*~/\.gstack/[^\n]*\n",                  0),
+    # AUTO-GENERATED comment from SKILL.md.tmpl
+    (r"^<!-- AUTO-GENERATED[^\n]*-->\s*\n",          0),
+    (r"^<!-- Regenerate[^\n]*-->\s*\n",              0),
+    # bun run gen:* / bun-tool-only call-outs
+    (r"^[^\n]*bun run gen:[^\n]*\n",                 0),
+]
+
+# Tool remappings. gstack assumes Claude Code's TUI tool surface; Neil's
+# neil_agent.py only has bash, read_file, write_file, call_service.
+REMAP = {
+    r"\bAskUserQuestion\b":   "(no AskUserQuestion in Neil — surface the question in your beat output instead)",
+    r"\bExitPlanMode\b":      "(no ExitPlanMode in Neil — emit DONE: <intent> when finished)",
+    r"\bAgent tool\b":        "(no Agent tool in Neil — peers run independently; do this work yourself or peer_send to a sibling)",
+    r"\bAgent sub-agent\b":   "(sub-agent spawn unavailable; do work in this beat)",
+    r"\bEdit tool\b":         "write_file tool",
+    r"\bWrite tool\b":        "write_file tool",
+    r"\bRead tool\b":         "read_file tool",
+}
+
+NEIL_HEADER_TEMPLATE = """\
+# Neil cluster integration
+
+You are a Neil peer running heartbeat beats, NOT a Claude Code session.
+Your tool surface is `bash`, `read_file`, `write_file`, `call_service`.
+You do NOT have AskUserQuestion, ExitPlanMode, Edit, Write, or Agent.
+
+When the gstack body below tells you to use Edit/Write, use `write_file`
+instead. When it tells you to AskUserQuestion, surface the question in
+your heartbeat's QUESTION field — the operator reads heartbeat reports.
+When it tells you to spawn a sub-agent, do the work yourself in this
+beat or `peer_send` your sibling.
+
+Output channels:
+  - Action lines (READ:, BASH:, WRITE:, MEMORY:, INTEND:, FAIL:, DONE:)
+    are bare-prefix, parsed by autoprompt.c. Don't bold or backtick them.
+  - peer_send via `CALL: service=peer_send action=queue peer=<sibling>
+    message="<text>"` is your channel to other peers in the cluster.
+  - HEARTBEAT/ACTION/QUESTION/IMPROVEMENT/CONTRIBUTION fields close
+    every beat (per essence/heartbeat.md).
+
+3C cycle still applies: CONFIGURATION beats don't write code. CHARACTERIZATION
+beats verify single findings. CREATIVITY beats ship. The gstack role below
+is your persona — what you push back on, what you care about, what voice
+you speak in. The beat mode is your operating constraint for what you can
+DO this beat.
+
+You are role: **{role}** — see body below.
+
+---
+
+"""
+
+
+def lookup_sha() -> str:
+    """Fetch the current gstack main SHA via gh CLI."""
+    try:
+        out = subprocess.check_output(
+            ["gh", "api", "repos/garrytan/gstack/commits/main"],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+        m = re.search(r'"sha":"([a-f0-9]{40})"', out)
+        if m:
+            return m.group(1)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+    raise SystemExit("FAIL: --sha required (gh api lookup failed)")
+
+
+def verify_anchors(body: str, source: Path) -> None:
+    """Loud-fail if upstream restructured and key anchors are gone."""
+    missing = []
+    for anchor in REQUIRED_ANCHORS:
+        if not re.search(anchor, body, re.M):
+            missing.append(anchor)
+    if missing:
+        raise SystemExit(
+            f"FAIL: skill {source} is missing expected anchors:\n  "
+            + "\n  ".join(missing)
+            + "\nUpstream may have restructured. Re-pin to a known-good SHA "
+            "or update build-persona's anchor list."
+        )
+
+
+def strip_blocks(body: str) -> str:
+    for pat, flags in STRIP_PATTERNS:
+        body = re.sub(pat, "", body, flags=re.M | flags)
+    return body
+
+
+def remap_tools(body: str) -> str:
+    for src, dst in REMAP.items():
+        body = re.sub(src, dst, body)
+    return body
+
+
+def split_frontmatter(body: str) -> tuple[str, str]:
+    """Return (frontmatter, rest). Frontmatter is the leading --- ... --- block."""
+    m = re.match(r"^---\n(.*?\n)---\n", body, re.S)
+    if not m:
+        return "", body
+    return m.group(1), body[m.end():]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("role", help="role name, e.g. eng-mgr or cso")
+    ap.add_argument("skill", help="vendored gstack skill name, e.g. plan-eng-review")
+    ap.add_argument("--sha", help="gstack commit SHA to pin (default: gh api lookup)")
+    ap.add_argument("--out", help="output path (default: ~/.neil/personas/<role>.md)")
+    args = ap.parse_args()
+
+    if not re.match(r"^[a-z][a-z0-9_-]+$", args.role):
+        raise SystemExit("FAIL: role must match [a-z][a-z0-9_-]+")
+
+    sha = args.sha or lookup_sha()
+    if not re.match(r"^[a-f0-9]{40}$", sha):
+        raise SystemExit("FAIL: --sha must be 40 hex chars")
+
+    src = SKILLS_DIR / args.skill / "SKILL.md"
+    if not src.exists():
+        raise SystemExit(f"FAIL: vendored skill not found at {src}")
+
+    body = src.read_text()
+    verify_anchors(body, src)
+
+    frontmatter, rest = split_frontmatter(body)
+    rest = strip_blocks(rest)
+    rest = remap_tools(rest)
+
+    out_path = Path(args.out) if args.out else PERSONAS_DIR / f"{args.role}.md"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    new_frontmatter = (
+        "---\n"
+        f"role: {args.role}\n"
+        f"gstack-source-skill: {args.skill}\n"
+        f"gstack-source-sha: {sha}\n"
+        f"persona-translation-version: 1\n"
+        "---\n\n"
+    )
+    header = NEIL_HEADER_TEMPLATE.format(role=args.role)
+    out_path.write_text(new_frontmatter + header + rest)
+
+    print(f"wrote {out_path} ({out_path.stat().st_size} bytes)")
+    print(f"  role: {args.role}")
+    print(f"  gstack-source-skill: {args.skill}")
+    print(f"  gstack-source-sha: {sha}")
+
+
+if __name__ == "__main__":
+    main()

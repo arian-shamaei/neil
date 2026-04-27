@@ -144,6 +144,25 @@ push_substrate() {
         done
     fi
 
+    # Persona overlay (Level 2A): if PARAM_persona is set, push the matching
+    # personas/<role>.md as essence/persona.md so the peer adopts a gstack-
+    # derived role. Validates by file existence — no hardcoded allowlist
+    # (per Level 2A spec). Unknown role -> die early with clear error.
+    if [ -n "${PARAM_persona:-}" ]; then
+        case "$PARAM_persona" in
+            *[!a-z0-9_-]*|"")
+                die "invalid persona '$PARAM_persona' -- must match [a-z0-9_-]+"
+                ;;
+        esac
+        local persona_file="$NEIL_HOME/personas/$PARAM_persona.md"
+        if [ ! -f "$persona_file" ]; then
+            die "persona '$PARAM_persona' not found at $persona_file"
+        fi
+        log "  persona overlay: $PARAM_persona"
+        LXC file push "$persona_file" "$name$PEER_HOME/.neil/essence/persona.md" \
+            --mode 0644 >/dev/null 2>&1 || die "persona push failed for $PARAM_persona"
+    fi
+
     # 3. Agent runner
     local agent_py="$NEIL_HOME/tools/autoPrompter/agent/neil_agent.py"
     if [ -f "$agent_py" ]; then

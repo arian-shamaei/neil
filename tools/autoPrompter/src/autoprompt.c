@@ -459,24 +459,63 @@ static void extract_query(const char *prompt, char *query, size_t cap) {
     query[i] = '\0';
 }
 
-/* Load all .md files from essence/ dir, concatenated. */
+/* Load all .md files from essence/ dir, concatenated.
+ *
+ * Files are sorted lexicographically with one exception: persona.md is
+ * always loaded LAST. This is the Level 2A drift fix — when a peer is
+ * spawned with persona=<role>, ~/.neil/essence/persona.md holds the
+ * role's gstack-derived voice. Loading it last means lessons.md and
+ * other essence files cannot dilute the role via attention recency,
+ * even after many beats accumulate context.
+ *
+ * readdir() returns entries in filesystem-defined order (hash-tree on
+ * ext4) so we collect names first, then sort, then concatenate. */
 static char *load_essence(void) {
     DIR *d = opendir(g_essence_dir);
     if (!d) return NULL;
 
-    size_t cap = 8192, len = 0;
-    char *buf = malloc(cap);
-    if (!buf) { closedir(d); return NULL; }
-    buf[0] = '\0';
+    #define ESSENCE_MAX_FILES 64
+    #define ESSENCE_NAME_MAX  256
+    char names[ESSENCE_MAX_FILES][ESSENCE_NAME_MAX];
+    int count = 0;
 
     struct dirent *ent;
-    while ((ent = readdir(d)) != NULL) {
+    while ((ent = readdir(d)) != NULL && count < ESSENCE_MAX_FILES) {
         size_t nlen = strlen(ent->d_name);
-        if (nlen <= 3 || strcmp(ent->d_name + nlen - 3, ".md") != 0)
+        if (nlen <= 3 || nlen >= ESSENCE_NAME_MAX
+            || strcmp(ent->d_name + nlen - 3, ".md") != 0)
             continue;
+        strncpy(names[count], ent->d_name, ESSENCE_NAME_MAX - 1);
+        names[count][ESSENCE_NAME_MAX - 1] = '\0';
+        count++;
+    }
+    closedir(d);
 
+    /* Sort: persona.md sorts last; everything else lexicographic. */
+    for (int i = 0; i < count - 1; i++) {
+        for (int j = i + 1; j < count; j++) {
+            int i_per = (strcmp(names[i], "persona.md") == 0);
+            int j_per = (strcmp(names[j], "persona.md") == 0);
+            int swap = 0;
+            if (i_per && !j_per) swap = 1;
+            else if (!i_per && !j_per && strcmp(names[i], names[j]) > 0) swap = 1;
+            if (swap) {
+                char tmp[ESSENCE_NAME_MAX];
+                strncpy(tmp, names[i], ESSENCE_NAME_MAX);
+                strncpy(names[i], names[j], ESSENCE_NAME_MAX);
+                strncpy(names[j], tmp, ESSENCE_NAME_MAX);
+            }
+        }
+    }
+
+    size_t cap = 8192, len = 0;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    buf[0] = '\0';
+
+    for (int idx = 0; idx < count; idx++) {
         char path[MAX_PATH];
-        snprintf(path, sizeof(path), "%s/%s", g_essence_dir, ent->d_name);
+        snprintf(path, sizeof(path), "%s/%s", g_essence_dir, names[idx]);
 
         size_t flen;
         char *content = read_file(path, &flen);
@@ -497,7 +536,6 @@ static char *load_essence(void) {
         buf[len] = '\0';
         free(content);
     }
-    closedir(d);
 
     if (len == 0) { free(buf); return NULL; }
     return buf;
@@ -2106,10 +2144,43 @@ static int run_claude(const char *prompt, const char *system_prompt,
         argv[argc++] = g_ai_prompt_flag;
         argv[argc++] = prompt;
 
-        /* Add system prompt if provided */
+        /* Add system prompt if provided. For large prompts (>64KB) write
+         * to a tempfile and pass --system-prompt-file <path>; otherwise
+         * pass inline as before. Linux MAX_ARG_STRLEN is 128KB per argv
+         * element — essence + persona overlay can exceed that, causing
+         * execvp to fail with E2BIG. */
+        char sp_tmpfile[64] = "";
         if (system_prompt && system_prompt[0] && g_ai_system_flag[0]) {
-            argv[argc++] = g_ai_system_flag;
-            argv[argc++] = system_prompt;
+            size_t sp_len = strlen(system_prompt);
+            if (sp_len > 65536) {
+                /* Tempfile path */
+                snprintf(sp_tmpfile, sizeof(sp_tmpfile),
+                         "/tmp/neil_sp_%d.md", (int)getpid());
+                int sp_fd = open(sp_tmpfile, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+                if (sp_fd >= 0) {
+                    ssize_t w = write(sp_fd, system_prompt, sp_len);
+                    close(sp_fd);
+                    if (w == (ssize_t)sp_len) {
+                        argv[argc++] = "--system-prompt-file";
+                        argv[argc++] = sp_tmpfile;
+                    } else {
+                        unlink(sp_tmpfile);
+                        sp_tmpfile[0] = '\0';
+                        /* fall back to inline (will likely fail E2BIG, but
+                         * the resulting exec failure produces a clearer
+                         * error than a half-written tempfile). */
+                        argv[argc++] = g_ai_system_flag;
+                        argv[argc++] = system_prompt;
+                    }
+                } else {
+                    sp_tmpfile[0] = '\0';
+                    argv[argc++] = g_ai_system_flag;
+                    argv[argc++] = system_prompt;
+                }
+            } else {
+                argv[argc++] = g_ai_system_flag;
+                argv[argc++] = system_prompt;
+            }
         }
 
         argv[argc] = NULL;
