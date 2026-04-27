@@ -34,7 +34,9 @@ RC=$?
 POST_MTIME=$(stat -c '%Y' "$CREDS" 2>/dev/null || echo 0)
 DELTA=$((POST_MTIME - PRE_MTIME))
 
-if echo "$OUT" | grep -q 'authentication_error\|401'; then
+# Anchor the auth-failure detection so benign output mentioning '401'
+# (e.g. agent prose, log echoes) doesn't trip a false reauth-required.
+if echo "$OUT" | grep -qE '"(authentication_error|invalid_grant)"|HTTP/[0-9.]+ 401'; then
     log "FAIL auth (rc=$RC) — refresh token may be expired; needs interactive 'claude' login"
     exit 1
 fi

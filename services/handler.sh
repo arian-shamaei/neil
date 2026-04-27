@@ -245,8 +245,22 @@ case "$NEIL_SERVICE" in
     # params: context="<text passed as user prompt>"
     gstack)
         SKILL=$NEIL_ACTION
+        # Reject any skill name with non-safe chars (path traversal defense).
+        # Skills are alphanumeric + underscore + hyphen only — matches the
+        # naming convention every gstack skill on disk uses.
+        case "$SKILL" in
+            *[!a-zA-Z0-9_-]*|"")
+                echo "{\"service\":\"gstack\",\"error\":\"invalid skill name (must match [a-zA-Z0-9_-]+)\"}" >&2
+                exit 1
+                ;;
+        esac
         CONTEXT="${PARAM_context:-}"
         SKILL_FILE="$HOME/.neil/skills/gstack/$SKILL/SKILL.md"
+        # Reject symlinks: SKILL_FILE must be a regular file, not a link to elsewhere.
+        if [ -L "$SKILL_FILE" ]; then
+            echo "{\"service\":\"gstack\",\"error\":\"skill file is a symlink — refusing for safety\"}" >&2
+            exit 1
+        fi
         if [ ! -f "$SKILL_FILE" ]; then
             echo "{\"service\":\"gstack\",\"error\":\"skill '$SKILL' not installed at $SKILL_FILE\"}" >&2
             exit 1
@@ -256,9 +270,16 @@ case "$NEIL_SERVICE" in
             exit 1
         fi
         # Run neil_agent.py with the gstack skill as system prompt and
-        # caller's context as user prompt. Capture output verbatim.
+        # caller's context as user prompt. If PARAM_cwd is provided and is
+        # an existing directory, run the agent inside that directory so
+        # gstack's Bash invocations (git diff, ls, etc) see the right repo.
         SYS=$(cat "$SKILL_FILE")
-        OUT=$(NEIL_HOME="$HOME/.neil" NEIL_MAX_TURNS=15 \
+        CWD="${PARAM_cwd:-$HOME}"
+        if [ ! -d "$CWD" ]; then
+            echo "{\"service\":\"gstack\",\"error\":\"cwd '$CWD' is not a directory\"}" >&2
+            exit 1
+        fi
+        OUT=$(cd "$CWD" && NEIL_HOME="$HOME/.neil" NEIL_MAX_TURNS=25 \
             "$HOME/.neil/tools/autoPrompter/agent/.venv/bin/python" \
             "$HOME/.neil/tools/autoPrompter/agent/neil_agent.py" \
             --system-prompt "$SYS" -p "$CONTEXT" 2>&1)
