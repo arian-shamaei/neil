@@ -53,6 +53,26 @@ fn main() {
         last_lines = graph::render_lines(w, h);
     }
 
+    // Sanity check anchor toggle: Q is cached at rebuild but anchor
+    // changes should at least visibly reorganize the layout. Toggle on,
+    // run more ticks, render again, then toggle off.
+    println!("--- anchors=free  Q={:.3} ---", graph::modularity());
+    let _ = graph::toggle_anchors();
+    println!("anchor_strength now = {}", graph::anchor_strength());
+    for _ in 0..120 {
+        last_lines = graph::render_lines(w, h);
+    }
+    let _ = graph::toggle_anchors();
+    println!("anchor_strength now = {}", graph::anchor_strength());
+    for _ in 0..120 {
+        last_lines = graph::render_lines(w, h);
+    }
+    let _ = graph::toggle_anchors();  // back to 0
+    println!("anchor_strength now = {} (back to free)", graph::anchor_strength());
+    for _ in 0..120 {
+        last_lines = graph::render_lines(w, h);
+    }
+
     // Sanity: line count == panel height.
     if last_lines.len() != h as usize {
         eprintln!("FAIL: expected {} lines, got {}", h, last_lines.len());

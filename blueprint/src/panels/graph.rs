@@ -68,6 +68,11 @@ pub struct GraphState {
     orphan_count: usize,
     /// Number of explicit (zettel link) edges — the rare curated bridges.
     explicit_count: usize,
+    /// Strength of the wing-centroid anchor force. 0.0 = pure free
+    /// physics (the topology Neil's tags+links say); 0.3 = soft
+    /// anchor (wings bias clustering); 0.6 = strong anchor (wings
+    /// dominate, layout shows wing taxonomy). Cycles via `s` key.
+    anchor_strength: f32,
     settle_ticks: u32,
     last_load_version: u64,
     seed_state: u64,
@@ -351,6 +356,38 @@ impl GraphState {
             nd.force.1 -= gravity * nd.pos.1;
         }
 
+        // Wing-centroid anchor. When `anchor_strength > 0`, every node
+        // feels a Hookean pull toward its wing's mean position. With
+        // pairwise repulsion still active, the equilibrium is wings
+        // forming visually distinct clusters: the wing with most notes
+        // gets the largest cluster, smaller wings form satellites.
+        // Comparing this view to anchor_strength=0 reveals visually how
+        // far Neil's filing taxonomy diverges from his actual
+        // tag-driven note structure.
+        if self.anchor_strength > 0.0 {
+            let mut sums: HashMap<String, ((f32, f32), usize)> = HashMap::new();
+            for nd in &self.nodes {
+                let entry = sums.entry(nd.wing.clone()).or_insert(((0.0, 0.0), 0));
+                entry.0 .0 += nd.pos.0;
+                entry.0 .1 += nd.pos.1;
+                entry.1 += 1;
+            }
+            let centroids: HashMap<String, (f32, f32)> = sums.into_iter()
+                .map(|(w, (sum, n))| (w, (sum.0 / n as f32, sum.1 / n as f32)))
+                .collect();
+            // Linear pull magnitude scales with distance × strength × k.
+            // 0.3 strength keeps wings loose; 0.6 makes them dominate.
+            let coef = self.anchor_strength * k * 0.5;
+            for nd in self.nodes.iter_mut() {
+                if let Some(c) = centroids.get(&nd.wing) {
+                    let dx = c.0 - nd.pos.0;
+                    let dy = c.1 - nd.pos.1;
+                    nd.force.0 += dx * coef;
+                    nd.force.1 += dy * coef;
+                }
+            }
+        }
+
         // F-R move: step size = min(|F|, t) in direction of F. No
         // bounding box — gravity provides the global container.
         for nd in self.nodes.iter_mut() {
@@ -440,6 +477,44 @@ pub fn modularity() -> f32 {
 /// any other note within the MAX_TAG_FANOUT cap.
 pub fn orphan_count() -> usize {
     graph_state().lock().map(|s| s.orphan_count).unwrap_or(0)
+}
+
+/// Current wing-anchor strength: 0.0 = free physics, 0.3 = soft, 0.6 = strong.
+pub fn anchor_strength() -> f32 {
+    graph_state().lock().map(|s| s.anchor_strength).unwrap_or(0.0)
+}
+
+/// Cycle wing-anchor strength: 0.0 → 0.3 → 0.6 → 0.0. Returns the new
+/// value. Re-arms the cooling schedule so the layout visibly reshuffles
+/// instead of jumping; the user gets a 3-second animated transition
+/// from one mode to the next.
+pub fn toggle_anchors() -> f32 {
+    if let Ok(mut s) = graph_state().lock() {
+        s.anchor_strength = if s.anchor_strength < 0.15 { 0.3 }
+                            else if s.anchor_strength < 0.45 { 0.6 }
+                            else { 0.0 };
+        s.settle_ticks = 0;
+        return s.anchor_strength;
+    }
+    0.0
+}
+
+/// Re-randomize all node positions from a fresh seed. Useful when
+/// physics gets stuck in a poor local minimum — the global structure
+/// (cluster count, modularity) is determined by the edge weights, but
+/// the specific arrangement on screen is seed-dependent.
+pub fn reseed() {
+    if let Ok(mut s) = graph_state().lock() {
+        s.seed_state = s.seed_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut rng = s.seed_state;
+        for nd in s.nodes.iter_mut() {
+            nd.pos = (xrand_unit(&mut rng) * 20.0 - 10.0,
+                      xrand_unit(&mut rng) * 20.0 - 10.0);
+            nd.vel = (0.0, 0.0);
+            nd.force = (0.0, 0.0);
+        }
+        s.settle_ticks = 0;
+    }
 }
 
 /// Render the topology into `area_w × area_h` lines of styled spans.

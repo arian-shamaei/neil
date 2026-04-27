@@ -874,6 +874,16 @@ fn main() -> anyhow::Result<()> {
                                     }
                                 }
                             }
+                            // Graph panel (idx 8): `s` cycles wing-anchor
+                            // strength, `r` re-seeds the layout. Both
+                            // re-arm the cooling schedule so the change
+                            // animates instead of snapping.
+                            KeyCode::Char('s') if *pidx == 8 => {
+                                let _ = crate::panels::graph::toggle_anchors();
+                            }
+                            KeyCode::Char('r') if *pidx == 8 => {
+                                crate::panels::graph::reseed();
+                            }
                             KeyCode::Enter if *pidx == 7 => {
                                 // If the selection lands on a peer card, suspend
                                 // the TUI and SSH into that peer (Phase 4 hook).
@@ -1570,12 +1580,17 @@ fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: 
     } else if idx == 7 {
         format!(" {} | Up/Down:select Enter:open Esc:close ", name)
     } else if idx == 8 {
-        format!(" {} | {} notes · {} links · {} orphans · Q={:.2} | Esc:close 1-9:switch ",
+        let a = crate::panels::graph::anchor_strength();
+        let anchor_label = if a < 0.15 { "free" }
+                           else if a < 0.45 { "soft-anchor" }
+                           else { "wing-anchor" };
+        format!(" {} | {} notes · {} links · {} orphans · Q={:.2} · [{}] | s:toggle r:reseed Esc:close ",
                 name,
                 crate::panels::graph::node_count(),
                 crate::panels::graph::explicit_count(),
                 crate::panels::graph::orphan_count(),
-                crate::panels::graph::modularity())
+                crate::panels::graph::modularity(),
+                anchor_label)
     } else {
         format!(" {} | Esc:close 1-9:switch ", name)
     };
