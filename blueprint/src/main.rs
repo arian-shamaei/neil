@@ -1637,7 +1637,7 @@ fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: 
         4 => crate::panels::services::render(state),
         5 => render_failures_panel(state),
         6 => render_logs_panel(),
-        7 => render_cluster_panel_selectable(state, cluster_sel),
+        7 => render_cluster_panel_selectable(state, cluster_sel, inner.width, inner.height),
         8 => {
             // Legend wins over matrix wins over graph; toggling any flag
             // flips just that one, so if both ever co-exist we deterministic-
@@ -2054,8 +2054,456 @@ fn render_logs_panel() -> Vec<Line<'static>> {
 
 /// Cluster panel with selectable cards (selection highlight but no expansion).
 /// Instance index 0 = MAIN, 1..=N = live temps, N+1..=M = recent history.
-fn render_cluster_panel_selectable(_state: &NeilState, selection: usize) -> Vec<Line<'static>> {
-    cluster_lines(selection)
+fn render_cluster_panel_selectable(state: &NeilState, selection: usize,
+                                   area_w: u16, area_h: u16) -> Vec<Line<'static>> {
+    cluster_lines_responsive(selection, area_w, area_h, &state.neil_home)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Responsive cluster panel (Phase 9)
+//
+// 4 layout tiers based on terminal inner-area width. The relationship
+// signal — pair connectors + activity dots — is preserved at every
+// size; secondary info (IP, image) drops away as space shrinks.
+//
+//   ≥ 110  WIDE     — 2 pairs side-by-side, full cards
+//   70–109 MEDIUM   — pairs stacked vertically, each pair horizontal
+//   40–69  NARROW   — pair members stacked vertically, slim cards
+//   < 40   TINY     — single-column linear list, no boxes
+//
+// Pair detection: shared name-prefix (split on '-'). humanizer-a
+// pairs with humanizer-b automatically; water-wet with water-dry.
+// Activity dot: ● green (peer_send <1h ago), ◐ yellow (1h–48h),
+// ○ red (>48h or never). Read from cluster_activity.jsonl.
+// ─────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq)]
+enum ClusterTier { Wide, Medium, Narrow, Tiny }
+
+fn pick_cluster_tier(w: u16) -> ClusterTier {
+    if w < 40 { ClusterTier::Tiny }
+    else if w < 70 { ClusterTier::Narrow }
+    else if w < 110 { ClusterTier::Medium }
+    else { ClusterTier::Wide }
+}
+
+fn detect_pair_partner(peer_name: &str, all_names: &[String]) -> Option<String> {
+    let prefix = peer_name.split('-').next().unwrap_or("");
+    if prefix.is_empty() { return None; }
+    let mates: Vec<&String> = all_names.iter()
+        .filter(|n| n.as_str() != peer_name)
+        .filter(|n| n.split('-').next() == Some(prefix))
+        .collect();
+    if mates.len() == 1 { Some(mates[0].clone()) } else { None }
+}
+
+/// Read recent peer_send events from cluster_activity.jsonl, returning
+/// the most recent timestamp per peer. Tails the last ~64 KB for speed
+/// — older events don't matter for the activity-dot freshness check.
+fn read_peer_activity_timestamps(neil_home: &std::path::Path)
+    -> std::collections::HashMap<String, String>
+{
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+    let mut out: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let path = neil_home.join("state/cluster_activity.jsonl");
+    let Ok(mut f) = std::fs::File::open(&path) else { return out };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(65_536);
+    let _ = f.seek(SeekFrom::Start(start));
+    let reader = BufReader::new(f);
+    for line in reader.lines().filter_map(|l| l.ok()) {
+        if !line.contains("peer_send") { continue; }
+        let peer = extract_obj_field(&line, "peer").unwrap_or_default();
+        let ts = extract_obj_field(&line, "ts").unwrap_or_default();
+        if !peer.is_empty() && !ts.is_empty() {
+            out.insert(peer, ts);
+        }
+    }
+    out
+}
+
+fn activity_dot(
+    peer_name: &str,
+    activity: &std::collections::HashMap<String, String>,
+) -> (char, Color) {
+    let Some(ts_str) = activity.get(peer_name) else {
+        return ('○', Color::Rgb(220, 80, 80));
+    };
+    let parsed = chrono::DateTime::parse_from_rfc3339(ts_str);
+    let Ok(ts) = parsed else {
+        return ('○', Color::Rgb(220, 80, 80));
+    };
+    let age_min = chrono::Utc::now()
+        .signed_duration_since(ts.with_timezone(&chrono::Utc))
+        .num_minutes();
+    if age_min < 60 {
+        ('●', Color::Rgb(80, 220, 110))    // active
+    } else if age_min < 60 * 48 {
+        ('◐', Color::Rgb(220, 200, 80))    // warming/cooling
+    } else {
+        ('○', Color::Rgb(220, 80, 80))     // stalled
+    }
+}
+
+/// Group peers into pairs for the pair-aware layouts. Returns a list
+/// of "groups", where each group is either a pair of indices into the
+/// original peer list, or a single index for solo peers. Pair order
+/// is stable: the lower-name peer is always first within a pair.
+fn group_peers_by_pair(peer_names: &[String]) -> Vec<Vec<usize>> {
+    let mut placed: Vec<bool> = vec![false; peer_names.len()];
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for i in 0..peer_names.len() {
+        if placed[i] { continue; }
+        if let Some(partner) = detect_pair_partner(&peer_names[i], peer_names) {
+            if let Some(j) = peer_names.iter().position(|n| n == &partner) {
+                if !placed[j] && i != j {
+                    let (a, b) = if peer_names[i] < peer_names[j] { (i, j) } else { (j, i) };
+                    groups.push(vec![a, b]);
+                    placed[a] = true;
+                    placed[b] = true;
+                    continue;
+                }
+            }
+        }
+        groups.push(vec![i]);
+        placed[i] = true;
+    }
+    groups
+}
+
+// ── Tier renderers ─────────────────────────────────────────────────
+
+fn cluster_render_tiny(
+    main_name: &str, main_active: bool,
+    peers: &[PeerInstance], peer_names: &[String],
+    activity: &std::collections::HashMap<String, String>,
+    selection: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let main_color = if main_active { Color::Green } else { Color::DarkGray };
+    let main_marker = if selection == 0 { "▶ " } else { "  " };
+    lines.push(Line::from(vec![
+        Span::raw(main_marker.to_string()),
+        Span::styled("●".to_string(), Style::default().fg(main_color)),
+        Span::raw(" "),
+        Span::styled(main_name.chars().take(14).collect::<String>(),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+    ]));
+    for (i, p) in peers.iter().enumerate() {
+        let is_last = i == peers.len() - 1;
+        let prefix = if is_last { "  └─ " } else { "  ├─ " };
+        let (dot, dcolor) = activity_dot(&p.name, activity);
+        let partner = detect_pair_partner(&p.name, peer_names);
+        let pair_str: String = match &partner {
+            Some(pr) => format!(" ↔ {}", pr.chars().take(12).collect::<String>()),
+            None => String::new(),
+        };
+        let sel = if selection == i + 1 { "▶ " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(prefix.to_string(),
+                Style::default().fg(Color::Rgb(90, 90, 110))),
+            Span::styled(dot.to_string(), Style::default().fg(dcolor)),
+            Span::raw(" "),
+            Span::raw(sel.to_string()),
+            Span::styled(p.name.chars().take(14).collect::<String>(),
+                Style::default().fg(Color::White)),
+            Span::styled(pair_str, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    lines
+}
+
+fn cluster_render_narrow(
+    main_name: &str, main_active: bool,
+    peers: &[PeerInstance], peer_names: &[String],
+    activity: &std::collections::HashMap<String, String>,
+    selection: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let connector = Style::default().fg(Color::Rgb(90, 90, 110));
+    let main_color = if main_active { Color::Green } else { Color::DarkGray };
+    let main_marker = if selection == 0 {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    lines.push(Line::from(vec![
+        Span::raw("       "),
+        Span::styled("●".to_string(), Style::default().fg(main_color)),
+        Span::raw(" "),
+        Span::styled(main_name.to_string(), main_marker),
+    ]));
+    lines.push(Line::from(Span::styled("        │".to_string(), connector)));
+
+    let groups = group_peers_by_pair(peer_names);
+    for (gi, group) in groups.iter().enumerate() {
+        if group.len() == 2 {
+            let prefix = peer_names[group[0]].split('-').next().unwrap_or("?");
+            lines.push(Line::from(Span::styled(
+                format!("    ── {} pair ──", prefix),
+                Style::default().fg(Color::DarkGray))));
+            for (sub, &idx) in group.iter().enumerate() {
+                let p = &peers[idx];
+                let (dot, dcolor) = activity_dot(&p.name, activity);
+                let sel = selection == idx + 1;
+                let body_style = if sel {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let card_w: usize = 30;
+                let name_line = format!("{} {}", dot, p.name);
+                let inner = name_line.chars().take(card_w - 4).collect::<String>();
+                lines.push(Line::from(vec![
+                    Span::styled("    ┌".to_string(), connector),
+                    Span::styled("─".repeat(card_w - 2), connector),
+                    Span::styled("┐".to_string(), connector),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("    │ ".to_string(), connector),
+                    Span::styled(dot.to_string(), Style::default().fg(dcolor)),
+                    Span::raw(" "),
+                    Span::styled(p.name.chars().take(card_w - 6).collect::<String>(),
+                        body_style),
+                    Span::raw(" ".repeat(card_w.saturating_sub(inner.chars().count() + 4))),
+                    Span::styled("│".to_string(), connector),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("    └".to_string(), connector),
+                    Span::styled("─".repeat(card_w - 2), connector),
+                    Span::styled("┘".to_string(), connector),
+                ]));
+                if sub == 0 {
+                    lines.push(Line::from(Span::styled(
+                        "         ↕ pair".to_string(), connector)));
+                }
+            }
+        } else {
+            let idx = group[0];
+            let p = &peers[idx];
+            let (dot, dcolor) = activity_dot(&p.name, activity);
+            let sel_marker = if selection == idx + 1 { "▶ " } else { "  " };
+            lines.push(Line::from(vec![
+                Span::raw("    ".to_string()),
+                Span::styled(dot.to_string(), Style::default().fg(dcolor)),
+                Span::raw(" "),
+                Span::raw(sel_marker.to_string()),
+                Span::styled(p.name.clone(), Style::default().fg(Color::White)),
+            ]));
+        }
+        if gi < groups.len() - 1 { lines.push(Line::from("")); }
+    }
+    lines
+}
+
+fn cluster_render_medium_or_wide(
+    main_name: &str, main_status: &str, main_persona: &str, main_mem: &str,
+    main_up: &str, main_task: &str, main_pending: &str,
+    main_active: bool,
+    peers: &[PeerInstance], peer_names: &[String],
+    activity: &std::collections::HashMap<String, String>,
+    selection: usize,
+    tier: ClusterTier,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let connector = Style::default().fg(Color::Rgb(90, 90, 110));
+    let _ = (main_persona, main_mem, main_up, main_task, main_pending, main_active);
+
+    // Pair-grouped layout. WIDE: 2 pair-blocks per row. MEDIUM: 1 per row.
+    let pair_blocks_per_row = match tier {
+        ClusterTier::Wide => 2,
+        _ => 1,
+    };
+
+    // MAIN card (existing helper, full-width)
+    let main_selected = selection == 0;
+    let main_card = build_main_box(main_name, main_status, main_persona, main_mem,
+                                   main_up, main_task, main_pending, main_selected);
+    let indent = "  ";
+    for cl in main_card {
+        lines.push(prefix_line(&cl, indent.len()));
+    }
+
+    let groups = group_peers_by_pair(peer_names);
+    if groups.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(prefix_line(&Line::from(Span::styled(
+            "(no live children)".to_string(),
+            Style::default().fg(Color::DarkGray))), 2));
+        return lines;
+    }
+
+    // Trunk
+    lines.push(Line::from(Span::styled("    │".to_string(), connector)));
+
+    // Card width per tier
+    let card_w: usize = match tier {
+        ClusterTier::Wide => 22,
+        _                 => 26,
+    };
+    let pair_gap: usize = 8;       // " ──pair── "
+    let group_gap: usize = 4;      // between pair-blocks within a row
+
+    // Render groups in chunks of pair_blocks_per_row
+    for chunk in groups.chunks(pair_blocks_per_row) {
+        // Build each block as a rendered card-block (3 cards wide max)
+        let mut block_lines: Vec<Vec<Line<'static>>> = Vec::new();
+        for group in chunk {
+            // Header: "── humanizer pair ──" or "── (solo: name) ──"
+            let header = if group.len() == 2 {
+                let prefix = peer_names[group[0]].split('-').next().unwrap_or("?");
+                format!("── {} pair ──", prefix)
+            } else {
+                format!("── solo ──")
+            };
+            let mut block: Vec<Line<'static>> = Vec::new();
+            block.push(Line::from(Span::styled(header,
+                Style::default().fg(Color::DarkGray))));
+
+            // Render each peer card, with pair connector between if pair
+            let cards: Vec<Vec<Line<'static>>> = group.iter().map(|&idx| {
+                let p = &peers[idx];
+                let (dot, dcolor) = activity_dot(&p.name, activity);
+                let sel = selection == idx + 1;
+                build_peer_card_with_dot(&p.name, &p.status, dot, dcolor, sel, card_w)
+            }).collect();
+
+            let card_h = cards[0].len();
+            for li in 0..card_h {
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                for (i, card) in cards.iter().enumerate() {
+                    if i > 0 {
+                        // pair connector — only on the middle row of the card
+                        let mid = card_h / 2;
+                        let conn = if li == mid { "──pair──" } else { "        " };
+                        spans.push(Span::styled(conn.to_string(), connector));
+                    }
+                    for s in &card[li].spans { spans.push(s.clone()); }
+                }
+                block.push(Line::from(spans));
+            }
+            block_lines.push(block);
+        }
+
+        // Horizontal join blocks within the chunk
+        let block_h = block_lines.iter().map(|b| b.len()).max().unwrap_or(0);
+        for li in 0..block_h {
+            let mut spans: Vec<Span<'static>> = vec![Span::raw("  ".to_string())];
+            for (i, block) in block_lines.iter().enumerate() {
+                if i > 0 { spans.push(Span::raw(" ".repeat(group_gap))); }
+                if li < block.len() {
+                    for s in &block[li].spans { spans.push(s.clone()); }
+                } else {
+                    // Pad with spaces to keep alignment if blocks differ in height
+                    let pair_w = if chunk[i].len() == 2 {
+                        card_w * 2 + pair_gap
+                    } else { card_w };
+                    spans.push(Span::raw(" ".repeat(pair_w)));
+                }
+            }
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::from(""));
+    }
+    lines
+}
+
+fn build_peer_card_with_dot(
+    name: &str, status: &str, dot: char, dot_color: Color,
+    selected: bool, card_w: usize,
+) -> Vec<Line<'static>> {
+    let border_style = if selected {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Rgb(90, 90, 110))
+    };
+    let name_style = if selected {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let status_color = match status {
+        "active" | "running" | "ready" => Color::Green,
+        _ => Color::DarkGray,
+    };
+    let mut out = Vec::new();
+    let inner_w = card_w.saturating_sub(2);
+    out.push(Line::from(vec![
+        Span::styled("┌".to_string() + &"─".repeat(inner_w) + "┐", border_style),
+    ]));
+    let line1: String = format!(" {} {}", dot, name)
+        .chars().take(inner_w).collect();
+    let pad1 = inner_w.saturating_sub(line1.chars().count());
+    out.push(Line::from(vec![
+        Span::styled("│".to_string(), border_style),
+        Span::styled(format!(" {}", dot), Style::default().fg(dot_color)),
+        Span::raw(" "),
+        Span::styled(name.chars().take(inner_w.saturating_sub(4)).collect::<String>(),
+            name_style),
+        Span::raw(" ".repeat(pad1.saturating_sub(3 + name.chars().take(inner_w.saturating_sub(4)).count()))),
+        Span::styled("│".to_string(), border_style),
+    ]));
+    let line2: String = format!(" status={}", status)
+        .chars().take(inner_w).collect();
+    let pad2 = inner_w.saturating_sub(line2.chars().count());
+    out.push(Line::from(vec![
+        Span::styled("│".to_string(), border_style),
+        Span::styled(line2, Style::default().fg(status_color)),
+        Span::raw(" ".repeat(pad2)),
+        Span::styled("│".to_string(), border_style),
+    ]));
+    out.push(Line::from(vec![
+        Span::styled("└".to_string() + &"─".repeat(inner_w) + "┘", border_style),
+    ]));
+    out
+}
+
+/// Top-level responsive entry point. Picks tier from `area_w`, reads
+/// activity log, dispatches to the per-tier renderer.
+fn cluster_lines_responsive(
+    selection: usize,
+    area_w: u16,
+    _area_h: u16,
+    neil_home: &std::path::Path,
+) -> Vec<Line<'static>> {
+    let cached = cluster_cache().lock().ok().and_then(|g| g.clone());
+    let json_text = match cached {
+        None => return vec![
+            Line::from(Span::styled("  Cluster data loading...".to_string(),
+                Style::default().fg(Color::DarkGray))),
+        ],
+        Some(ref s) if s.starts_with("__ERROR__") => return vec![
+            Line::from(Span::styled(s.clone(), Style::default().fg(Color::Red))),
+        ],
+        Some(s) => s,
+    };
+
+    let main_name = extract_main_field(&json_text, "name").unwrap_or("main".into());
+    let main_status = extract_main_field(&json_text, "status").unwrap_or("idle".into());
+    let main_persona = extract_main_field(&json_text, "persona").unwrap_or("default".into());
+    let main_mem = extract_main_field(&json_text, "memory_type").unwrap_or("full".into());
+    let main_up = extract_main_field(&json_text, "uptime_sec").unwrap_or("0".into());
+    let main_task = extract_main_field(&json_text, "current_task").unwrap_or_default();
+    let main_pending = extract_main_field(&json_text, "pending_intentions")
+        .unwrap_or("0".into());
+    let main_active = main_status == "active";
+
+    let peers = parse_peers(&json_text);
+    let peer_names: Vec<String> = peers.iter().map(|p| p.name.clone()).collect();
+    let activity = read_peer_activity_timestamps(neil_home);
+
+    let tier = pick_cluster_tier(area_w);
+    match tier {
+        ClusterTier::Tiny => cluster_render_tiny(
+            &main_name, main_active, &peers, &peer_names, &activity, selection),
+        ClusterTier::Narrow => cluster_render_narrow(
+            &main_name, main_active, &peers, &peer_names, &activity, selection),
+        ClusterTier::Medium | ClusterTier::Wide => cluster_render_medium_or_wide(
+            &main_name, &main_status, &main_persona, &main_mem,
+            &main_up, &main_task, &main_pending, main_active,
+            &peers, &peer_names, &activity, selection, tier),
+    }
 }
 
 fn cluster_lines(selection: usize) -> Vec<Line<'static>> {
