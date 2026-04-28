@@ -200,6 +200,26 @@ push_substrate() {
         fi
     "
 
+    # 6b. Runtime hook layer — _neil_hooks.{py,pth} into the agent venv's
+    # site-packages so any third-party Python tool the peer ends up using
+    # (mempalace, etc.) gets Neil's instrumentation auto-applied. Hook
+    # bodies live in $NEIL_HOME/python and are version-controlled; here
+    # we just push + symlink. Re-runnable: ln -sf is idempotent.
+    if [ -f "$NEIL_HOME/python/_neil_hooks.py" ]; then
+        LXC exec "$name" -- bash -c "mkdir -p $PEER_HOME/.neil/python"
+        LXC file push "$NEIL_HOME/python/_neil_hooks.py" \
+            "$name$PEER_HOME/.neil/python/_neil_hooks.py" --mode 0644 >/dev/null 2>&1 || true
+        LXC file push "$NEIL_HOME/python/_neil_hooks.pth" \
+            "$name$PEER_HOME/.neil/python/_neil_hooks.pth" --mode 0644 >/dev/null 2>&1 || true
+        LXC exec "$name" -- bash -c "
+            SITE=\$(ls -d $PEER_HOME/.neil/tools/autoPrompter/agent/.venv/lib/python*/site-packages 2>/dev/null | head -1)
+            [ -n \"\$SITE\" ] && {
+                ln -sf $PEER_HOME/.neil/python/_neil_hooks.py  \$SITE/_neil_hooks.py
+                ln -sf $PEER_HOME/.neil/python/_neil_hooks.pth \$SITE/_neil_hooks.pth
+            }
+        " >/dev/null 2>&1 || true
+    fi
+
     # 7. State seed + role config + .claude.json stub
     local persona="${PARAM_persona:-minimal}"
     local memory_mode="${PARAM_memory_mode:-read_only_parent}"
