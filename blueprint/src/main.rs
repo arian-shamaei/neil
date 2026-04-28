@@ -2227,7 +2227,7 @@ fn cluster_render_narrow(
     main_name: &str, main_active: bool,
     peers: &[PeerInstance], peer_names: &[String],
     activity: &std::collections::HashMap<String, String>,
-    selection: usize,
+    selection: usize, area_w: u16,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let connector = Style::default().fg(Color::Rgb(90, 90, 110));
@@ -2238,11 +2238,12 @@ fn cluster_render_narrow(
         Style::default().fg(Color::White)
     };
 
-    // Cards live at indent=4, width=30. Use (card_w - 1) / 2 so the
-    // computed center column matches where odd-length headers
-    // ("── humanizer pair ──") naturally render after centering.
+    // Cards expand to fill the available width: card_w = area_w - 2*indent
+    // with a 2-cell right margin. Floor at 22 (just enough to fit
+    // "humanizer-a" + dot + borders).
     let card_indent: usize = 4;
-    let card_w: usize = 30;
+    let card_w: usize = ((area_w as usize).saturating_sub(card_indent + 2))
+        .max(22);
     let card_center: usize = card_indent + (card_w.saturating_sub(1)) / 2;
 
     let main_pad = card_center.saturating_sub(2); // 2 = "● " preview width
@@ -2344,6 +2345,7 @@ fn cluster_render_medium_or_wide(
     activity: &std::collections::HashMap<String, String>,
     selection: usize,
     tier: ClusterTier,
+    area_w: u16,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let connector = Style::default().fg(Color::Rgb(90, 90, 110));
@@ -2368,15 +2370,34 @@ fn cluster_render_medium_or_wide(
         return lines;
     }
 
-    // Card + block width per tier.
-    let card_w: usize = match tier {
-        ClusterTier::Wide => 22,
-        _                 => 26,
-    };
     let pair_gap: usize = 8;       // " ──pair── "
     let group_gap: usize = 4;      // between pair-blocks within a row
-    let main_w: usize = 48;
     let children_indent: usize = 2;
+    let right_margin: usize = 2;
+
+    // Card width fills the available width. Total used per row:
+    //   indent + N_blocks * (2*card_w + pair_gap)
+    //         + (N_blocks - 1) * group_gap + right_margin
+    // Solve for card_w. Floor at 22 so even very narrow MEDIUMs (70)
+    // still fit "humanizer-a" + dot + borders.
+    let aw = area_w as usize;
+    let card_w: usize = {
+        let n = pair_blocks_per_row;
+        let fixed = children_indent
+                  + n * pair_gap
+                  + n.saturating_sub(1) * group_gap
+                  + right_margin;
+        let avail = aw.saturating_sub(fixed);
+        (avail / (2 * n)).max(22)
+    };
+
+    // MAIN box width also expands — but capped so it doesn't dwarf the
+    // children. Set it to children_total_w / 2 (rounded), bounded
+    // [44, 96]. Visually anchors MAIN as the "parent" without being
+    // wider than the children's row.
+    let children_total_w = pair_blocks_per_row * (2 * card_w + pair_gap)
+        + pair_blocks_per_row.saturating_sub(1) * group_gap;
+    let main_w: usize = (children_total_w / 2).clamp(44, 96);
 
     // Compute first-row pair-block centers given children_indent. Used
     // for MAIN alignment and the fan-out connector.
@@ -2413,10 +2434,11 @@ fn cluster_render_medium_or_wide(
     let main_indent: usize = children_center.saturating_sub((main_w.saturating_sub(1)) / 2);
     let main_center: usize = main_indent + (main_w.saturating_sub(1)) / 2;
 
-    // MAIN card (existing helper, full-width) at the computed indent.
+    // MAIN card (parameterized width) at the computed indent.
     let main_selected = selection == 0;
-    let main_card = build_main_box(main_name, main_status, main_persona, main_mem,
-                                   main_up, main_task, main_pending, main_selected);
+    let main_card = build_main_box_w(main_name, main_status, main_persona, main_mem,
+                                     main_up, main_task, main_pending, main_selected,
+                                     main_w.saturating_sub(2));
     for cl in main_card {
         lines.push(prefix_line(&cl, main_indent));
     }
@@ -2653,11 +2675,11 @@ fn cluster_lines_responsive(
         ClusterTier::Tiny => cluster_render_tiny(
             &main_name, main_active, &peers, &peer_names, &activity, selection),
         ClusterTier::Narrow => cluster_render_narrow(
-            &main_name, main_active, &peers, &peer_names, &activity, selection),
+            &main_name, main_active, &peers, &peer_names, &activity, selection, area_w),
         ClusterTier::Medium | ClusterTier::Wide => cluster_render_medium_or_wide(
             &main_name, &main_status, &main_persona, &main_mem,
             &main_up, &main_task, &main_pending, main_active,
-            &peers, &peer_names, &activity, selection, tier),
+            &peers, &peer_names, &activity, selection, tier, area_w),
     }
 }
 
@@ -3308,7 +3330,14 @@ fn build_main_box(
     name: &str, status: &str, persona: &str, mem: &str,
     up: &str, task: &str, pending: &str, selected: bool,
 ) -> Vec<Line<'static>> {
-    let inner = 46;
+    build_main_box_w(name, status, persona, mem, up, task, pending, selected, 46)
+}
+
+fn build_main_box_w(
+    name: &str, status: &str, persona: &str, mem: &str,
+    up: &str, task: &str, pending: &str, selected: bool,
+    inner: usize,
+) -> Vec<Line<'static>> {
     let border_color = if selected { Color::Cyan } else { Color::DarkGray };
     let border_mod = if selected { Modifier::BOLD } else { Modifier::empty() };
     let bs = Style::default().fg(border_color).add_modifier(border_mod);
@@ -3336,7 +3365,9 @@ fn build_main_box(
     let name_s = pad_to(name, 18);
     let up_s = fmt_duration(up);
 
-    let l1_used = 3 + 18 + 3 + up_s.chars().count();
+    // " ● " = 3, name padded to 18, " up=" = 4 (was 3 — that's the
+    // off-by-one that broke the right border).
+    let l1_used = 3 + 18 + 4 + up_s.chars().count();
     let line1 = row(vec![
         dot_span,
         Span::styled(name_s, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
