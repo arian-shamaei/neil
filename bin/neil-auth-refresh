@@ -1,49 +1,197 @@
-#!/bin/bash
-# neil-auth-refresh — periodic forced refresh of Claude OAuth access token.
-#
-# The Claude SDK auto-refreshes its access token whenever it makes a
-# successful API call, so as long as SOMETHING runs an agent invocation
-# before the access token's ~1h TTL elapses, the refresh-token chain
-# stays alive indefinitely. neil-creds-sync then propagates the refreshed
-# token to every peer.
-#
-# This script just fires a minimal-cost agent invocation (1 turn, tiny
-# prompt) every ~30 minutes via cron. If main is otherwise idle for
-# hours, this keeps the cluster authenticated without any other beats.
-#
-# If this script ever returns rc!=0 with an authentication_error in the
-# captured output, the refresh token itself is expired — that requires a
-# human to run an interactive 'claude login' on the server.
-set -u
-NEIL_HOME=${NEIL_HOME:-$HOME/.neil}
-LOG=$NEIL_HOME/logs/auth_refresh.log
-CREDS=$HOME/.claude/.credentials.json
-mkdir -p $NEIL_HOME/logs
+#!/usr/bin/env python3
+"""
+neil-auth-refresh — proactively redeem Claude.ai OAuth refresh tokens.
 
-ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-log() { printf '[%s] %s\n' "$(ts)" "$*" >> "$LOG"; }
+The Claude Code subscription auth ('claudeAiOauth' in
+~/.claude/.credentials.json) uses single-use rotating refresh tokens.
+Each successful refresh:
+  1. issues a new access_token
+  2. issues a NEW refresh_token (old one is invalidated server-side)
+  3. extends expires_at
 
-[ -f "$CREDS" ] || { log 'no credentials file; skip'; exit 0; }
+If we don't redeem the refresh token before the access token expires AND
+before the refresh token's own rotation window closes (~12-24h), the
+chain breaks and the user must re-login interactively.
 
-PRE_MTIME=$(stat -c '%Y' "$CREDS" 2>/dev/null || echo 0)
+This script:
+  - reads ~/.claude/.credentials.json
+  - POSTs to https://platform.claude.com/v1/oauth/token with the
+    documented Claude Code client_id (extracted from the bundled CLI:
+    9d1c250a-e61b-44d9-88ed-5944d1962f5e)
+  - on 200, atomically writes the refreshed access_token + refresh_token
+    + expires_at back to credentials.json
+  - on 4xx, logs the error verbatim and exits non-zero
 
-# Minimal cost: 1 turn, no tools used, agent just echoes back.
-OUT=$(NEIL_HOME=$NEIL_HOME NEIL_MAX_TURNS=1 timeout 30     $NEIL_HOME/tools/autoPrompter/agent/.venv/bin/python     $NEIL_HOME/tools/autoPrompter/agent/neil_agent.py     --system-prompt 'Respond with exactly: ok'     -p 'ping' 2>&1)
-RC=$?
+Idempotent: a flock around the whole operation prevents concurrent
+refreshes from racing each other (one would invalidate the other's
+fresh refresh_token via rotation).
 
-POST_MTIME=$(stat -c '%Y' "$CREDS" 2>/dev/null || echo 0)
-DELTA=$((POST_MTIME - PRE_MTIME))
+Run frequency: every 30 min via cron. Access tokens have ~4h TTL;
+refreshing every 30 min keeps the chain alive with plenty of buffer.
 
-# Anchor the auth-failure detection so benign output mentioning '401'
-# (e.g. agent prose, log echoes) doesn't trip a false reauth-required.
-if echo "$OUT" | grep -qE '"(authentication_error|invalid_grant)"|HTTP/[0-9.]+ 401'; then
-    log "FAIL auth (rc=$RC) — refresh token may be expired; needs interactive 'claude' login"
-    exit 1
-fi
+Endpoints + client_id reverse-engineered from the bundled CLI inside
+claude-agent-sdk v0.1.63: ~/.neil/tools/autoPrompter/agent/.venv/lib/
+python3.12/site-packages/claude_agent_sdk/_bundled/claude
+(BASE_API_URL constants block; visible via `strings`).
+"""
+import fcntl
+import json
+import os
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
 
-if [ "$DELTA" -gt 0 ]; then
-    log "refresh wrote new token (rc=$RC, mtime+$DELTA s)"
-else
-    log "ping ok, token unchanged (rc=$RC, still within TTL)"
-fi
-exit $RC
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+TIMEOUT_S = 20
+
+NEIL_HOME = Path(os.environ.get("NEIL_HOME", str(Path.home() / ".neil")))
+CREDS_PATH = Path(os.environ.get("CLAUDE_CREDS",
+                                  str(Path.home() / ".claude" / ".credentials.json")))
+LOCK_PATH = CREDS_PATH.parent / ".credentials.lock"
+LOG_PATH = NEIL_HOME / "logs" / "auth_refresh.log"
+
+# Refresh if access token expires within this many seconds. Access tokens
+# typically have ~4h TTL; refreshing when <2h remain gives plenty of
+# buffer and exercises the refresh chain often enough that the rotation
+# token doesn't go stale.
+REFRESH_WHEN_REMAINING_S = 7200
+
+
+def ts() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def log(msg: str) -> None:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOG_PATH.open("a") as f:
+        f.write(f"[{ts()}] {msg}\n")
+
+
+def atomic_write_json(path: Path, data: dict) -> None:
+    """Write JSON via temp file + rename. Preserves the file's existing
+    mode (0600 for credentials)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = 0o600
+    if path.exists():
+        mode = path.stat().st_mode & 0o777
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent),
+                                    prefix=path.name + ".",
+                                    suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except Exception:
+        # Clean up on any failure so we don't leave half-written tempfiles.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def refresh_once() -> int:
+    if not CREDS_PATH.exists():
+        log(f"FAIL no credentials file at {CREDS_PATH}")
+        return 2
+
+    with open(CREDS_PATH) as f:
+        creds = json.load(f)
+    oa = creds.get("claudeAiOauth")
+    if not oa or not oa.get("refreshToken"):
+        log("FAIL credentials missing claudeAiOauth.refreshToken")
+        return 3
+
+    expires_at_ms = oa.get("expiresAt", 0)
+    now_ms = int(time.time() * 1000)
+    remaining_s = (expires_at_ms - now_ms) / 1000.0
+
+    # Skip if access token still has plenty of life. Avoids wasting
+    # refresh-token rotations when no refresh is needed.
+    if remaining_s > REFRESH_WHEN_REMAINING_S:
+        log(f"skip — access token has {remaining_s:.0f}s remaining "
+            f"(threshold {REFRESH_WHEN_REMAINING_S}s)")
+        return 0
+
+    # Build refresh request. Endpoint accepts JSON only (form-encoded
+    # gets a Cloudflare 403, confirmed empirically).
+    body = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": oa["refreshToken"],
+        "client_id": CLIENT_ID,
+    }).encode()
+
+    req = urllib.request.Request(
+        TOKEN_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "neil-auth-refresh/1",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT_S) as r:
+            resp = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        body_txt = e.read().decode(errors="replace")[:400]
+        log(f"FAIL HTTP {e.code} {body_txt} — refresh token may be "
+            f"invalidated; needs interactive re-login")
+        return 1
+    except Exception as e:
+        log(f"FAIL network/transport: {type(e).__name__}: {e}")
+        return 4
+
+    # Extract returned tokens. OAuth2 standard fields, optionally with
+    # token rotation. If new refresh_token is missing, keep the old one.
+    new_access = resp.get("access_token")
+    new_refresh = resp.get("refresh_token") or oa["refreshToken"]
+    expires_in = resp.get("expires_in")
+    if not new_access or expires_in is None:
+        log(f"FAIL malformed response (no access_token or expires_in): "
+            f"{json.dumps(resp)[:200]}")
+        return 5
+
+    # Mutate the credentials structure in place so we preserve any
+    # extra fields claude-agent-sdk added (scopes, subscriptionType,
+    # rateLimitTier, etc.)
+    new_expires_at = int(time.time() * 1000) + int(expires_in) * 1000
+    rotated = (new_refresh != oa["refreshToken"])
+    oa["accessToken"] = new_access
+    oa["refreshToken"] = new_refresh
+    oa["expiresAt"] = new_expires_at
+    creds["claudeAiOauth"] = oa
+
+    atomic_write_json(CREDS_PATH, creds)
+    log(f"OK refreshed (rotated_refresh_token={rotated}, "
+        f"new_expires_in={int(expires_in)}s)")
+    return 0
+
+
+def main() -> int:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    # Serialize via flock — prevents two cron runs (or a cron run + a
+    # manual invocation) from racing and invalidating each other's
+    # fresh refresh tokens.
+    with open(LOCK_PATH, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log("skip — another refresh is already in flight")
+            return 0
+        return refresh_once()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
