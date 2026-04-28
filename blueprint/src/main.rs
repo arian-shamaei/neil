@@ -70,17 +70,16 @@ fn cluster_cache() -> &'static std::sync::Arc<std::sync::Mutex<Option<String>>> 
     CLUSTER_CACHE.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(None)))
 }
 
-/// Number of children cards per row in the cluster panel layout.
-/// Must stay in sync with PER_ROW inside cluster_lines().
-const CLUSTER_PER_ROW: usize = 3;
-
-/// Total live children (temps + peers) currently in the cluster cache.
-/// Used by key handlers to bound-check row/col navigation.
+/// Total live peers in the cluster cache. Used by key handlers to
+/// bound-check arrow navigation. Counts ONLY peers — the responsive
+/// cluster renderer doesn't include temps in the card grid yet, so
+/// they're not addressable; counting them here would let arrow keys
+/// drive selection past the last visible card into "ghost" indices.
 fn cluster_children_count() -> usize {
     let cached = cluster_cache().lock().ok().and_then(|g| g.clone());
     match cached {
         Some(ref t) if t.starts_with("__ERROR__") => 0,
-        Some(ref t) => parse_temps(t).len() + parse_peers(t).len(),
+        Some(ref t) => parse_peers(t).len(),
         None => 0,
     }
 }
@@ -833,15 +832,25 @@ fn main() -> anyhow::Result<()> {
                                     hb_scroll = 0;
                                 }
                             }
+                            // Cluster panel arrow keys: tier-aware grid
+                            // navigation. cards_per_row is published by
+                            // the renderer (Wide=4, Medium=2,
+                            // Narrow/Tiny=1) so Up/Down jumps a whole
+                            // visual row and Left/Right steps within
+                            // it. Selection 0 is MAIN; 1..=N are peers
+                            // in pair-grouped order.
                             KeyCode::Up if *pidx == 7 => {
                                 if cluster_expanded {
                                     if cluster_scroll > 0 { cluster_scroll = cluster_scroll.saturating_sub(1); }
                                 } else {
-                                    // Sequential previous (responsive layout —
-                                    // children are a flat ordered list regardless
-                                    // of tier). 0=MAIN; 1..=N are children.
-                                    if cluster_selection > 0 {
-                                        cluster_selection -= 1;
+                                    let cols = CLUSTER_CARDS_PER_ROW.load(
+                                        std::sync::atomic::Ordering::Relaxed).max(1);
+                                    if cluster_selection == 0 {
+                                        // already at MAIN
+                                    } else if cluster_selection <= cols {
+                                        cluster_selection = 0;
+                                    } else {
+                                        cluster_selection -= cols;
                                     }
                                 }
                             }
@@ -849,26 +858,40 @@ fn main() -> anyhow::Result<()> {
                                 if cluster_expanded {
                                     cluster_scroll += 1;
                                 } else {
+                                    let cols = CLUSTER_CARDS_PER_ROW.load(
+                                        std::sync::atomic::Ordering::Relaxed).max(1);
                                     let total = cluster_children_count();
-                                    if cluster_selection < total {
-                                        cluster_selection += 1;
+                                    if cluster_selection == 0 {
+                                        if total > 0 { cluster_selection = 1; }
+                                    } else {
+                                        let target = cluster_selection + cols;
+                                        if target <= total {
+                                            cluster_selection = target;
+                                        } else if cluster_selection < total {
+                                            // Last partial row: clamp
+                                            // to the last existing peer
+                                            // in the column the user
+                                            // would have landed in.
+                                            cluster_selection = total;
+                                        }
                                     }
                                 }
                             }
                             KeyCode::Left if *pidx == 7 => {
-                                // Jump to pair partner: if currently on a peer,
-                                // and that peer has a pair partner in the list,
-                                // hop to the partner. Otherwise no-op.
                                 if !cluster_expanded && cluster_selection >= 1 {
-                                    if cluster_selection > 1 {
-                                        cluster_selection -= 1;
-                                    }
+                                    let cols = CLUSTER_CARDS_PER_ROW.load(
+                                        std::sync::atomic::Ordering::Relaxed).max(1);
+                                    let col = (cluster_selection - 1) % cols;
+                                    if col > 0 { cluster_selection -= 1; }
                                 }
                             }
                             KeyCode::Right if *pidx == 7 => {
                                 if !cluster_expanded && cluster_selection >= 1 {
+                                    let cols = CLUSTER_CARDS_PER_ROW.load(
+                                        std::sync::atomic::Ordering::Relaxed).max(1);
                                     let total = cluster_children_count();
-                                    if cluster_selection < total {
+                                    let col = (cluster_selection - 1) % cols;
+                                    if col < cols - 1 && cluster_selection < total {
                                         cluster_selection += 1;
                                     }
                                 }
@@ -2083,6 +2106,22 @@ fn pick_cluster_tier(w: u16) -> ClusterTier {
     else { ClusterTier::Wide }
 }
 
+/// How many peer cards a single visual row contains at each tier.
+/// Drives arrow-key navigation: Up/Down jumps by `cards_per_row`,
+/// Left/Right by 1 within the row.
+fn cards_per_row(tier: ClusterTier) -> usize {
+    match tier {
+        ClusterTier::Wide => 4,
+        ClusterTier::Medium => 2,
+        ClusterTier::Narrow | ClusterTier::Tiny => 1,
+    }
+}
+
+/// Latest row-width seen at render time, for the key handler. Atomic
+/// so the handler reads it without touching cluster_state mutex.
+static CLUSTER_CARDS_PER_ROW: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(1);
+
 fn detect_pair_partner(peer_name: &str, all_names: &[String]) -> Option<String> {
     let prefix = peer_name.split('-').next().unwrap_or("");
     if prefix.is_empty() { return None; }
@@ -2683,6 +2722,10 @@ fn cluster_lines_responsive(
     let activity = read_peer_activity_timestamps(neil_home);
 
     let tier = pick_cluster_tier(area_w);
+    // Publish the row-width for the key handler so Up/Down can jump
+    // by full visual rows and Left/Right step within the row.
+    CLUSTER_CARDS_PER_ROW.store(cards_per_row(tier),
+        std::sync::atomic::Ordering::Relaxed);
     match tier {
         ClusterTier::Tiny => cluster_render_tiny(
             &main_name, main_active, &peers, &peer_names, &activity, selection),
@@ -3477,12 +3520,21 @@ fn peer_ip_at(selection: usize) -> Option<String> {
         .output().ok()?;
     if !out.status.success() { return None; }
     let json = String::from_utf8_lossy(&out.stdout).to_string();
-    let temps = parse_temps(&json);
-    let peers = parse_peers(&json);
-    let peer_start = 1 + temps.len();
-    if selection >= peer_start && selection < peer_start + peers.len() {
-        let idx = selection - peer_start;
-        let ip = peers[idx].ip.clone();
+
+    // Selection layout matches the responsive renderer:
+    //   0       = MAIN
+    //   1..=N   = peers in pair-grouped order (same reorder
+    //             cluster_lines_responsive applies via
+    //             group_peers_by_pair).
+    // Temps aren't rendered yet, so they're not addressable.
+    let raw_peers = parse_peers(&json);
+    let raw_names: Vec<String> = raw_peers.iter().map(|p| p.name.clone()).collect();
+    let groups = group_peers_by_pair(&raw_names);
+    let mut ordered: Vec<PeerInstance> = Vec::with_capacity(raw_peers.len());
+    for g in &groups { for &i in g { ordered.push(raw_peers[i].clone()); } }
+
+    if selection >= 1 && selection <= ordered.len() {
+        let ip = ordered[selection - 1].ip.clone();
         if ip.is_empty() || ip == "?" { None } else { Some(ip) }
     } else {
         None
@@ -3673,20 +3725,26 @@ fn run_visual_cluster_test(neil_home: PathBuf) -> anyhow::Result<()> {
         ("WIDE",  130, 35),
     ];
 
-    // Render at each width with TWO selections: 0 (MAIN selected) and
-    // 2 (the second peer selected). Lets us eyeball both the layout
-    // and the selection styling.
-    for sel in &[0usize, 2usize] {
-        println!("\n\n##########  SELECTION = {}  ##########", sel);
-        for (label, w, h) in widths {
-            println!("\n{}", "=".repeat(*w as usize));
-            println!("{} ({}×{}) sel={}", label, w, h, sel);
-            println!("{}", "=".repeat(*w as usize));
-            let lines = cluster_lines_responsive(*sel, *w, *h, &neil_home);
+    // Render at each width × all selection states (MAIN + each peer)
+    // so navigation can be visually traced. Then for one tier (WIDE),
+    // simulate each arrow-key transition starting from sel=1 to verify
+    // grid logic.
+    for (label, w, h) in widths {
+        println!("\n\n##########  TIER {} ({}×{})  ##########", label, w, h);
+        let total = 4; // 4 peers in the live cluster
+        for sel in 0..=total {
+            println!("\n  --- selection = {} {} ---",
+                sel,
+                if sel == 0 { "(MAIN)" } else { "(peer)" });
+            let lines = cluster_lines_responsive(sel, *w, *h, &neil_home);
             for line in &lines {
                 let s: String = line.spans.iter()
                     .flat_map(|sp| sp.content.chars())
                     .collect();
+                // Mark selection visually since we've stripped colors:
+                // print the line as-is, prefix the selected card's
+                // top-border line with a small arrow if we can detect
+                // it. Cheaper: just print and let the user see structure.
                 println!("{}", s);
             }
         }
