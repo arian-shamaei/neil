@@ -2238,11 +2238,12 @@ fn cluster_render_narrow(
         Style::default().fg(Color::White)
     };
 
-    // Cards live at indent=4, width=30, so card center is at column 4+15=19.
-    // MAIN bullet should align to the same center.
+    // Cards live at indent=4, width=30. Use (card_w - 1) / 2 so the
+    // computed center column matches where odd-length headers
+    // ("── humanizer pair ──") naturally render after centering.
     let card_indent: usize = 4;
     let card_w: usize = 30;
-    let card_center: usize = card_indent + card_w / 2;
+    let card_center: usize = card_indent + (card_w.saturating_sub(1)) / 2;
 
     let main_pad = card_center.saturating_sub(2); // 2 = "● " preview width
     lines.push(Line::from(vec![
@@ -2354,17 +2355,12 @@ fn cluster_render_medium_or_wide(
         _ => 1,
     };
 
-    // MAIN card (existing helper, full-width)
-    let main_selected = selection == 0;
-    let main_card = build_main_box(main_name, main_status, main_persona, main_mem,
-                                   main_up, main_task, main_pending, main_selected);
-    let indent = "  ";
-    for cl in main_card {
-        lines.push(prefix_line(&cl, indent.len()));
-    }
-
     let groups = group_peers_by_pair(peer_names);
     if groups.is_empty() {
+        // MAIN card with default indent; nothing else to layout.
+        let main_card = build_main_box(main_name, main_status, main_persona, main_mem,
+                                       main_up, main_task, main_pending, selection == 0);
+        for cl in main_card { lines.push(prefix_line(&cl, 2)); }
         lines.push(Line::from(""));
         lines.push(prefix_line(&Line::from(Span::styled(
             "(no live children)".to_string(),
@@ -2379,11 +2375,53 @@ fn cluster_render_medium_or_wide(
     };
     let pair_gap: usize = 8;       // " ──pair── "
     let group_gap: usize = 4;      // between pair-blocks within a row
-    let main_indent: usize = indent.len();
     let main_w: usize = 48;
-    let main_center: usize = main_indent + main_w / 2;
+    let children_indent: usize = 2;
 
-    // Trunk drop from MAIN center down to the children area.
+    // Compute first-row pair-block centers given children_indent. Used
+    // for MAIN alignment and the fan-out connector.
+    let first_chunk: &[Vec<usize>] = groups.chunks(pair_blocks_per_row).next().unwrap();
+    let mut block_widths_row: Vec<usize> = Vec::new();
+    let mut block_centers_row: Vec<usize> = Vec::new();
+    {
+        let mut col = children_indent;
+        for (i, group) in first_chunk.iter().enumerate() {
+            if i > 0 { col += group_gap; }
+            let bw = if group.len() == 2 { card_w * 2 + pair_gap } else { card_w };
+            block_widths_row.push(bw);
+            // Use (bw-1)/2 — same axis the (block_w - label_len)/2
+            // header-centering uses, so the fan-out drop column lands
+            // EXACTLY on the label's center column rather than 1 cell
+            // off (the integer-division asymmetry on even/odd lengths).
+            block_centers_row.push(col + (bw.saturating_sub(1)) / 2);
+            col += bw;
+        }
+    }
+
+    // Position MAIN so its center matches the children "column of
+    // gravity": for one block, the block's center; for two, the
+    // midpoint between block centers.
+    let children_center: usize = if block_centers_row.is_empty() {
+        children_indent + main_w / 2
+    } else if block_centers_row.len() == 1 {
+        block_centers_row[0]
+    } else {
+        let lo = *block_centers_row.first().unwrap();
+        let hi = *block_centers_row.last().unwrap();
+        (lo + hi) / 2
+    };
+    let main_indent: usize = children_center.saturating_sub((main_w.saturating_sub(1)) / 2);
+    let main_center: usize = main_indent + (main_w.saturating_sub(1)) / 2;
+
+    // MAIN card (existing helper, full-width) at the computed indent.
+    let main_selected = selection == 0;
+    let main_card = build_main_box(main_name, main_status, main_persona, main_mem,
+                                   main_up, main_task, main_pending, main_selected);
+    for cl in main_card {
+        lines.push(prefix_line(&cl, main_indent));
+    }
+
+    // Trunk drop from MAIN center.
     {
         let mut s = String::new();
         for _ in 0..main_center { s.push(' '); }
@@ -2391,9 +2429,32 @@ fn cluster_render_medium_or_wide(
         lines.push(Line::from(Span::styled(s, connector)));
     }
 
-    // (Pair-block fan-out for WIDE — i.e. ┌─┴─┐ branching from
-    // main_center to each block's center — is a follow-up polish.
-    // The single trunk drop above is sufficient for clarity.)
+    // Fan-out connector: only needed when first chunk has >1 block
+    // (i.e. WIDE with two pair-blocks). Draws ┌─┴─┐ where ┴ sits at
+    // main_center and ┌/┐ at each block_center.
+    if block_centers_row.len() > 1 {
+        let lo = *block_centers_row.first().unwrap();
+        let hi = *block_centers_row.last().unwrap();
+        let width = hi.max(main_center) + 1;
+        let mut buf: Vec<char> = vec![' '; width];
+        for col in lo..=hi { buf[col] = '─'; }
+        buf[lo] = '┌';
+        buf[hi] = '┐';
+        for c in &block_centers_row[1..block_centers_row.len() - 1] {
+            buf[*c] = '┬';
+        }
+        if main_center >= lo && main_center <= hi {
+            buf[main_center] = if block_centers_row.contains(&main_center) { '┼' } else { '┴' };
+        }
+        lines.push(Line::from(Span::styled(
+            buf.into_iter().collect::<String>(), connector)));
+        // Drop lines from each block_center down to the cards
+        let drop_w = hi + 1;
+        let mut drop = vec![' '; drop_w];
+        for c in &block_centers_row { drop[*c] = '│'; }
+        lines.push(Line::from(Span::styled(
+            drop.into_iter().collect::<String>(), connector)));
+    }
 
     // Render groups in chunks of pair_blocks_per_row.
     // Each block renders to a fixed width = block_w so horizontal
@@ -2467,7 +2528,7 @@ fn cluster_render_medium_or_wide(
         // to their full block_w on rows beyond their content.
         let block_h = block_lines.iter().map(|b| b.len()).max().unwrap_or(0);
         for li in 0..block_h {
-            let mut spans: Vec<Span<'static>> = vec![Span::raw("  ".to_string())];
+            let mut spans: Vec<Span<'static>> = vec![Span::raw(" ".repeat(children_indent))];
             for (i, block) in block_lines.iter().enumerate() {
                 if i > 0 { spans.push(Span::raw(" ".repeat(group_gap))); }
                 if li < block.len() {
