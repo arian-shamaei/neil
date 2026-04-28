@@ -579,8 +579,10 @@ static int cmd_find(int argc, char **argv) {
             *tab = '\0';
             char *tag = strip(line);
             char *id = strip(tab + 1);
-            if (strcmp(tag, query) == 0 && note_in_scope(id, wing_filter, room_filter))
+            if (strcmp(tag, query) == 0 && note_in_scope(id, wing_filter, room_filter)) {
                 printf("%s\n", id);
+                log_note_access(id, "find");
+            }
         }
         fclose(f);
         return 0;
@@ -619,6 +621,7 @@ static int cmd_find(int argc, char **argv) {
                         preview[0] = '\0';
                     }
                     printf("%s  %s\n", id, preview);
+                    log_note_access(id, "find");
                     free_note(&n);
                 }
             }
@@ -668,6 +671,7 @@ static int cmd_graph(int argc, char **argv) {
             if (nl) *nl = '\0';
         }
         printf("%s%s  %s\n", cur.depth == 0 ? "" : "-> ", n.id, preview);
+        log_note_access(n.id, "graph");
 
         /* enqueue links if within depth */
         if (cur.depth < depth) {

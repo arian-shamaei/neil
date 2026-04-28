@@ -97,33 +97,56 @@ fn main() {
         eprintln!("FAIL: no note files in palace, can't test access flash");
         std::process::exit(4);
     };
-    println!("triggering: zettel show {}", target_id);
+    // Trigger one WRITE (zettel new) and one READ (zettel show) in
+    // sequence. Two distinct fresh accesses; render should produce
+    // both red and green cells.
+    println!("triggering: zettel new \"smoke-write-{}\"", target_id);
+    let _ = std::process::Command::new(&zettel_bin)
+        .arg("new").arg(&format!("smoke-test-write {}", std::process::id()))
+        .env("ZETTEL_HOME", &palace_dir)
+        .output();
+    println!("triggering: zettel show {} (read)", target_id);
     let _ = std::process::Command::new(&zettel_bin)
         .arg("show").arg(&target_id)
         .env("ZETTEL_HOME", &palace_dir)
         .output();
-    // Watcher polls every 250ms — give it 600ms to catch up.
-    std::thread::sleep(Duration::from_millis(600));
+    // Watcher polls every 250ms — give it ~700ms for both events.
+    std::thread::sleep(Duration::from_millis(700));
 
-    // Render once with flash live.
+    // Trigger one extra render so the watcher's id (smoke-write) — a
+    // brand-new note that wasn't in the graph at startup — gets picked
+    // up. We need to also force a graph rebuild. The easiest way:
+    // request a rebuild by reseeding (which re-runs zettel list --json
+    // implicitly via cache version bump on next refresher pass — but
+    // refresher only runs every 30s). Skip the smoke-write check —
+    // even without rebuild, the existing target_id WAS read so its
+    // green flash is enough proof of the read path.
     let flashed_lines = graph::render_lines(w, h);
 
-    // Count red-flash cells: R > 200, G < 100, B < 100.
+    // Count cells by gradient channel.
     let mut red_cells = 0usize;
+    let mut green_cells = 0usize;
     for line in &flashed_lines {
         for span in &line.spans {
-            if let Some(fg) = span.style.fg {
-                if let ratatui::style::Color::Rgb(r, g, b) = fg {
-                    if r > 200 && g < 100 && b < 100 {
-                        red_cells += span.content.chars().count();
-                    }
+            if let Some(ratatui::style::Color::Rgb(r, g, b)) = span.style.fg {
+                if r > 200 && g < 100 && b < 100 {
+                    red_cells += span.content.chars().count();
+                }
+                // Read-flash green: G dominant, R lower, B moderate.
+                if g > 200 && r < 120 && b < 140 {
+                    green_cells += span.content.chars().count();
                 }
             }
         }
     }
-    println!("red_flash_cells = {}", red_cells);
-    if red_cells == 0 {
-        eprintln!("FAIL: no red-flashed cells found after zettel show");
+    println!("red_write_flash_cells  = {}", red_cells);
+    println!("green_read_flash_cells = {}", green_cells);
+    // The new note isn't in the loaded graph yet (cache refreshes every
+    // 30s) — its id won't match any rendered node, so its flash won't
+    // appear. The READ is on an existing note (target_id) so green is
+    // visible. Assert green ≥ 1; red is best-effort.
+    if green_cells == 0 {
+        eprintln!("FAIL: no green-flashed cells — read color path not active");
         std::process::exit(5);
     }
 
@@ -149,8 +172,9 @@ fn main() {
     }
     println!("flash_mode_after_3.5s_decay = {} red cells (expect 0)", still_flashing);
 
-    // Toggle trail and render. The previously-flashed node should
-    // re-appear with a fade color (orange/amber: R 180-220, G 90-150).
+    // Toggle trail and render. The previously-flashed READ should
+    // re-appear with a fade color in the green-teal band (the read
+    // gradient at ~4s elapsed: roughly R 90, G 215, B 130).
     let new = graph::toggle_trail();
     println!("trail_enabled now = {}", new);
     let trail_view = graph::render_lines(w, h);
@@ -158,16 +182,16 @@ fn main() {
     for line in &trail_view {
         for span in &line.spans {
             if let Some(ratatui::style::Color::Rgb(r, g, b)) = span.style.fg {
-                // Mid-trail color: warm but not bright red.
-                if r > 180 && r <= 230 && g >= 80 && g <= 160 && b < 130 {
+                // Read-trail green-teal: G dominant, R low/moderate.
+                if g > 180 && r < 140 && b > 90 && b < 180 {
                     trail_cells += span.content.chars().count();
                 }
             }
         }
     }
-    println!("trail_mode_warm_cells = {} (expect ≥1)", trail_cells);
+    println!("trail_mode_aged_read_cells = {} (expect ≥1)", trail_cells);
     if trail_cells == 0 {
-        eprintln!("FAIL: trail mode shows no warm-colored aged accesses");
+        eprintln!("FAIL: trail mode shows no aged-read cells");
         std::process::exit(6);
     }
 

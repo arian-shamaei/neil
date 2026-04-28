@@ -81,12 +81,21 @@ pub struct GraphState {
 static GRAPH_STATE: OnceLock<Arc<Mutex<GraphState>>> = OnceLock::new();
 static GRAPH_CACHE: OnceLock<Arc<Mutex<(u64, Option<String>)>>> = OnceLock::new();
 
-/// Per-note Instant of most recent access. Populated by the access
-/// watcher thread reading `$ZETTEL_HOME/.access.jsonl`. The render
-/// thread reads this map to compute flash intensity per node. Keyed by
-/// note id so the map survives graph rebuilds (new notes auto-pick up
-/// flashes; deleted notes leave dead entries that decay naturally).
-static ACCESS_TIMES: OnceLock<Arc<Mutex<HashMap<String, Instant>>>> = OnceLock::new();
+/// Read vs write distinction for the access flash. Writes (new note,
+/// new link) render in red; reads (show / find / graph) render in
+/// green. The two channels make it visually obvious whether Neil is
+/// *modifying* memory or *recalling* it — a much higher-information
+/// view than a single-color flash.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AccessKind { Read, Write }
+
+/// Per-note (Instant, kind) of most recent access. Populated by the
+/// access watcher thread reading `$ZETTEL_HOME/.access.jsonl`. The
+/// render thread reads this map to compute flash intensity AND color
+/// per node. Keyed by note id so the map survives graph rebuilds (new
+/// notes auto-pick up flashes; deleted notes leave dead entries that
+/// decay naturally). Newer access wins regardless of kind.
+static ACCESS_TIMES: OnceLock<Arc<Mutex<HashMap<String, (Instant, AccessKind)>>>> = OnceLock::new();
 
 /// Decay window after a `zettel show`/`new`/`link` event in flash mode.
 /// The node renders red at access, lerps back to its wing color over
@@ -123,8 +132,17 @@ fn graph_cache() -> &'static Arc<Mutex<(u64, Option<String>)>> {
     GRAPH_CACHE.get_or_init(|| Arc::new(Mutex::new((0, None))))
 }
 
-fn access_times() -> &'static Arc<Mutex<HashMap<String, Instant>>> {
+fn access_times() -> &'static Arc<Mutex<HashMap<String, (Instant, AccessKind)>>> {
     ACCESS_TIMES.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+}
+
+/// Map an access event's `op` field to read/write category. Writes
+/// modify the palace; reads just look at it.
+fn kind_for_op(op: &str) -> AccessKind {
+    match op {
+        "new" | "link" => AccessKind::Write,
+        _              => AccessKind::Read,
+    }
 }
 
 /// Spawn a thread that re-runs `zettel list --json` every 30 s and stores
@@ -209,7 +227,8 @@ pub fn spawn_access_watcher(neil_home: PathBuf) {
                 for line in buf.lines() {
                     if line.trim().is_empty() { continue; }
                     if let Ok(ev) = serde_json::from_str::<AccessEvent>(line) {
-                        m.insert(ev.id, now);
+                        let kind = kind_for_op(&ev.op);
+                        m.insert(ev.id, (now, kind));
                     }
                 }
             }
@@ -646,19 +665,37 @@ pub fn toggle_trail() -> bool {
 }
 
 /// Piecewise-linear color gradient over elapsed time since access.
-/// Stops chosen so flash mode (3 s window) shows only the bright-red
-/// segment, while trail mode (60 s window) walks through red → orange →
-/// amber → faded. Returns (r, g, b).
-fn flash_color(elapsed_s: f32) -> (u8, u8, u8) {
-    // (t_seconds, r, g, b)
-    const STOPS: &[(f32, f32, f32, f32)] = &[
-        ( 0.0, 255.0,  60.0,  60.0),  // bright red — just accessed
-        ( 3.0, 220.0,  90.0,  90.0),  // end of flash, still distinctly red
+/// Two channels:
+///
+///   AccessKind::Write  → red gradient   (255,60,60) → faded amber
+///                        signals "Neil is *modifying* memory"
+///   AccessKind::Read   → green gradient (60,255,90) → faded teal
+///                        signals "Neil is *recalling* memory"
+///
+/// Stops chosen so flash mode (3 s window) shows only the bright-color
+/// segment; trail mode (60 s window) walks through the full fade.
+fn flash_color(elapsed_s: f32, kind: AccessKind) -> (u8, u8, u8) {
+    // Each kind has its own (t_seconds, r, g, b) stop list. Stops are
+    // mirror-images of each other — same brightness curve, hue swap.
+    const WRITE: &[(f32, f32, f32, f32)] = &[
+        ( 0.0, 255.0,  60.0,  60.0),  // bright red — just written
+        ( 3.0, 220.0,  90.0,  90.0),  // end of flash
         (10.0, 210.0, 130.0,  70.0),  // red-orange
         (25.0, 180.0, 150.0,  90.0),  // amber
-        (60.0, 140.0, 140.0, 110.0),  // faded — close to wing color
+        (60.0, 140.0, 140.0, 110.0),  // faded
     ];
-    for w in STOPS.windows(2) {
+    const READ: &[(f32, f32, f32, f32)] = &[
+        ( 0.0,  60.0, 255.0,  90.0),  // bright green — just read
+        ( 3.0,  90.0, 220.0, 110.0),  // end of flash
+        (10.0,  90.0, 210.0, 150.0),  // green-teal
+        (25.0, 110.0, 180.0, 160.0),  // teal
+        (60.0, 130.0, 150.0, 140.0),  // faded
+    ];
+    let stops: &[(f32, f32, f32, f32)] = match kind {
+        AccessKind::Write => WRITE,
+        AccessKind::Read  => READ,
+    };
+    for w in stops.windows(2) {
         if elapsed_s <= w[1].0 {
             let (t0, r0, g0, b0) = w[0];
             let (t1, r1, g1, b1) = w[1];
@@ -671,7 +708,10 @@ fn flash_color(elapsed_s: f32) -> (u8, u8, u8) {
         }
     }
     // Past the last stop — caller should have already filtered by window.
-    (140, 140, 110)
+    match kind {
+        AccessKind::Write => (140, 140, 110),
+        AccessKind::Read  => (130, 150, 140),
+    }
 }
 
 /// Re-randomize all node positions from a fresh seed. Useful when
@@ -955,7 +995,7 @@ pub fn render_lines(area_w: u16, area_h: u16) -> Vec<Line<'static>> {
     // and read with no harm — we just miss this frame's flash, catch it
     // next.
     let now = Instant::now();
-    let access_snap: HashMap<String, Instant> = match access_times().lock() {
+    let access_snap: HashMap<String, (Instant, AccessKind)> = match access_times().lock() {
         Ok(m) => m.clone(),
         Err(_) => HashMap::new(),
     };
@@ -974,16 +1014,13 @@ pub fn render_lines(area_w: u16, area_h: u16) -> Vec<Line<'static>> {
     order.sort_by_key(|&i| {
         let nd = &state.nodes[i];
         // Sort tuple (in ascending paint order):
-        //   (-1 - elapsed_int) negated so older = lower priority
         // For non-accessed: priority = (0, degree).
-        // For accessed: priority = (1, neg_elapsed_int, degree).
-        // We use a single i64 so the sort is total.
+        // For accessed: priority = (1+rescaled-recency, degree).
+        // Single i64 so the sort is total.
         let access_priority: i64 = match access_snap.get(&nd.id) {
-            Some(t) => {
+            Some((t, _)) => {
                 let elapsed = now.duration_since(*t).as_secs_f32();
                 if elapsed < window {
-                    // Range: 1_000_000 (just-accessed) .. 0 (window edge).
-                    // Adding 1 so it's strictly > 0.
                     1 + ((1.0 - elapsed / window) * 1_000_000.0) as i64
                 } else { 0 }
             }
@@ -999,18 +1036,21 @@ pub fn render_lines(area_w: u16, area_h: u16) -> Vec<Line<'static>> {
         let intensity = if max_degree == 0 { 0.0 }
                         else { nd.degree as f32 / max_degree as f32 };
 
-        // Time since last access (∞ if never).
-        let elapsed_s = access_snap.get(&nd.id)
-            .map(|t| now.duration_since(*t).as_secs_f32())
+        // Time since last access (∞ if never), and access kind.
+        let access_info = access_snap.get(&nd.id).copied();
+        let elapsed_s = access_info
+            .map(|(t, _)| now.duration_since(t).as_secs_f32())
             .unwrap_or(f32::INFINITY);
 
         if elapsed_s < window {
-            // Accessed within visibility window — apply the gradient.
-            // Color comes from absolute time-since-access (so a 4s-old
-            // node looks the same in both modes); glyph and bold are
-            // also driven by absolute elapsed so trail mode degrades
-            // visibly: ● bold (≤1.5s) → ● (≤3s) → • (≤20s) → · (≤60s).
-            let (r, g, b) = flash_color(elapsed_s);
+            // Accessed within visibility window — apply the appropriate
+            // gradient (red for write, green for read). Color comes
+            // from absolute time-since-access (so a 4s-old node looks
+            // the same in both modes); glyph and bold are also driven
+            // by absolute elapsed so trail mode degrades visibly:
+            // ● bold (≤1.5s) → ● (≤3s) → • (≤20s) → · (≤60s).
+            let kind = access_info.map(|(_, k)| k).unwrap_or(AccessKind::Read);
+            let (r, g, b) = flash_color(elapsed_s, kind);
             grid[idx].fg = Color::Rgb(r, g, b);
             grid[idx].bold = elapsed_s < 1.5;
             grid[idx].glyph = if elapsed_s < 3.0 { '●' }
