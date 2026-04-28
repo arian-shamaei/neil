@@ -892,6 +892,9 @@ fn main() -> anyhow::Result<()> {
                             KeyCode::Char('m') if *pidx == 8 => {
                                 let _ = crate::panels::graph::toggle_matrix_view();
                             }
+                            KeyCode::Char('h') if *pidx == 8 => {
+                                let _ = crate::panels::graph::toggle_legend();
+                            }
                             KeyCode::Enter if *pidx == 7 => {
                                 // If the selection lands on a peer card, suspend
                                 // the TUI and SSH into that peer (Phase 4 hook).
@@ -1588,7 +1591,9 @@ fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: 
     } else if idx == 7 {
         format!(" {} | Up/Down:select Enter:open Esc:close ", name)
     } else if idx == 8 {
-        if crate::panels::graph::matrix_view_enabled() {
+        if crate::panels::graph::legend_view_enabled() {
+            format!(" {} › color key | h:graph Esc:close ", name)
+        } else if crate::panels::graph::matrix_view_enabled() {
             // Matrix view: surface the strongest cross-wing pair — that's
             // the bridge wings fail to capture, the headline diagnostic
             // for "where Neil's filing taxonomy is wrong".
@@ -1608,7 +1613,7 @@ fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: 
                                else { "wing-anchor" };
             let trail_label = if crate::panels::graph::trail_enabled() { "trail-60s" }
                               else { "flash-3s" };
-            format!(" {} | {} notes · {} links · {} orphans · Q={:.2} · [{} · {}] | s:anchor l:trail m:matrix r:reseed Esc:close ",
+            format!(" {} | {} notes · {} links · {} orphans · Q={:.2} · [{} · {}] | s:anchor l:trail m:matrix h:key r:reseed Esc:close ",
                     name,
                     crate::panels::graph::node_count(),
                     crate::panels::graph::explicit_count(),
@@ -1634,7 +1639,12 @@ fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: 
         6 => render_logs_panel(),
         7 => render_cluster_panel_selectable(state, cluster_sel),
         8 => {
-            if crate::panels::graph::matrix_view_enabled() {
+            // Legend wins over matrix wins over graph; toggling any flag
+            // flips just that one, so if both ever co-exist we deterministic-
+            // ally show the legend.
+            if crate::panels::graph::legend_view_enabled() {
+                crate::panels::graph::render_legend_lines(inner.width, inner.height)
+            } else if crate::panels::graph::matrix_view_enabled() {
                 crate::panels::graph::render_matrix_lines(inner.width, inner.height)
             } else {
                 crate::panels::graph::render_lines(inner.width, inner.height)

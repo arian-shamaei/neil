@@ -124,6 +124,11 @@ static TRAIL_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// the F-R layout flattens into a 2D projection.
 static MATRIX_VIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Toggle: when true, the panel renders the wing-color legend instead
+/// of the graph or matrix. Lets the operator look up any colored cell
+/// they see — "what wing is this teal-grey?" → tail (rank 9+).
+static LEGEND_VIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn graph_state() -> &'static Arc<Mutex<GraphState>> {
     GRAPH_STATE.get_or_init(|| Arc::new(Mutex::new(GraphState::default())))
 }
@@ -236,16 +241,31 @@ pub fn spawn_access_watcher(neil_home: PathBuf) {
     });
 }
 
-// Stable per-wing color via DJB2 hash → small palette.
+/// Wing → color mapping, populated by GraphState::assign_wing_colors()
+/// at every rebuild. Top 8 wings (by note count) each get a distinct
+/// palette slot; everything beyond rank 8 maps to tail-grey. This
+/// guarantees the visually dominant wings never share a color, at the
+/// cost of stability — a wing's color changes if its rank changes
+/// across rebuilds. The legend (h key) lets the operator look up
+/// what's what.
+static WING_COLORS: OnceLock<Arc<Mutex<HashMap<String, Color>>>> = OnceLock::new();
+
+fn wing_colors_map() -> &'static Arc<Mutex<HashMap<String, Color>>> {
+    WING_COLORS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+}
+
+const WING_PALETTE: [Color; 8] = [
+    Color::Cyan, Color::Magenta, Color::Yellow, Color::Green,
+    Color::Blue, Color::LightCyan, Color::LightYellow, Color::LightGreen,
+];
+const WING_TAIL_COLOR: Color = Color::Rgb(110, 110, 110);
+
 fn wing_color(wing: &str) -> Color {
     if wing.is_empty() { return Color::DarkGray; }
-    let mut h: u32 = 5381;
-    for b in wing.bytes() { h = h.wrapping_mul(33).wrapping_add(b as u32); }
-    const PALETTE: [Color; 8] = [
-        Color::Cyan, Color::Magenta, Color::Yellow, Color::Green,
-        Color::Blue, Color::LightCyan, Color::LightYellow, Color::LightGreen,
-    ];
-    PALETTE[(h as usize) % PALETTE.len()]
+    if let Ok(m) = wing_colors_map().lock() {
+        if let Some(c) = m.get(wing) { return *c; }
+    }
+    WING_TAIL_COLOR
 }
 
 // xorshift64* — small, deterministic, zero-dep RNG used to seed initial
@@ -385,6 +405,25 @@ impl GraphState {
         self.orphan_count = orphan_count;
         self.explicit_count = explicit_count;
         self.settle_ticks = 0;
+
+        // Rank-based wing → color assignment. Top 8 wings (by note
+        // count, ties alphabetical) each get a distinct palette slot;
+        // wings beyond rank 8 fall to a single tail-grey. Updates the
+        // shared WING_COLORS map that wing_color() reads from.
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for nd in &self.nodes {
+            let key = if nd.wing.is_empty() { "?".to_string() } else { nd.wing.clone() };
+            *counts.entry(key).or_insert(0) += 1;
+        }
+        let mut by_rank: Vec<(String, usize)> = counts.into_iter().collect();
+        by_rank.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut new_map: HashMap<String, Color> = HashMap::new();
+        for (i, (w, _)) in by_rank.iter().enumerate() {
+            new_map.insert(w.clone(),
+                if i < WING_PALETTE.len() { WING_PALETTE[i] }
+                else { WING_TAIL_COLOR });
+        }
+        if let Ok(mut m) = wing_colors_map().lock() { *m = new_map; }
     }
 
     /// Single physics step using canonical Fruchterman-Reingold.
@@ -634,6 +673,18 @@ pub fn toggle_matrix_view() -> bool {
     s
 }
 
+/// Whether the wing-color legend overlay is on.
+pub fn legend_view_enabled() -> bool {
+    LEGEND_VIEW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Toggle the wing-color legend overlay. Returns the new state.
+pub fn toggle_legend() -> bool {
+    let s = !legend_view_enabled();
+    LEGEND_VIEW.store(s, std::sync::atomic::Ordering::Relaxed);
+    s
+}
+
 /// Identify the strongest off-diagonal wing-pair coupling (i.e., which
 /// two distinct wings share the most edge weight). Returns
 /// `(wing_a, wing_b, total_weight)` or None if there are no cross-wing
@@ -730,6 +781,69 @@ pub fn reseed() {
         }
         s.settle_ticks = 0;
     }
+}
+
+/// Render the wing-color legend: each wing on its own row with its
+/// rendered color sample, rank, name, and note count. Wings beyond
+/// rank 8 share the tail-grey slot — they're listed but flagged so
+/// the operator knows their dots aren't separable by color.
+pub fn render_legend_lines(area_w: u16, area_h: u16) -> Vec<Line<'static>> {
+    let _ = (area_w, area_h);
+
+    let state = match graph_state().lock() {
+        Ok(s) => s,
+        Err(_) => return vec![Line::from("legend: state lock poisoned")],
+    };
+
+    if state.nodes.is_empty() {
+        return vec![Line::from(Span::styled(
+            "no notes loaded — legend empty".to_string(),
+            Style::default().fg(Color::DarkGray)))];
+    }
+
+    // Recompute rank ordering same way assign_wing_colors() did.
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for nd in &state.nodes {
+        let key = if nd.wing.is_empty() { "?".to_string() } else { nd.wing.clone() };
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    let mut by_rank: Vec<(String, usize)> = counts.into_iter().collect();
+    by_rank.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(by_rank.len() + 4);
+    lines.push(Line::from(Span::styled(
+        "wing → color  (rank by note count, ties alphabetical)".to_string(),
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD))));
+    lines.push(Line::from(""));
+    for (rank, (wing, n)) in by_rank.iter().enumerate() {
+        let color = wing_color(wing);
+        let in_palette = rank < WING_PALETTE.len();
+        let rank_label = if in_palette {
+            format!("  {:>2}.", rank + 1)
+        } else {
+            "  --".to_string()
+        };
+        let trail = if !in_palette {
+            "   (tail-grey, shared with all wings rank 9+)".to_string()
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(rank_label, Style::default().fg(Color::DarkGray)),
+            Span::raw("  "),
+            Span::styled("●●●".to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled(format!("{:<22} {:>4} notes", wing, n),
+                Style::default().fg(Color::White)),
+            Span::styled(trail, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "press h to return to graph; access flashes (red=write, green=read) override these wing colors temporarily".to_string(),
+        Style::default().fg(Color::DarkGray))));
+    lines
 }
 
 /// Render the wing-by-wing adjacency matrix as a heatmap. Each cell is
