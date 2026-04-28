@@ -914,6 +914,18 @@ fn main() -> anyhow::Result<()> {
                             KeyCode::Char('h') if *pidx == 8 => {
                                 let _ = crate::panels::graph::toggle_legend();
                             }
+                            // Cluster panel: 'v' on a peer toggles the
+                            // session-detail overlay (summary +
+                            // deliverables from peer_sessions.json).
+                            // Distinct from Enter, which SSHes.
+                            KeyCode::Char('v') if *pidx == 7 => {
+                                if !cluster_expanded && cluster_selection >= 1 {
+                                    cluster_expanded = true;
+                                    cluster_scroll = 0;
+                                } else if cluster_expanded {
+                                    cluster_expanded = false;
+                                }
+                            }
                             KeyCode::Enter if *pidx == 7 => {
                                 // If the selection lands on a peer card, suspend
                                 // the TUI and SSH into that peer (Phase 4 hook).
@@ -1599,8 +1611,16 @@ fn render_panel_view(frame: &mut ratatui::Frame, area: Rect, idx: usize, state: 
         render_heartbeat_expanded(frame, area, state, hb_sel, hb_section, hb_scroll, fps);
         return;
     }
-    // Cluster expanded: two-pane detail view
+    // Cluster expanded: two-pane detail view OR session-detail
+    // overlay when the selected peer has a curated entry in
+    // peer_sessions.json (i.e. has a synthesis to review).
     if idx == 7 && cluster_expanded {
+        if let Some(name) = selected_peer_name(cluster_sel) {
+            if peer_has_session_entry(&name) {
+                render_cluster_session_detail(frame, area, &name, cluster_scroll);
+                return;
+            }
+        }
         render_cluster_expanded(frame, area, cluster_sel, cluster_scroll, fps);
         return;
     }
@@ -2167,6 +2187,139 @@ fn read_peer_activity_timestamps(neil_home: &std::path::Path)
 /// since both look identical from peer_send-recency alone.
 #[derive(Clone, Copy, PartialEq)]
 enum PeerSessionState { Completed, Stalled, Unknown }
+
+/// Look up the peer name at a given cluster selection (1-based index
+/// after MAIN). Mirrors peer_ip_at's pair-grouped reorder so the lookup
+/// matches what the responsive renderer shows.
+fn selected_peer_name(selection: usize) -> Option<String> {
+    if selection == 0 { return None; }
+    let cached = cluster_cache().lock().ok().and_then(|g| g.clone())?;
+    if cached.starts_with("__ERROR__") { return None; }
+    let raw = parse_peers(&cached);
+    let names: Vec<String> = raw.iter().map(|p| p.name.clone()).collect();
+    let groups = group_peers_by_pair(&names);
+    let mut ordered: Vec<String> = Vec::new();
+    for g in &groups { for &i in g { ordered.push(names[i].clone()); } }
+    ordered.get(selection - 1).cloned()
+}
+
+/// Whether peer_sessions.json has any entry for this peer.
+fn peer_has_session_entry(peer_name: &str) -> bool {
+    let neil_home = env::var("NEIL_HOME").map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env::var("HOME").unwrap_or("/tmp".into())).join(".neil"));
+    let sessions = read_peer_sessions(&neil_home);
+    sessions.contains_key(peer_name)
+}
+
+/// Render the session-detail overlay for a completed/stalled peer.
+/// Pulls from peer_sessions.json: session id, state, summary, rounds,
+/// outcome, deliverables list, transcript path. Scrollable when long.
+fn render_cluster_session_detail(
+    frame: &mut ratatui::Frame, area: Rect, peer_name: &str, scroll: usize,
+) {
+    let neil_home = env::var("NEIL_HOME").map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env::var("HOME").unwrap_or("/tmp".into())).join(".neil"));
+    let path = neil_home.join("state/peer_sessions.json");
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let parsed: serde_json::Value = serde_json::from_str(&content)
+        .unwrap_or(serde_json::Value::Null);
+    let entry = parsed.get(peer_name).cloned().unwrap_or(serde_json::Value::Null);
+
+    let state_str = entry.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+    let session_str = entry.get("session").and_then(|v| v.as_str()).unwrap_or("?");
+    let closed_at = entry.get("closed_at").and_then(|v| v.as_str())
+        .or_else(|| entry.get("last_attempt").and_then(|v| v.as_str()))
+        .unwrap_or("?");
+    let rounds = entry.get("rounds").and_then(|v| v.as_u64())
+        .map(|n| n.to_string()).unwrap_or_else(|| "?".into());
+    let outcome = entry.get("outcome").and_then(|v| v.as_str()).unwrap_or("?");
+    let summary = entry.get("summary").and_then(|v| v.as_str()).unwrap_or("(no summary)");
+    let transcript = entry.get("transcript").and_then(|v| v.as_str()).unwrap_or("");
+    let deliverables: Vec<String> = entry.get("deliverables")
+        .and_then(|v| v.as_array()).cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+
+    let (state_tag, state_color) = match state_str {
+        "completed" => ("✓ COMPLETED", Color::Rgb(80, 220, 110)),
+        "stalled"   => ("○ STALLED",   Color::Rgb(220, 80, 80)),
+        _           => ("? UNKNOWN",   Color::DarkGray),
+    };
+
+    let title = format!(" Session detail · {} · v:back Esc:back Up/Down:scroll ",
+                        peer_name);
+    let outer = Block::default().borders(Borders::ALL).title(title)
+        .border_style(Style::default().fg(state_color));
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let dim = Style::default().fg(Color::Rgb(150, 150, 150));
+    let label = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+
+    lines.push(Line::from(vec![
+        Span::styled("  state:    ", label),
+        Span::styled(state_tag.to_string(),
+            Style::default().fg(state_color).add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  session:  ", label),
+        Span::styled(session_str.to_string(), Style::default().fg(Color::White)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  closed:   ", label),
+        Span::styled(closed_at.to_string(), Style::default().fg(Color::White)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  rounds:   ", label),
+        Span::styled(rounds, Style::default().fg(Color::White)),
+        Span::raw("   "),
+        Span::styled("outcome: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(outcome.to_string(), Style::default().fg(Color::White)),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("  Synthesis:", label)));
+    // Word-wrap summary to inner width - 4 (margin each side)
+    let wrap_w = inner.width.saturating_sub(4) as usize;
+    for chunk in textwrap_simple(summary, wrap_w.max(20)) {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(chunk, Style::default().fg(Color::White)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("  Deliverables:", label)));
+    if deliverables.is_empty() {
+        lines.push(Line::from(Span::styled("    (none recorded)".to_string(), dim)));
+    } else {
+        for d in &deliverables {
+            for (i, chunk) in textwrap_simple(d, wrap_w.saturating_sub(4)).into_iter().enumerate() {
+                let prefix = if i == 0 { "    • " } else { "      " };
+                lines.push(Line::from(vec![
+                    Span::raw(prefix),
+                    Span::styled(chunk, Style::default().fg(Color::White)),
+                ]));
+            }
+        }
+    }
+    if !transcript.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  Transcript:", label)));
+        for chunk in textwrap_simple(transcript, wrap_w.max(20)) {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(chunk, dim),
+            ]));
+        }
+    }
+
+    // Scroll: skip first `scroll` lines.
+    let visible: Vec<Line<'static>> = lines.into_iter().skip(scroll).collect();
+    let p = Paragraph::new(visible).wrap(Wrap { trim: false });
+    frame.render_widget(p, inner);
+}
 
 fn read_peer_sessions(neil_home: &std::path::Path)
     -> std::collections::HashMap<String, PeerSessionState>
@@ -3787,6 +3940,35 @@ fn run_visual_cluster_test(neil_home: PathBuf) -> anyhow::Result<()> {
         ("MEDIUM", 90, 35),
         ("WIDE",  130, 35),
     ];
+
+    // Dump session-detail content for each peer with an entry. Just
+    // the text payload (no Rect/Frame). Lets us eyeball the summary
+    // + deliverables formatting without driving a TUI.
+    {
+        let path = neil_home.join("state/peer_sessions.json");
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let parsed: serde_json::Value = serde_json::from_str(&content)
+            .unwrap_or(serde_json::Value::Null);
+        if let Some(obj) = parsed.as_object() {
+            println!("\n##########  SESSION DETAILS (per peer)  ##########");
+            for (peer, entry) in obj {
+                println!("\n=== {} ===", peer);
+                let st = entry.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+                let sess = entry.get("session").and_then(|v| v.as_str()).unwrap_or("?");
+                let outcome = entry.get("outcome").and_then(|v| v.as_str()).unwrap_or("?");
+                let summary = entry.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+                println!("  state: {} | session: {}", st, sess);
+                println!("  outcome: {}", outcome);
+                println!("  summary: {}", summary);
+                if let Some(arr) = entry.get("deliverables").and_then(|v| v.as_array()) {
+                    println!("  deliverables:");
+                    for d in arr {
+                        if let Some(s) = d.as_str() { println!("    • {}", s); }
+                    }
+                }
+            }
+        }
+    }
 
     // Render at each width × all selection states (MAIN + each peer)
     // so navigation can be visually traced. Then for one tier (WIDE),
