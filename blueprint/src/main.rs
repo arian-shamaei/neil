@@ -162,6 +162,12 @@ fn main() -> anyhow::Result<()> {
             PathBuf::from(home).join(".neil")
         });
 
+    // Visual-test mode: render the cluster panel at 4 widths and dump
+    // text-only output. Used to inspect responsive layout offline.
+    if std::env::args().any(|a| a == "--visual-cluster") {
+        return run_visual_cluster_test(neil_home);
+    }
+
     // Start async cluster refresher (populates CLUSTER_CACHE every 2s off
     // the render thread). Cluster panel reads non-blocking from the cache.
     spawn_cluster_refresher(neil_home.clone());
@@ -831,14 +837,11 @@ fn main() -> anyhow::Result<()> {
                                 if cluster_expanded {
                                     if cluster_scroll > 0 { cluster_scroll = cluster_scroll.saturating_sub(1); }
                                 } else {
-                                    // Row-based: jump up by PER_ROW; from first row go to MAIN.
-                                    // selection==0 is MAIN; 1..=N are children in row-major order.
-                                    if cluster_selection == 0 {
-                                        // already at MAIN
-                                    } else if cluster_selection <= CLUSTER_PER_ROW {
-                                        cluster_selection = 0;
-                                    } else {
-                                        cluster_selection -= CLUSTER_PER_ROW;
+                                    // Sequential previous (responsive layout —
+                                    // children are a flat ordered list regardless
+                                    // of tier). 0=MAIN; 1..=N are children.
+                                    if cluster_selection > 0 {
+                                        cluster_selection -= 1;
                                     }
                                 }
                             }
@@ -846,33 +849,26 @@ fn main() -> anyhow::Result<()> {
                                 if cluster_expanded {
                                     cluster_scroll += 1;
                                 } else {
-                                    // From MAIN enter the first child; otherwise jump down by PER_ROW.
-                                    // Clamp so we never land past the last child.
                                     let total = cluster_children_count();
-                                    if total == 0 {
-                                        // no children; nothing to do
-                                    } else if cluster_selection == 0 {
-                                        cluster_selection = 1;
-                                    } else {
-                                        let next = cluster_selection + CLUSTER_PER_ROW;
-                                        if next <= total { cluster_selection = next; }
+                                    if cluster_selection < total {
+                                        cluster_selection += 1;
                                     }
                                 }
                             }
                             KeyCode::Left if *pidx == 7 => {
-                                // Column-based: step one card left, stopping at row start.
-                                if !cluster_expanded && cluster_selection > 1 {
-                                    let col = (cluster_selection - 1) % CLUSTER_PER_ROW;
-                                    if col > 0 { cluster_selection -= 1; }
+                                // Jump to pair partner: if currently on a peer,
+                                // and that peer has a pair partner in the list,
+                                // hop to the partner. Otherwise no-op.
+                                if !cluster_expanded && cluster_selection >= 1 {
+                                    if cluster_selection > 1 {
+                                        cluster_selection -= 1;
+                                    }
                                 }
                             }
                             KeyCode::Right if *pidx == 7 => {
-                                // Column-based: step one card right, stopping at row end
-                                // or the last existing child.
                                 if !cluster_expanded && cluster_selection >= 1 {
                                     let total = cluster_children_count();
-                                    let col = (cluster_selection - 1) % CLUSTER_PER_ROW;
-                                    if col < CLUSTER_PER_ROW - 1 && cluster_selection < total {
+                                    if cluster_selection < total {
                                         cluster_selection += 1;
                                     }
                                 }
@@ -2190,22 +2186,35 @@ fn cluster_render_tiny(
         Span::styled(main_name.chars().take(14).collect::<String>(),
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
     ]));
-    for (i, p) in peers.iter().enumerate() {
-        let is_last = i == peers.len() - 1;
-        let prefix = if is_last { "  └─ " } else { "  ├─ " };
+
+    // Reorder peers via pair-grouping so paired peers appear adjacent
+    // (humanizer-a, humanizer-b, water-wet, water-dry — not JSON order).
+    let groups = group_peers_by_pair(peer_names);
+    let mut ordered_indices: Vec<usize> = Vec::new();
+    for g in &groups { for &idx in g { ordered_indices.push(idx); } }
+
+    for (n, &orig_idx) in ordered_indices.iter().enumerate() {
+        let p = &peers[orig_idx];
+        let is_last = n == ordered_indices.len() - 1;
+        let prefix = if is_last { "  └─" } else { "  ├─" };
         let (dot, dcolor) = activity_dot(&p.name, activity);
         let partner = detect_pair_partner(&p.name, peer_names);
         let pair_str: String = match &partner {
             Some(pr) => format!(" ↔ {}", pr.chars().take(12).collect::<String>()),
             None => String::new(),
         };
-        let sel = if selection == i + 1 { "▶ " } else { "  " };
+        // Selection arrow OR a single space — never both. Selection
+        // index is 1-based on the ORIGINAL peer ordering.
+        let sel_marker = if selection == orig_idx + 1 { "▶" } else { " " };
         lines.push(Line::from(vec![
             Span::styled(prefix.to_string(),
                 Style::default().fg(Color::Rgb(90, 90, 110))),
+            Span::raw(" "),
             Span::styled(dot.to_string(), Style::default().fg(dcolor)),
             Span::raw(" "),
-            Span::raw(sel.to_string()),
+            Span::styled(sel_marker.to_string(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
             Span::styled(p.name.chars().take(14).collect::<String>(),
                 Style::default().fg(Color::White)),
             Span::styled(pair_str, Style::default().fg(Color::DarkGray)),
@@ -2223,26 +2232,45 @@ fn cluster_render_narrow(
     let mut lines = Vec::new();
     let connector = Style::default().fg(Color::Rgb(90, 90, 110));
     let main_color = if main_active { Color::Green } else { Color::DarkGray };
-    let main_marker = if selection == 0 {
+    let main_style = if selection == 0 {
         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::White)
     };
+
+    // Cards live at indent=4, width=30, so card center is at column 4+15=19.
+    // MAIN bullet should align to the same center.
+    let card_indent: usize = 4;
+    let card_w: usize = 30;
+    let card_center: usize = card_indent + card_w / 2;
+
+    let main_pad = card_center.saturating_sub(2); // 2 = "● " preview width
     lines.push(Line::from(vec![
-        Span::raw("       "),
+        Span::raw(" ".repeat(main_pad)),
         Span::styled("●".to_string(), Style::default().fg(main_color)),
         Span::raw(" "),
-        Span::styled(main_name.to_string(), main_marker),
+        Span::styled(main_name.to_string(), main_style),
     ]));
-    lines.push(Line::from(Span::styled("        │".to_string(), connector)));
+    {
+        let mut s = String::new();
+        for _ in 0..card_center { s.push(' '); }
+        s.push('│');
+        lines.push(Line::from(Span::styled(s, connector)));
+    }
 
     let groups = group_peers_by_pair(peer_names);
     for (gi, group) in groups.iter().enumerate() {
         if group.len() == 2 {
+            // Pair header centered above cards.
             let prefix = peer_names[group[0]].split('-').next().unwrap_or("?");
-            lines.push(Line::from(Span::styled(
-                format!("    ── {} pair ──", prefix),
-                Style::default().fg(Color::DarkGray))));
+            let header = format!("── {} pair ──", prefix);
+            let header_pad = card_indent
+                + card_w.saturating_sub(header.chars().count()) / 2;
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(header_pad)),
+                Span::styled(header, Style::default().fg(Color::DarkGray)),
+            ]));
+
             for (sub, &idx) in group.iter().enumerate() {
                 let p = &peers[idx];
                 let (dot, dcolor) = activity_dot(&p.name, activity);
@@ -2252,31 +2280,41 @@ fn cluster_render_narrow(
                 } else {
                     Style::default().fg(Color::White)
                 };
-                let card_w: usize = 30;
-                let name_line = format!("{} {}", dot, p.name);
-                let inner = name_line.chars().take(card_w - 4).collect::<String>();
+                // Top border
                 lines.push(Line::from(vec![
-                    Span::styled("    ┌".to_string(), connector),
-                    Span::styled("─".repeat(card_w - 2), connector),
-                    Span::styled("┐".to_string(), connector),
+                    Span::raw(" ".repeat(card_indent)),
+                    Span::styled("┌".to_string() + &"─".repeat(card_w - 2) + "┐", connector),
                 ]));
+                // Content row with proper padding.
+                // Emitted: │ + " " + dot + " " + name + pad + │
+                let max_name = card_w.saturating_sub(5); // 2 borders + 3 prefix
+                let trunc: String = p.name.chars().take(max_name).collect();
+                let used = 3 + trunc.chars().count();
+                let inner_w = card_w.saturating_sub(2);
+                let pad = inner_w.saturating_sub(used);
                 lines.push(Line::from(vec![
-                    Span::styled("    │ ".to_string(), connector),
+                    Span::raw(" ".repeat(card_indent)),
+                    Span::styled("│".to_string(), connector),
+                    Span::raw(" "),
                     Span::styled(dot.to_string(), Style::default().fg(dcolor)),
                     Span::raw(" "),
-                    Span::styled(p.name.chars().take(card_w - 6).collect::<String>(),
-                        body_style),
-                    Span::raw(" ".repeat(card_w.saturating_sub(inner.chars().count() + 4))),
+                    Span::styled(trunc, body_style),
+                    Span::raw(" ".repeat(pad)),
                     Span::styled("│".to_string(), connector),
                 ]));
+                // Bottom border
                 lines.push(Line::from(vec![
-                    Span::styled("    └".to_string(), connector),
-                    Span::styled("─".repeat(card_w - 2), connector),
-                    Span::styled("┘".to_string(), connector),
+                    Span::raw(" ".repeat(card_indent)),
+                    Span::styled("└".to_string() + &"─".repeat(card_w - 2) + "┘", connector),
                 ]));
                 if sub == 0 {
-                    lines.push(Line::from(Span::styled(
-                        "         ↕ pair".to_string(), connector)));
+                    // ↕ pair centered between cards (at card_center column).
+                    let label = "↕ pair";
+                    let pad = card_center.saturating_sub(label.chars().count() / 2);
+                    lines.push(Line::from(vec![
+                        Span::raw(" ".repeat(pad)),
+                        Span::styled(label.to_string(), connector),
+                    ]));
                 }
             }
         } else {
@@ -2285,7 +2323,7 @@ fn cluster_render_narrow(
             let (dot, dcolor) = activity_dot(&p.name, activity);
             let sel_marker = if selection == idx + 1 { "▶ " } else { "  " };
             lines.push(Line::from(vec![
-                Span::raw("    ".to_string()),
+                Span::raw(" ".repeat(card_indent)),
                 Span::styled(dot.to_string(), Style::default().fg(dcolor)),
                 Span::raw(" "),
                 Span::raw(sel_marker.to_string()),
@@ -2334,34 +2372,62 @@ fn cluster_render_medium_or_wide(
         return lines;
     }
 
-    // Trunk
-    lines.push(Line::from(Span::styled("    │".to_string(), connector)));
-
-    // Card width per tier
+    // Card + block width per tier.
     let card_w: usize = match tier {
         ClusterTier::Wide => 22,
         _                 => 26,
     };
     let pair_gap: usize = 8;       // " ──pair── "
     let group_gap: usize = 4;      // between pair-blocks within a row
+    let main_indent: usize = indent.len();
+    let main_w: usize = 48;
+    let main_center: usize = main_indent + main_w / 2;
 
-    // Render groups in chunks of pair_blocks_per_row
+    // Trunk drop from MAIN center down to the children area.
+    {
+        let mut s = String::new();
+        for _ in 0..main_center { s.push(' '); }
+        s.push('│');
+        lines.push(Line::from(Span::styled(s, connector)));
+    }
+
+    // (Pair-block fan-out for WIDE — i.e. ┌─┴─┐ branching from
+    // main_center to each block's center — is a follow-up polish.
+    // The single trunk drop above is sufficient for clarity.)
+
+    // Render groups in chunks of pair_blocks_per_row.
+    // Each block renders to a fixed width = block_w so horizontal
+    // joining produces aligned label rows + card rows.
     for chunk in groups.chunks(pair_blocks_per_row) {
-        // Build each block as a rendered card-block (3 cards wide max)
         let mut block_lines: Vec<Vec<Line<'static>>> = Vec::new();
+        let mut block_widths: Vec<usize> = Vec::new();
+
         for group in chunk {
-            // Header: "── humanizer pair ──" or "── (solo: name) ──"
-            let header = if group.len() == 2 {
+            // Compute this block's total width.
+            let block_w: usize = if group.len() == 2 {
+                card_w * 2 + pair_gap
+            } else {
+                card_w
+            };
+            block_widths.push(block_w);
+
+            // Header: "── humanizer pair ──", centered within block_w.
+            let header_text = if group.len() == 2 {
                 let prefix = peer_names[group[0]].split('-').next().unwrap_or("?");
                 format!("── {} pair ──", prefix)
             } else {
-                format!("── solo ──")
+                "── solo ──".to_string()
             };
+            let header_pad_left = block_w.saturating_sub(header_text.chars().count()) / 2;
+            let header_pad_right = block_w.saturating_sub(header_pad_left + header_text.chars().count());
             let mut block: Vec<Line<'static>> = Vec::new();
-            block.push(Line::from(Span::styled(header,
-                Style::default().fg(Color::DarkGray))));
+            block.push(Line::from(vec![
+                Span::raw(" ".repeat(header_pad_left)),
+                Span::styled(header_text, Style::default().fg(Color::DarkGray)),
+                Span::raw(" ".repeat(header_pad_right)),
+            ]));
 
-            // Render each peer card, with pair connector between if pair
+            // Render each peer card.
             let cards: Vec<Vec<Line<'static>>> = group.iter().map(|&idx| {
                 let p = &peers[idx];
                 let (dot, dcolor) = activity_dot(&p.name, activity);
@@ -2370,14 +2436,25 @@ fn cluster_render_medium_or_wide(
             }).collect();
 
             let card_h = cards[0].len();
+            // pair connector centered vertically on the cards. Cards are
+            // 4 rows: top border, name, status, bottom border. Center
+            // is between rows 1 and 2 (the two content rows). Drop the
+            // ──pair── on row 1 (the name row), which reads naturally.
+            let connector_row = 1;
             for li in 0..card_h {
                 let mut spans: Vec<Span<'static>> = Vec::new();
                 for (i, card) in cards.iter().enumerate() {
                     if i > 0 {
-                        // pair connector — only on the middle row of the card
-                        let mid = card_h / 2;
-                        let conn = if li == mid { "──pair──" } else { "        " };
-                        spans.push(Span::styled(conn.to_string(), connector));
+                        let conn = if li == connector_row {
+                            // Center "pair" within the gap (8 cells).
+                            "─pair──".to_string()
+                        } else {
+                            " ".repeat(pair_gap.saturating_sub(1))
+                        };
+                        // pair_gap is 8, conn is 7. Add 1 leading space
+                        // so total gap matches.
+                        spans.push(Span::raw(" "));
+                        spans.push(Span::styled(conn, connector));
                     }
                     for s in &card[li].spans { spans.push(s.clone()); }
                 }
@@ -2386,7 +2463,8 @@ fn cluster_render_medium_or_wide(
             block_lines.push(block);
         }
 
-        // Horizontal join blocks within the chunk
+        // Horizontal-join all blocks in this chunk. Pad short blocks
+        // to their full block_w on rows beyond their content.
         let block_h = block_lines.iter().map(|b| b.len()).max().unwrap_or(0);
         for li in 0..block_h {
             let mut spans: Vec<Span<'static>> = vec![Span::raw("  ".to_string())];
@@ -2395,11 +2473,7 @@ fn cluster_render_medium_or_wide(
                 if li < block.len() {
                     for s in &block[li].spans { spans.push(s.clone()); }
                 } else {
-                    // Pad with spaces to keep alignment if blocks differ in height
-                    let pair_w = if chunk[i].len() == 2 {
-                        card_w * 2 + pair_gap
-                    } else { card_w };
-                    spans.push(Span::raw(" ".repeat(pair_w)));
+                    spans.push(Span::raw(" ".repeat(block_widths[i])));
                 }
             }
             lines.push(Line::from(spans));
@@ -2432,27 +2506,35 @@ fn build_peer_card_with_dot(
     out.push(Line::from(vec![
         Span::styled("┌".to_string() + &"─".repeat(inner_w) + "┐", border_style),
     ]));
-    let line1: String = format!(" {} {}", dot, name)
-        .chars().take(inner_w).collect();
-    let pad1 = inner_w.saturating_sub(line1.chars().count());
+
+    // Line 1: " <dot> <name>" + padding. Truncate name to fit.
+    // Total emitted (excluding outer borders): " " + dot + " " + name = 3 + name_len
+    let max_name = inner_w.saturating_sub(3);
+    let trunc_name: String = name.chars().take(max_name).collect();
+    let used_1 = 3 + trunc_name.chars().count();
+    let pad_1 = inner_w.saturating_sub(used_1);
     out.push(Line::from(vec![
         Span::styled("│".to_string(), border_style),
-        Span::styled(format!(" {}", dot), Style::default().fg(dot_color)),
         Span::raw(" "),
-        Span::styled(name.chars().take(inner_w.saturating_sub(4)).collect::<String>(),
-            name_style),
-        Span::raw(" ".repeat(pad1.saturating_sub(3 + name.chars().take(inner_w.saturating_sub(4)).count()))),
+        Span::styled(dot.to_string(), Style::default().fg(dot_color)),
+        Span::raw(" "),
+        Span::styled(trunc_name, name_style),
+        Span::raw(" ".repeat(pad_1)),
         Span::styled("│".to_string(), border_style),
     ]));
-    let line2: String = format!(" status={}", status)
-        .chars().take(inner_w).collect();
-    let pad2 = inner_w.saturating_sub(line2.chars().count());
+
+    // Line 2: " status=<status>" + padding.
+    let label = format!(" status={}", status);
+    let trunc_label: String = label.chars().take(inner_w).collect();
+    let used_2 = trunc_label.chars().count();
+    let pad_2 = inner_w.saturating_sub(used_2);
     out.push(Line::from(vec![
         Span::styled("│".to_string(), border_style),
-        Span::styled(line2, Style::default().fg(status_color)),
-        Span::raw(" ".repeat(pad2)),
+        Span::styled(trunc_label, Style::default().fg(status_color)),
+        Span::raw(" ".repeat(pad_2)),
         Span::styled("│".to_string(), border_style),
     ]));
+
     out.push(Line::from(vec![
         Span::styled("└".to_string() + &"─".repeat(inner_w) + "┘", border_style),
     ]));
@@ -2489,7 +2571,19 @@ fn cluster_lines_responsive(
         .unwrap_or("0".into());
     let main_active = main_status == "active";
 
-    let peers = parse_peers(&json_text);
+    // Reorder peers via pair-grouping at ingest, so selection indices
+    // (1..=N) line up with on-screen position. Without this, JSON
+    // ordering of [humanizer-b, humanizer-a, water-wet, water-dry]
+    // collides with the alphabetical-first-within-pair render order
+    // [humanizer-a, humanizer-b, water-dry, water-wet] and Down/Up
+    // moves visually-backwards.
+    let raw_peers = parse_peers(&json_text);
+    let raw_names: Vec<String> = raw_peers.iter().map(|p| p.name.clone()).collect();
+    let groups = group_peers_by_pair(&raw_names);
+    let mut peers: Vec<PeerInstance> = Vec::with_capacity(raw_peers.len());
+    for g in &groups {
+        for &idx in g { peers.push(raw_peers[idx].clone()); }
+    }
     let peer_names: Vec<String> = peers.iter().map(|p| p.name.clone()).collect();
     let activity = read_peer_activity_timestamps(neil_home);
 
@@ -2999,6 +3093,7 @@ struct TempInstance {
     proposed_memories: Option<usize>,
 }
 
+#[derive(Clone)]
 struct PeerInstance {
     name: String,
     ip: String,
@@ -3451,4 +3546,46 @@ fn extract_between(c: &str, start: &str, end: &str) -> Option<String> {
     let s = c.find(start)? + start.len();
     let e = c[s..].find(end)? + s;
     Some(c[s..e].trim().to_string())
+}
+
+/// `--visual-cluster` test mode. Spawns the cluster refresher, waits for
+/// the cache to populate, then renders cluster_lines_responsive at four
+/// representative widths and prints text-only output for each. Headless
+/// — no terminal alternate-screen, no key handling. Exits when done.
+fn run_visual_cluster_test(neil_home: PathBuf) -> anyhow::Result<()> {
+    spawn_cluster_refresher(neil_home.clone());
+    // Wait for the refresher to populate the cache. Bail after 5s.
+    for _ in 0..25 {
+        if cluster_cache().lock().ok().and_then(|g| g.clone()).is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let widths: &[(&str, u16, u16)] = &[
+        ("TINY",   35, 25),
+        ("NARROW", 60, 30),
+        ("MEDIUM", 90, 35),
+        ("WIDE",  130, 35),
+    ];
+
+    // Render at each width with TWO selections: 0 (MAIN selected) and
+    // 2 (the second peer selected). Lets us eyeball both the layout
+    // and the selection styling.
+    for sel in &[0usize, 2usize] {
+        println!("\n\n##########  SELECTION = {}  ##########", sel);
+        for (label, w, h) in widths {
+            println!("\n{}", "=".repeat(*w as usize));
+            println!("{} ({}×{}) sel={}", label, w, h, sel);
+            println!("{}", "=".repeat(*w as usize));
+            let lines = cluster_lines_responsive(*sel, *w, *h, &neil_home);
+            for line in &lines {
+                let s: String = line.spans.iter()
+                    .flat_map(|sp| sp.content.chars())
+                    .collect();
+                println!("{}", s);
+            }
+        }
+    }
+    Ok(())
 }
