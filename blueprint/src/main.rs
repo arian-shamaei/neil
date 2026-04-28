@@ -2160,10 +2160,64 @@ fn read_peer_activity_timestamps(neil_home: &std::path::Path)
     out
 }
 
+/// Curated session state from $NEIL_HOME/state/peer_sessions.json.
+/// Distinguishes "stalled" (timed-out without close) from "completed"
+/// (formally closed with synthesis or DONE). Lets the panel render
+/// ✓ for completed peers instead of the same red ○ stalled peers get,
+/// since both look identical from peer_send-recency alone.
+#[derive(Clone, Copy, PartialEq)]
+enum PeerSessionState { Completed, Stalled, Unknown }
+
+fn read_peer_sessions(neil_home: &std::path::Path)
+    -> std::collections::HashMap<String, PeerSessionState>
+{
+    let mut out = std::collections::HashMap::new();
+    let path = neil_home.join("state/peer_sessions.json");
+    let Ok(content) = std::fs::read_to_string(&path) else { return out; };
+    // Naive JSON walk — peers are top-level object keys, each maps to
+    // an object with a "state" string. Avoid pulling serde_json's
+    // strict mode by hand-parsing; the file shape is simple and stable.
+    for line in content.lines() {
+        let line = line.trim();
+        // Match `"<peer>": {` to identify peer keys; carry forward the
+        // current peer name until we see a "state" field.
+        // (One-pass parse — peers must be top-level keys, not nested.)
+        let _ = line;
+    }
+    // Use serde_json after all — already a dep, simpler than rolling
+    // a parser. Parse the whole file then walk the top-level map.
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return out;
+    };
+    let Some(obj) = v.as_object() else { return out; };
+    for (peer, val) in obj {
+        let st = val.get("state").and_then(|s| s.as_str()).unwrap_or("");
+        let state = match st {
+            "completed" => PeerSessionState::Completed,
+            "stalled"   => PeerSessionState::Stalled,
+            _           => PeerSessionState::Unknown,
+        };
+        out.insert(peer.clone(), state);
+    }
+    out
+}
+
 fn activity_dot(
     peer_name: &str,
     activity: &std::collections::HashMap<String, String>,
+    sessions: &std::collections::HashMap<String, PeerSessionState>,
 ) -> (char, Color) {
+    // Curated state takes precedence. ✓ green for completed sessions
+    // (synthesis reached, work done), ○ red for explicitly-stalled
+    // (operator-recognized substrate failure).
+    if let Some(st) = sessions.get(peer_name) {
+        match st {
+            PeerSessionState::Completed => return ('✓', Color::Rgb(80, 220, 110)),
+            PeerSessionState::Stalled   => return ('○', Color::Rgb(220, 80, 80)),
+            PeerSessionState::Unknown   => {}
+        }
+    }
+    // Otherwise fall back to peer_send recency.
     let Some(ts_str) = activity.get(peer_name) else {
         return ('○', Color::Rgb(220, 80, 80));
     };
@@ -2183,23 +2237,28 @@ fn activity_dot(
     }
 }
 
-/// "last seen" age string from peer_send timestamp. "never" when the
-/// peer has no logged peer_send. Used to fill cluster card whitespace
-/// with operational signal.
+/// Returns a fully-formatted card line describing the peer's status:
+/// "closed (synthesized)" for completed peers (work done — silence is
+/// intentional), "last seen <age>" for ongoing/stalled peers
+/// (silence may indicate abandonment). Caller renders the string as-is.
 fn format_last_seen(
     peer_name: &str,
     activity: &std::collections::HashMap<String, String>,
+    sessions: &std::collections::HashMap<String, PeerSessionState>,
 ) -> String {
-    let Some(ts_str) = activity.get(peer_name) else { return "never".to_string(); };
+    if let Some(PeerSessionState::Completed) = sessions.get(peer_name) {
+        return "synthesis closed".to_string();
+    }
+    let Some(ts_str) = activity.get(peer_name) else { return "last seen never".to_string(); };
     let parsed = chrono::DateTime::parse_from_rfc3339(ts_str);
-    let Ok(ts) = parsed else { return "never".to_string(); };
+    let Ok(ts) = parsed else { return "last seen never".to_string(); };
     let mins = chrono::Utc::now()
         .signed_duration_since(ts.with_timezone(&chrono::Utc))
         .num_minutes();
-    if mins < 1 { "just now".to_string() }
-    else if mins < 60 { format!("{}m ago", mins) }
-    else if mins < 60 * 24 { format!("{}h ago", mins / 60) }
-    else { format!("{}d ago", mins / (60 * 24)) }
+    if mins < 1 { "last seen just now".to_string() }
+    else if mins < 60 { format!("last seen {}m ago", mins) }
+    else if mins < 60 * 24 { format!("last seen {}h ago", mins / 60) }
+    else { format!("last seen {}d ago", mins / (60 * 24)) }
 }
 
 /// Group peers into pairs for the pair-aware layouts. Returns a list
@@ -2234,6 +2293,7 @@ fn cluster_render_tiny(
     main_name: &str, main_active: bool,
     peers: &[PeerInstance], peer_names: &[String],
     activity: &std::collections::HashMap<String, String>,
+    sessions: &std::collections::HashMap<String, PeerSessionState>,
     selection: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -2257,7 +2317,7 @@ fn cluster_render_tiny(
         let p = &peers[orig_idx];
         let is_last = n == ordered_indices.len() - 1;
         let prefix = if is_last { "  └─" } else { "  ├─" };
-        let (dot, dcolor) = activity_dot(&p.name, activity);
+        let (dot, dcolor) = activity_dot(&p.name, activity, sessions);
         let partner = detect_pair_partner(&p.name, peer_names);
         let pair_str: String = match &partner {
             Some(pr) => format!(" ↔ {}", pr.chars().take(12).collect::<String>()),
@@ -2287,6 +2347,7 @@ fn cluster_render_narrow(
     main_name: &str, main_active: bool,
     peers: &[PeerInstance], peer_names: &[String],
     activity: &std::collections::HashMap<String, String>,
+    sessions: &std::collections::HashMap<String, PeerSessionState>,
     selection: usize, area_w: u16,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -2335,8 +2396,8 @@ fn cluster_render_narrow(
 
             for (sub, &idx) in group.iter().enumerate() {
                 let p = &peers[idx];
-                let (dot, dcolor) = activity_dot(&p.name, activity);
-                let last = format_last_seen(&p.name, activity);
+                let (dot, dcolor) = activity_dot(&p.name, activity, sessions);
+                let last = format_last_seen(&p.name, activity, sessions);
                 let sel = selection == idx + 1;
                 let card = build_peer_card_with_dot(
                     &p.name, &p.status, &p.ip, &last,
@@ -2356,7 +2417,7 @@ fn cluster_render_narrow(
         } else {
             let idx = group[0];
             let p = &peers[idx];
-            let (dot, dcolor) = activity_dot(&p.name, activity);
+            let (dot, dcolor) = activity_dot(&p.name, activity, sessions);
             let sel_marker = if selection == idx + 1 { "▶ " } else { "  " };
             lines.push(Line::from(vec![
                 Span::raw(" ".repeat(card_indent)),
@@ -2377,6 +2438,7 @@ fn cluster_render_medium_or_wide(
     main_active: bool,
     peers: &[PeerInstance], peer_names: &[String],
     activity: &std::collections::HashMap<String, String>,
+    sessions: &std::collections::HashMap<String, PeerSessionState>,
     selection: usize,
     tier: ClusterTier,
     area_w: u16,
@@ -2547,8 +2609,8 @@ fn cluster_render_medium_or_wide(
             // Render each peer card with extra detail rows (ip, last seen).
             let cards: Vec<Vec<Line<'static>>> = group.iter().map(|&idx| {
                 let p = &peers[idx];
-                let (dot, dcolor) = activity_dot(&p.name, activity);
-                let last = format_last_seen(&p.name, activity);
+                let (dot, dcolor) = activity_dot(&p.name, activity, sessions);
+                let last = format_last_seen(&p.name, activity, sessions);
                 let sel = selection == idx + 1;
                 build_peer_card_with_dot(&p.name, &p.status, &p.ip, &last,
                                          dot, dcolor, sel, card_w)
@@ -2667,7 +2729,7 @@ fn build_peer_card_with_dot(
         Style::default().fg(status_color),
         format!("status={}", status)));
     out.push(plain_row(dim, format!("ip={}", ip)));
-    out.push(plain_row(dim, format!("last seen {}", last_seen)));
+    out.push(plain_row(dim, last_seen.to_string()));
 
     out.push(Line::from(vec![
         Span::styled("└".to_string() + &"─".repeat(inner_w) + "┘", border_style),
@@ -2720,6 +2782,7 @@ fn cluster_lines_responsive(
     }
     let peer_names: Vec<String> = peers.iter().map(|p| p.name.clone()).collect();
     let activity = read_peer_activity_timestamps(neil_home);
+    let sessions = read_peer_sessions(neil_home);
 
     let tier = pick_cluster_tier(area_w);
     // Publish the row-width for the key handler so Up/Down can jump
@@ -2728,13 +2791,13 @@ fn cluster_lines_responsive(
         std::sync::atomic::Ordering::Relaxed);
     match tier {
         ClusterTier::Tiny => cluster_render_tiny(
-            &main_name, main_active, &peers, &peer_names, &activity, selection),
+            &main_name, main_active, &peers, &peer_names, &activity, &sessions, selection),
         ClusterTier::Narrow => cluster_render_narrow(
-            &main_name, main_active, &peers, &peer_names, &activity, selection, area_w),
+            &main_name, main_active, &peers, &peer_names, &activity, &sessions, selection, area_w),
         ClusterTier::Medium | ClusterTier::Wide => cluster_render_medium_or_wide(
             &main_name, &main_status, &main_persona, &main_mem,
             &main_up, &main_task, &main_pending, main_active,
-            &peers, &peer_names, &activity, selection, tier, area_w),
+            &peers, &peer_names, &activity, &sessions, selection, tier, area_w),
     }
 }
 
