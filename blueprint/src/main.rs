@@ -2093,26 +2093,28 @@ fn detect_pair_partner(peer_name: &str, all_names: &[String]) -> Option<String> 
     if mates.len() == 1 { Some(mates[0].clone()) } else { None }
 }
 
-/// Read recent peer_send events from cluster_activity.jsonl, returning
-/// the most recent timestamp per peer. Tails the last ~64 KB for speed
-/// — older events don't matter for the activity-dot freshness check.
+/// Read peer_send events from cluster_activity.jsonl, returning the
+/// most recent timestamp per peer. Scans the whole file because
+/// peer_send events are sparse (one per actual collaboration) and
+/// often older than the recent creds-sync flood — a tail-only read
+/// misses them. File is typically <1 MB; full read is sub-10 ms on
+/// any modern disk and only happens when the cluster panel renders.
 fn read_peer_activity_timestamps(neil_home: &std::path::Path)
     -> std::collections::HashMap<String, String>
 {
-    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+    use std::io::{BufRead, BufReader};
     let mut out: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let path = neil_home.join("state/cluster_activity.jsonl");
-    let Ok(mut f) = std::fs::File::open(&path) else { return out };
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    let start = len.saturating_sub(65_536);
-    let _ = f.seek(SeekFrom::Start(start));
+    let Ok(f) = std::fs::File::open(&path) else { return out };
     let reader = BufReader::new(f);
     for line in reader.lines().filter_map(|l| l.ok()) {
         if !line.contains("peer_send") { continue; }
         let peer = extract_obj_field(&line, "peer").unwrap_or_default();
         let ts = extract_obj_field(&line, "ts").unwrap_or_default();
         if !peer.is_empty() && !ts.is_empty() {
+            // Later entries override earlier ones — peer_send events
+            // are time-ordered in the log, so the last one wins.
             out.insert(peer, ts);
         }
     }
@@ -2140,6 +2142,25 @@ fn activity_dot(
     } else {
         ('○', Color::Rgb(220, 80, 80))     // stalled
     }
+}
+
+/// "last seen" age string from peer_send timestamp. "never" when the
+/// peer has no logged peer_send. Used to fill cluster card whitespace
+/// with operational signal.
+fn format_last_seen(
+    peer_name: &str,
+    activity: &std::collections::HashMap<String, String>,
+) -> String {
+    let Some(ts_str) = activity.get(peer_name) else { return "never".to_string(); };
+    let parsed = chrono::DateTime::parse_from_rfc3339(ts_str);
+    let Ok(ts) = parsed else { return "never".to_string(); };
+    let mins = chrono::Utc::now()
+        .signed_duration_since(ts.with_timezone(&chrono::Utc))
+        .num_minutes();
+    if mins < 1 { "just now".to_string() }
+    else if mins < 60 { format!("{}m ago", mins) }
+    else if mins < 60 * 24 { format!("{}h ago", mins / 60) }
+    else { format!("{}d ago", mins / (60 * 24)) }
 }
 
 /// Group peers into pairs for the pair-aware layouts. Returns a list
@@ -2276,41 +2297,15 @@ fn cluster_render_narrow(
             for (sub, &idx) in group.iter().enumerate() {
                 let p = &peers[idx];
                 let (dot, dcolor) = activity_dot(&p.name, activity);
+                let last = format_last_seen(&p.name, activity);
                 let sel = selection == idx + 1;
-                let body_style = if sel {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::White)
-                };
-                // Top border
-                lines.push(Line::from(vec![
-                    Span::raw(" ".repeat(card_indent)),
-                    Span::styled("┌".to_string() + &"─".repeat(card_w - 2) + "┐", connector),
-                ]));
-                // Content row with proper padding.
-                // Emitted: │ + " " + dot + " " + name + pad + │
-                let max_name = card_w.saturating_sub(5); // 2 borders + 3 prefix
-                let trunc: String = p.name.chars().take(max_name).collect();
-                let used = 3 + trunc.chars().count();
-                let inner_w = card_w.saturating_sub(2);
-                let pad = inner_w.saturating_sub(used);
-                lines.push(Line::from(vec![
-                    Span::raw(" ".repeat(card_indent)),
-                    Span::styled("│".to_string(), connector),
-                    Span::raw(" "),
-                    Span::styled(dot.to_string(), Style::default().fg(dcolor)),
-                    Span::raw(" "),
-                    Span::styled(trunc, body_style),
-                    Span::raw(" ".repeat(pad)),
-                    Span::styled("│".to_string(), connector),
-                ]));
-                // Bottom border
-                lines.push(Line::from(vec![
-                    Span::raw(" ".repeat(card_indent)),
-                    Span::styled("└".to_string() + &"─".repeat(card_w - 2) + "┘", connector),
-                ]));
+                let card = build_peer_card_with_dot(
+                    &p.name, &p.status, &p.ip, &last,
+                    dot, dcolor, sel, card_w);
+                for cl in card {
+                    lines.push(prefix_line(&cl, card_indent));
+                }
                 if sub == 0 {
-                    // ↕ pair centered between cards (at card_center column).
                     let label = "↕ pair";
                     let pad = card_center.saturating_sub(label.chars().count() / 2);
                     lines.push(Line::from(vec![
@@ -2510,12 +2505,14 @@ fn cluster_render_medium_or_wide(
                 Span::raw(" ".repeat(header_pad_right)),
             ]));
 
-            // Render each peer card.
+            // Render each peer card with extra detail rows (ip, last seen).
             let cards: Vec<Vec<Line<'static>>> = group.iter().map(|&idx| {
                 let p = &peers[idx];
                 let (dot, dcolor) = activity_dot(&p.name, activity);
+                let last = format_last_seen(&p.name, activity);
                 let sel = selection == idx + 1;
-                build_peer_card_with_dot(&p.name, &p.status, dot, dcolor, sel, card_w)
+                build_peer_card_with_dot(&p.name, &p.status, &p.ip, &last,
+                                         dot, dcolor, sel, card_w)
             }).collect();
 
             let card_h = cards[0].len();
@@ -2567,7 +2564,8 @@ fn cluster_render_medium_or_wide(
 }
 
 fn build_peer_card_with_dot(
-    name: &str, status: &str, dot: char, dot_color: Color,
+    name: &str, status: &str, ip: &str, last_seen: &str,
+    dot: char, dot_color: Color,
     selected: bool, card_w: usize,
 ) -> Vec<Line<'static>> {
     let border_style = if selected {
@@ -2584,14 +2582,32 @@ fn build_peer_card_with_dot(
         "active" | "running" | "ready" => Color::Green,
         _ => Color::DarkGray,
     };
-    let mut out = Vec::new();
+    let dim = Style::default().fg(Color::Rgb(150, 150, 150));
+
     let inner_w = card_w.saturating_sub(2);
+    let mut out = Vec::new();
     out.push(Line::from(vec![
         Span::styled("┌".to_string() + &"─".repeat(inner_w) + "┐", border_style),
     ]));
 
-    // Line 1: " <dot> <name>" + padding. Truncate name to fit.
-    // Total emitted (excluding outer borders): " " + dot + " " + name = 3 + name_len
+    // Helper: emit a content row " <text>" left-padded inside inner_w.
+    // Truncate `text` if it'd overflow (keeping 1 leading space).
+    let plain_row = |fg: Style, text: String| -> Line<'static> {
+        let max_t = inner_w.saturating_sub(1);
+        let t: String = text.chars().take(max_t).collect();
+        let used = 1 + t.chars().count();
+        let pad = inner_w.saturating_sub(used);
+        Line::from(vec![
+            Span::styled("│".to_string(), border_style),
+            Span::raw(" "),
+            Span::styled(t, fg),
+            Span::raw(" ".repeat(pad)),
+            Span::styled("│".to_string(), border_style),
+        ])
+    };
+
+    // Line 1: " <dot> <name>" with bold name on selection. Custom span
+    // layout because the dot uses its own color span.
     let max_name = inner_w.saturating_sub(3);
     let trunc_name: String = name.chars().take(max_name).collect();
     let used_1 = 3 + trunc_name.chars().count();
@@ -2606,17 +2622,13 @@ fn build_peer_card_with_dot(
         Span::styled("│".to_string(), border_style),
     ]));
 
-    // Line 2: " status=<status>" + padding.
-    let label = format!(" status={}", status);
-    let trunc_label: String = label.chars().take(inner_w).collect();
-    let used_2 = trunc_label.chars().count();
-    let pad_2 = inner_w.saturating_sub(used_2);
-    out.push(Line::from(vec![
-        Span::styled("│".to_string(), border_style),
-        Span::styled(trunc_label, Style::default().fg(status_color)),
-        Span::raw(" ".repeat(pad_2)),
-        Span::styled("│".to_string(), border_style),
-    ]));
+    // Lines 2-4: status / ip / last-seen. Each row gracefully handles
+    // narrow cards by truncating on the right.
+    out.push(plain_row(
+        Style::default().fg(status_color),
+        format!("status={}", status)));
+    out.push(plain_row(dim, format!("ip={}", ip)));
+    out.push(plain_row(dim, format!("last seen {}", last_seen)));
 
     out.push(Line::from(vec![
         Span::styled("└".to_string() + &"─".repeat(inner_w) + "┘", border_style),
