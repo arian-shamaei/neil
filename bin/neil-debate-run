@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""
+neil-debate-run — orchestrate a stateful debate across stateless Neil peers.
+
+Each peer beat is a fresh subprocess with no memory of prior turns. To
+make a multi-hour debate possible, we (the orchestrator) hold the
+canonical transcript and re-feed it into every turn's prompt. From the
+peers' perspective each turn is a one-shot reply to a richly-contextualized
+prompt; the conversation continuity is in OUR file, not their head.
+
+Usage:
+    neil-debate-run \\
+        --topic "Is centralized AI alignment governance more
+                 important than decentralized capability access?" \\
+        --side-a "trump-001:Centralized governance is the disaster" \\
+        --side-b "neil-001:Centralized governance is necessary" \\
+        --max-turns 100 \\
+        --min-turns 30 \\
+        --turn-timeout 120
+
+Side spec is "<peer_name>:<position-text>". Position text is verbatim
+in every prompt so the peer always sees its mandate. Peers must already
+exist in $NEIL_HOME/state/peers.json (spawn them first).
+
+Each turn:
+  1. Build prompt: session header + topic + sides + transcript-so-far +
+     "now respond in your voice" footer.
+  2. SCP into the speaker's autoPrompter queue.
+  3. Poll the speaker's history dir until the *.result.md appears.
+  4. Parse the Output block, append to transcript, log to JSONL.
+  5. Switch speakers (alternating A/B by turn parity).
+  6. Stop when (a) [SESSION CLOSE] appears AFTER min_turns, or
+     (b) max_turns reached, or (c) a turn times out.
+
+Run detached for long debates:
+    nohup neil-debate-run ... > /tmp/debate.log 2>&1 &
+    tail -f /tmp/debate.log
+
+State + transcript: $NEIL_HOME/state/debates/<session>.jsonl
+Each line is one event: start | turn | close | fail.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+NEIL_HOME = Path(os.environ.get("NEIL_HOME", Path.home() / ".neil"))
+KEY = NEIL_HOME / "keys" / "peer_ed25519"
+
+
+def ts() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def short_ts() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+
+def ssh_base() -> list[str]:
+    return [
+        "-i", str(KEY),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+    ]
+
+
+def peer_ip(name: str) -> str:
+    with open(NEIL_HOME / "state" / "peers.json") as f:
+        return json.load(f)[name]["ip"]
+
+
+def build_prompt(session: str, turn_n: int, max_turns: int,
+                 topic: str, speaker: str, sp_pos: str,
+                 opp: str, opp_pos: str, min_turns: int,
+                 transcript: list[tuple[int, str, str]]) -> str:
+    if transcript:
+        history = "\n".join(
+            f"  [Turn {n}] {who}: {msg}"
+            for (n, who, msg) in transcript
+        )
+    else:
+        history = "  (no turns yet — open the debate with your opening claim)"
+
+    return f"""[SESSION {session} · TURN {turn_n}/{max_turns}]
+
+This is a structured operator-orchestrated debate. The orchestrator
+is replaying the full conversation to you each turn because Neil
+peers are individually stateless — your model context was reset
+since the last turn.
+
+Topic: {topic}
+
+You are: {speaker}
+Your assigned position: {sp_pos}
+
+Opponent: {opp}
+Their assigned position: {opp_pos}
+
+Conversation so far:
+{history}
+
+Now respond in your persona's voice. Rules:
+  • Engage the opponent's most recent point directly — do not pivot
+    to a fresh angle while their argument is unanswered.
+  • Concede sub-arguments where the logic genuinely demands; refusal
+    to concede a clear point is bad-faith debate.
+  • Do not emit [SESSION CLOSE] before turn {min_turns}. The operator
+    wants depth, not premature synthesis.
+  • After turn {min_turns}, you may close if both sides have
+    converged on a synthesis OR reached a measured impasse.
+
+Your response (no preamble, just speak):"""
+
+
+def run_turn(session: str, turn_n: int, max_turns: int,
+             topic: str, speaker: str, sp_ip: str, sp_pos: str,
+             opp: str, opp_pos: str, min_turns: int,
+             transcript: list[tuple[int, str, str]],
+             turn_timeout: int) -> str | None:
+    prompt = build_prompt(session, turn_n, max_turns, topic, speaker,
+                          sp_pos, opp, opp_pos, min_turns, transcript)
+    fname = f"{short_ts()}_T{turn_n}_from_orchestrator.md"
+    tmp = Path("/tmp") / fname
+    tmp.write_text(prompt)
+
+    dest = f"neil@{sp_ip}:/home/neil/.neil/tools/autoPrompter/queue/{fname}"
+    r = subprocess.run(["scp", "-q"] + ssh_base() + [str(tmp), dest])
+    if r.returncode != 0:
+        print(f"[T{turn_n}] FAIL: scp to {speaker} returned {r.returncode}",
+              flush=True)
+        return None
+
+    result_path = f"/home/neil/.neil/tools/autoPrompter/history/{fname}.result.md"
+    deadline = time.time() + turn_timeout
+    raw = None
+    while time.time() < deadline:
+        time.sleep(5)
+        r = subprocess.run(
+            ["ssh"] + ssh_base() + [f"neil@{sp_ip}", f"cat {result_path} 2>/dev/null"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if r.stdout.strip():
+            raw = r.stdout
+            break
+    if raw is None:
+        print(f"[T{turn_n}] FAIL: {speaker} timed out after {turn_timeout}s",
+              flush=True)
+        return None
+
+    m = re.search(r"## Output\s*```\s*(.*?)\s*```\s*(?:##|$)", raw, re.DOTALL)
+    return m.group(1).strip() if m else "(orchestrator-parse-error)"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Orchestrate a stateful debate across stateless Neil peers."
+    )
+    ap.add_argument("--topic", required=True)
+    ap.add_argument("--side-a", required=True, metavar="NAME:POSITION")
+    ap.add_argument("--side-b", required=True, metavar="NAME:POSITION")
+    ap.add_argument("--max-turns", type=int, default=100)
+    ap.add_argument("--min-turns", type=int, default=30,
+                    help="No SESSION CLOSE accepted before this turn")
+    ap.add_argument("--turn-timeout", type=int, default=120,
+                    help="Max seconds to wait for a peer reply per turn")
+    ap.add_argument("--session-id", default=None)
+    args = ap.parse_args()
+
+    if ":" not in args.side_a or ":" not in args.side_b:
+        print("ERR: --side-a / --side-b must be 'name:position'", file=sys.stderr)
+        return 1
+    a_name, a_pos = args.side_a.split(":", 1)
+    b_name, b_pos = args.side_b.split(":", 1)
+    a_ip = peer_ip(a_name)
+    b_ip = peer_ip(b_name)
+    session = args.session_id or f"debate_{int(time.time())}"
+
+    debates_dir = NEIL_HOME / "state" / "debates"
+    debates_dir.mkdir(parents=True, exist_ok=True)
+    log_path = debates_dir / f"{session}.jsonl"
+
+    def log(event: str, **kw) -> None:
+        with open(log_path, "a") as f:
+            f.write(json.dumps({"event": event, "ts": ts(), **kw}) + "\n")
+
+    log("start", session=session, topic=args.topic,
+        side_a={"name": a_name, "ip": a_ip, "position": a_pos},
+        side_b={"name": b_name, "ip": b_ip, "position": b_pos},
+        max_turns=args.max_turns, min_turns=args.min_turns,
+        turn_timeout=args.turn_timeout)
+
+    print(f"=== debate {session} ===")
+    print(f"  topic     : {args.topic}")
+    print(f"  side A    : {a_name} ({a_ip})")
+    print(f"              position: {a_pos}")
+    print(f"  side B    : {b_name} ({b_ip})")
+    print(f"              position: {b_pos}")
+    print(f"  budget    : {args.max_turns} turns, no close before {args.min_turns}")
+    print(f"  timeout   : {args.turn_timeout}s/turn")
+    print(f"  transcript: {log_path}")
+    print(flush=True)
+
+    transcript: list[tuple[int, str, str]] = []
+
+    for turn_n in range(1, args.max_turns + 1):
+        if turn_n % 2 == 1:
+            speaker, sp_ip, sp_pos = a_name, a_ip, a_pos
+            opp, opp_pos = b_name, b_pos
+        else:
+            speaker, sp_ip, sp_pos = b_name, b_ip, b_pos
+            opp, opp_pos = a_name, a_pos
+
+        print(f"[T{turn_n}/{args.max_turns}] → {speaker}", flush=True)
+        output = run_turn(
+            session, turn_n, args.max_turns, args.topic,
+            speaker, sp_ip, sp_pos, opp, opp_pos,
+            args.min_turns, transcript, args.turn_timeout,
+        )
+        if output is None:
+            log("fail", turn=turn_n, speaker=speaker, reason="timeout-or-scp-error")
+            return 2
+
+        log("turn", n=turn_n, speaker=speaker, msg=output)
+        transcript.append((turn_n, speaker, output))
+
+        preview = output.replace("\n", " ")[:140]
+        print(f"[T{turn_n}] {speaker}: {preview}"
+              + ("..." if len(output) > 140 else ""), flush=True)
+
+        if turn_n >= args.min_turns:
+            if re.search(r"\[SESSION[^\]]*CLOSE", output, re.IGNORECASE):
+                print(f"[T{turn_n}] {speaker} emitted SESSION CLOSE — ending")
+                log("close", final_turn=turn_n, reason="session_close",
+                    closer=speaker)
+                return 0
+
+    print(f"[done] reached max_turns={args.max_turns}")
+    log("close", final_turn=args.max_turns, reason="max_turns")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
