@@ -137,13 +137,22 @@ def run_turn(session: str, turn_n: int, max_turns: int,
               flush=True)
         return None
 
-    result_path = f"/home/neil/.neil/tools/autoPrompter/history/{fname}.result.md"
+    # autoPrompter renames history files with an ISO-timestamp prefix
+    # (e.g. 2026-04-29T21-02-47_<our-fname>.result.md), so we glob-match
+    # by the original filename suffix.
+    history_glob = (
+        f"/home/neil/.neil/tools/autoPrompter/history/*{fname}.result.md"
+    )
     deadline = time.time() + turn_timeout
     raw = None
     while time.time() < deadline:
         time.sleep(5)
         r = subprocess.run(
-            ["ssh"] + ssh_base() + [f"neil@{sp_ip}", f"cat {result_path} 2>/dev/null"],
+            ["ssh"] + ssh_base() + [
+                f"neil@{sp_ip}",
+                f"f=$(ls -t {history_glob} 2>/dev/null | head -1); "
+                f"if [ -n \"$f\" ]; then cat \"$f\"; fi",
+            ],
             capture_output=True, text=True, timeout=15,
         )
         if r.stdout.strip():
